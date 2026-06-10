@@ -34,6 +34,7 @@
 #include "engine/engine_memory.h"
 #include "engine/engine_sleep.h"
 #include "engine/engine_sort.h"
+#include "engine/engine_toi.h"
 #include "engine/engine_util_blas.h"
 #include "engine/engine_util_errmem.h"
 #include "engine/engine_util_misc.h"
@@ -824,6 +825,11 @@ void mj_collision(const mjModel* m, mjData* d) {
     }
   }
 
+  // activate speculative contacts: separated pairs predicted to touch within one timestep
+  if (mjENABLED(mjENBL_SPECULATIVE) && d->ncon) {
+    mj_speculativeContacts(m, d);
+  }
+
   // end narrowphase and midphase timer
   TM_END(mjTIMER_COL_NARROW);
   TM_END1(mjTIMER_POS_COLLISION);
@@ -1082,12 +1088,13 @@ void mj_collideTree(const mjModel* m, mjData* d, int bf1, int bf2,
         continue;
       }
 
-      // if no intersection at intermediate levels, stop
+      // if no intersection at intermediate levels, stop; include gap so that in-gap
+      // contacts are not pruned before the leaf tests, which include it
       mjtNum margin = mj_assignMargin(m, m->body_margin[bf1] + m->flex_margin[f2]);
       if (!mj_collideOBB(bvh1 + 6*node1, bvh2 + 6*node2,
                          d->xipos + 3*bf1, d->ximat + 9*bf1,
                          NULL, NULL,
-                         margin, product, offset, &initialize)) {
+                         margin + m->flex_gap[f2], product, offset, &initialize)) {
         continue;
       }
     }
@@ -1110,9 +1117,12 @@ void mj_collideTree(const mjModel* m, mjData* d, int bf1, int bf2,
         continue;
       }
 
-      // if no intersection at intermediate levels, stop
+      // if no intersection at intermediate levels, stop; include gap so that in-gap
+      // contacts are not pruned before mj_collideElems, which includes it (gap is
+      // zeroed in self-collision, matching mj_collideElems)
       mjtNum margin = mj_assignMargin(m, m->flex_margin[f1] + m->flex_margin[f2]);
-      if (filterBox(bvh1 + 6*node1, bvh2 + 6*node2, margin)) {
+      mjtNum gap = (f1 != f2) ? m->flex_gap[f1] + m->flex_gap[f2] : 0;
+      if (filterBox(bvh1 + 6*node1, bvh2 + 6*node2, margin + gap)) {
         continue;
       }
     }

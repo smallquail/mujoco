@@ -1127,6 +1127,7 @@ void mjXWriter::Option(XMLElement* root) {
     WRITEENBL("invdiscrete",    mjENBL_INVDISCRETE)
     WRITEENBL("sleep",          mjENBL_SLEEP)
     WRITEENBL("diagexact",      mjENBL_DIAGEXACT)
+    WRITEENBL("speculative",    mjENBL_SPECULATIVE)
 #undef WRITEENBL
   }
 

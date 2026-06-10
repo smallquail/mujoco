@@ -17,6 +17,7 @@
 #include "src/engine/engine_toi.h"
 
 #include <cmath>
+#include <string>
 
 #include <mujoco/mujoco.h>
 #include <mujoco/mjtype.h>
@@ -525,6 +526,238 @@ TEST_F(ToiTest, FlexInvalidIds) {
               HasSubstr("invalid element id"));
   EXPECT_THAT(MjuErrorMessageFrom(mj_flexTOI)(model, data, 5, 0, 1, 0, 1.0, nullptr),
               HasSubstr("invalid flex id"));
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
+}
+
+//---------------------------------- speculative contacts (mjENBL_SPECULATIVE) --------------------
+
+// two parallel 1D flex strings, axes 0.03 apart, radius 0.01 (surface distance 0.01);
+// string1 carries a contact gap so that separated contacts are captured in the gap band
+constexpr char kSpeculativeStringsXml[] = R"(
+<mujoco>
+  <option gravity="0 0 0" timestep="0.002">
+    <flag speculative="enable"/>
+  </option>
+  <worldbody>
+    <flexcomp name="string1" type="grid" dim="1" count="5 1 1" spacing="0.1 1 1"
+              radius="0.01" mass="0.05" pos="0 0 0">
+      <contact gap="0.02"/>
+    </flexcomp>
+    <flexcomp name="string2" type="grid" dim="1" count="5 1 1" spacing="0.1 1 1"
+              radius="0.01" mass="0.05" pos="0 0.03 0"/>
+  </worldbody>
+</mujoco>
+)";
+
+// count contacts and check their exclude state; returns number of gap (exclude==1) and
+// active (exclude==0) contacts
+static void CountContacts(const mjData* data, int* ngap, int* nactive) {
+  *ngap = *nactive = 0;
+  for (int i = 0; i < data->ncon; i++) {
+    if (data->contact[i].exclude == 1) (*ngap)++;
+    if (data->contact[i].exclude == 0) (*nactive)++;
+  }
+}
+
+// the speculative flag round-trips through XML
+TEST_F(ToiTest, SpeculativeFlagParsing) {
+  mjModel* model = LoadModel(kSpeculativeStringsXml);
+  EXPECT_TRUE(model->opt.enableflags & mjENBL_SPECULATIVE);
+  mj_deleteModel(model);
+}
+
+// stationary strings: in-gap contacts are captured but not activated, with and without midphase
+TEST_F(ToiTest, SpeculativeGapCapture) {
+  for (int midphase = 0; midphase < 2; midphase++) {
+    mjModel* model = LoadModel(kSpeculativeStringsXml);
+    if (!midphase) {
+      model->opt.disableflags |= mjDSBL_MIDPHASE;
+    }
+    mjData* data = mj_makeData(model);
+    mj_forward(model, data);
+
+    int ngap, nactive;
+    CountContacts(data, &ngap, &nactive);
+    EXPECT_GT(ngap, 0) << "midphase " << midphase;
+    EXPECT_EQ(nactive, 0) << "midphase " << midphase;
+    for (int i = 0; i < data->ncon; i++) {
+      EXPECT_NEAR(data->contact[i].dist, 0.01, MjTol(1e-8, 1e-5));
+      EXPECT_EQ(data->contact[i].includemargin, 0);
+    }
+
+    mj_deleteData(data);
+    mj_deleteModel(model);
+  }
+}
+
+// fast approach: in-gap contacts are activated and enter the solver
+TEST_F(ToiTest, SpeculativeActivation) {
+  mjModel* model = LoadModel(kSpeculativeStringsXml);
+  mjData* data = mj_makeData(model);
+  int f1 = mj_name2id(model, mjOBJ_FLEX, "string1");
+
+  // closing 6 m/s: vclose*dt = 0.012 >= dist = 0.01
+  mjtNum v[3] = {0, 6, 0};
+  SetFlexVelocity(model, data, f1, v);
+  mj_forward(model, data);
+
+  int ngap, nactive;
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_GT(nactive, 0);
+  for (int i = 0; i < data->ncon; i++) {
+    if (data->contact[i].exclude == 0) {
+      EXPECT_GT(data->contact[i].dist, 0);
+      EXPECT_EQ(data->contact[i].includemargin, data->contact[i].dist);
+      EXPECT_GE(data->contact[i].efc_address, 0);
+    }
+  }
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
+}
+
+// no activation when approaching too slowly, receding, or with the flag disabled
+TEST_F(ToiTest, SpeculativeGateNegative) {
+  mjModel* model = LoadModel(kSpeculativeStringsXml);
+  mjData* data = mj_makeData(model);
+  int f1 = mj_name2id(model, mjOBJ_FLEX, "string1");
+  int ngap, nactive;
+
+  // slow approach: vclose*dt = 0.004 < dist = 0.01
+  mjtNum slow[3] = {0, 2, 0};
+  SetFlexVelocity(model, data, f1, slow);
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_GT(ngap, 0);
+  EXPECT_EQ(nactive, 0);
+
+  // fast receding
+  mjtNum recede[3] = {0, -6, 0};
+  SetFlexVelocity(model, data, f1, recede);
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_GT(ngap, 0);
+  EXPECT_EQ(nactive, 0);
+
+  // fast approach with the flag disabled
+  model->opt.enableflags &= ~mjENBL_SPECULATIVE;
+  mjtNum fast[3] = {0, 6, 0};
+  SetFlexVelocity(model, data, f1, fast);
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_GT(ngap, 0);
+  EXPECT_EQ(nactive, 0);
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
+}
+
+// two free spheres of radius 0.1, surface distance 0.01; sphere1 carries a contact gap
+constexpr char kSpeculativeSpheresXml[] = R"(
+<mujoco>
+  <option gravity="0 0 0" timestep="0.002">
+    <flag speculative="enable"/>
+  </option>
+  <worldbody>
+    <body name="ball1">
+      <freejoint/>
+      <geom name="sphere1" type="sphere" size="0.1" gap="0.02"/>
+    </body>
+    <body name="ball2" pos="0.21 0 0">
+      <freejoint/>
+      <geom name="sphere2" type="sphere" size="0.1"/>
+    </body>
+  </worldbody>
+</mujoco>
+)";
+
+// the pass is not flex-specific: geom-geom in-gap contacts are activated by the same gate
+TEST_F(ToiTest, SpeculativeGeomActivation) {
+  mjModel* model = LoadModel(kSpeculativeSpheresXml);
+  mjData* data = mj_makeData(model);
+  int ngap, nactive;
+
+  // stationary: captured in the gap band, not activated
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_EQ(ngap, 1);
+  EXPECT_EQ(nactive, 0);
+  EXPECT_NEAR(data->contact[0].dist, 0.01, MjTol(1e-8, 1e-5));
+
+  // slow approach: vclose*dt = 0.004 < dist = 0.01, stays excluded
+  data->qvel[0] = 2;
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_EQ(ngap, 1);
+  EXPECT_EQ(nactive, 0);
+
+  // fast receding: stays excluded
+  data->qvel[0] = -6;
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_EQ(ngap, 1);
+  EXPECT_EQ(nactive, 0);
+
+  // fast approach: vclose*dt = 0.012 >= 0.01, activated and in the solver
+  data->qvel[0] = 6;
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_EQ(nactive, 1);
+  for (int i = 0; i < data->ncon; i++) {
+    if (data->contact[i].exclude == 0) {
+      EXPECT_GT(data->contact[i].dist, 0);
+      EXPECT_EQ(data->contact[i].includemargin, data->contact[i].dist);
+      EXPECT_GE(data->contact[i].efc_address, 0);
+    }
+  }
+
+  // fast approach with the flag disabled: stays excluded
+  model->opt.enableflags &= ~mjENBL_SPECULATIVE;
+  mj_forward(model, data);
+  CountContacts(data, &ngap, &nactive);
+  EXPECT_EQ(ngap, 1);
+  EXPECT_EQ(nactive, 0);
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
+}
+
+// north star: a thin 2D flex tube falls under gravity onto a taut 1D flex string threaded
+// through it; with speculative contacts the tube is caught and hangs on the string, without
+// them the wall passes through the string at this sampling phase and the tube falls away
+TEST_F(ToiTest, SpeculativeStringTube) {
+  const std::string path = GetModelPath("toi/string_tube.xml");
+  mjModel* model = mj_loadXML(path.c_str(), nullptr, nullptr, 0);
+  ASSERT_THAT(model, NotNull());
+  ASSERT_TRUE(model->opt.enableflags & mjENBL_SPECULATIVE);
+  int tube = mj_name2id(model, mjOBJ_FLEX, "tube");
+  ASSERT_GE(tube, 0);
+  mjData* data = mj_makeData(model);
+
+  auto max_tube_z = [&]() {
+    mjtNum maxz = -1e10;
+    for (int i = 0; i < model->flex_vertnum[tube]; i++) {
+      maxz = mju_max(maxz, data->flexvert_xpos[3*(model->flex_vertadr[tube] + i) + 2]);
+    }
+    return maxz;
+  };
+
+  // speculative contacts: the tube hangs on the string
+  for (int i = 0; i < 500; i++) {
+    mj_step(model, data);
+  }
+  EXPECT_GT(max_tube_z(), 0.99) << "tube should hang on the string";
+  EXPECT_EQ(data->warning[mjWARN_BADQACC].number, 0);
+
+  // without them: the tube wall passes through the string and the tube falls away
+  model->opt.enableflags &= ~mjENBL_SPECULATIVE;
+  mj_resetData(model, data);
+  for (int i = 0; i < 500; i++) {
+    mj_step(model, data);
+  }
+  EXPECT_LT(max_tube_z(), 0.5) << "tube should fall through without speculative contacts";
 
   mj_deleteData(data);
   mj_deleteModel(model);

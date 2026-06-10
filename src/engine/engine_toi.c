@@ -20,6 +20,7 @@
 
 #include "engine/engine_collision_convex.h"
 #include "engine/engine_collision_gjk.h"
+#include "engine/engine_core_smooth.h"
 #include "engine/engine_core_util.h"
 #include "engine/engine_memory.h"
 #include "engine/engine_util_blas.h"
@@ -291,6 +292,22 @@ mjtNum mj_geomTOI(const mjModel* m, mjData* d, int geom1, int geom2, mjtNum hori
 }
 
 
+// fill one vertex slot of a motion descriptor: position and linear velocity of flex vertex gv
+static void flexVertSlot(const mjModel* m, const mjData* d, int gv, int slot,
+                         mjTOIMotion* motion) {
+  const mjtNum* vert = d->flexvert_xpos + 3*gv;
+  mju_copy3(motion->vertpos + 3*slot, vert);
+
+  // vertex velocity: body velocity at the body frame origin, transported to the vertex
+  int bid = m->flex_vertbodyid[gv];
+  mjtNum vel6[6], arm[3], rotvel[3];
+  mj_objectVelocity(m, d, mjOBJ_XBODY, bid, vel6, /*flg_local=*/0);
+  mju_sub3(arm, vert, d->xpos + 3*bid);
+  mju_cross(rotvel, vel6, arm);
+  mju_add3(motion->vertvel + 3*slot, vel6+3, rotvel);
+}
+
+
 // fill a flex element motion descriptor: vertex positions and per-vertex linear velocities
 static void flexElemMotion(const mjModel* m, const mjData* d, int f, int e, mjTOIMotion* motion) {
   int dim = m->flex_dim[f];
@@ -298,17 +315,7 @@ static void flexElemMotion(const mjModel* m, const mjData* d, int f, int e, mjTO
 
   motion->nvert = dim + 1;
   for (int i=0; i <= dim; i++) {
-    int gv = m->flex_vertadr[f] + edata[i];
-    const mjtNum* vert = d->flexvert_xpos + 3*gv;
-    mju_copy3(motion->vertpos + 3*i, vert);
-
-    // vertex velocity: body velocity at the body frame origin, transported to the vertex
-    int bid = m->flex_vertbodyid[gv];
-    mjtNum vel6[6], arm[3], rotvel[3];
-    mj_objectVelocity(m, d, mjOBJ_XBODY, bid, vel6, /*flg_local=*/0);
-    mju_sub3(arm, vert, d->xpos + 3*bid);
-    mju_cross(rotvel, vel6, arm);
-    mju_add3(motion->vertvel + 3*i, vel6+3, rotvel);
+    flexVertSlot(m, d, m->flex_vertadr[f] + edata[i], i, motion);
   }
 }
 
@@ -366,4 +373,63 @@ mjtNum mj_flexTOI(const mjModel* m, mjData* d, int flex1, int elem1, int flex2, 
 
   mj_freeStack(d);
   return toi;
+}
+
+
+//---------------------------------- speculative contacts -----------------------------------------
+
+// fill the motion descriptor for one side of a contact: flex element, flex vertex, or geom
+static void contactMotion(const mjModel* m, const mjData* d, const mjContact* con, int side,
+                          mjTOIMotion* motion) {
+  int f = con->flex[side];
+  if (f >= 0) {
+    if (con->elem[side] >= 0) {
+      flexElemMotion(m, d, f, con->elem[side], motion);
+    } else {
+      motion->nvert = 1;
+      flexVertSlot(m, d, m->flex_vertadr[f] + con->vert[side], 0, motion);
+    }
+  } else {
+    motion->nvert = 0;
+    mj_objectVelocity(m, d, mjOBJ_GEOM, con->geom[side], motion->vel, /*flg_local=*/0);
+    motion->rbound = m->geom_rbound[con->geom[side]];
+  }
+}
+
+
+// activate speculative contacts, see header for semantics
+void mj_speculativeContacts(const mjModel* m, mjData* d) {
+  int ncon = d->ncon;
+  int comvel_done = 0;
+  mjtNum dt = m->opt.timestep;
+
+  for (int i=0; i < ncon; i++) {
+    mjContact* con = d->contact + i;
+
+    // only separated in-gap contacts are candidates
+    if (con->exclude != 1) {
+      continue;
+    }
+
+    // mj_collision runs before mj_fwdVelocity, so cvel is stale: recompute from current qvel
+    if (!comvel_done) {
+      mj_comVel(m, d);
+      comvel_done = 1;
+    }
+
+    // upper bound on the closing speed along the contact normal (frame points side 0 -> side 1)
+    mjTOIMotion motion1, motion2;
+    contactMotion(m, d, con, 0, &motion1);
+    contactMotion(m, d, con, 1, &motion2);
+    mjtNum n_neg[3] = {-con->frame[0], -con->frame[1], -con->frame[2]};
+    mjtNum vclose = toiSpeedAlong(&motion1, con->frame) + toiSpeedAlong(&motion2, n_neg);
+
+    // activate if the pair can reach force range within one step: pos = dist - includemargin
+    // starts at zero, so the constraint damping brakes the approach before impact; the force
+    // is unilateral, so over-activation is self-correcting
+    if (vclose > 0 && vclose*dt >= con->dist - con->includemargin) {
+      con->includemargin = con->dist;
+      con->exclude = 0;
+    }
+  }
 }

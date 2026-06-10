@@ -76,6 +76,14 @@ MJAPI mjtNum mjc_toi(const mjCCDConfig* config, mjCCDStatus* status,
                      mjCCDObj* obj2, const mjTOIMotion* motion2,
                      mjtNum horizon, mjtNum tolerance);
 
+// activate speculative contacts: for each separated in-gap contact (exclude == 1), if the
+// support points of the pair can close the remaining surface distance within one timestep,
+// include the contact in the solver with includemargin = dist, so that the constraint
+// position starts at zero and the damping term brakes the approach before impact; the
+// contact force is unilateral, so over-activation is self-correcting
+// called at the end of mj_collision when mjENBL_SPECULATIVE is set
+MJAPI void mj_speculativeContacts(const mjModel* m, mjData* d);
+
 #ifdef __cplusplus
 }
 #endif
