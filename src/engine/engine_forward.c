@@ -29,6 +29,7 @@
 #include "engine/engine_core_util.h"
 #include "engine/engine_derivative.h"
 #include "engine/engine_inverse.h"
+#include "engine/engine_ipc.h"
 #include "engine/engine_island.h"
 #include "engine/engine_macro.h"
 #include "engine/engine_memory.h"
@@ -1280,142 +1281,6 @@ void mj_RungeKutta(const mjModel* m, mjData* d, int N) {
 }
 
 
-// return 1 if any flex needs implicit stiffness treatment (interp or bending)
-static int flex_has_implicit_stiffness(const mjModel* m) {
-  for (int f=0; f < m->nflex; f++) {
-    if (m->flex_rigid[f]) {
-      continue;
-    }
-
-    // interpolated flex with stiffness
-    if (m->flex_interp[f] &&
-        m->flex_edgeequality[f] != 3 &&
-        m->flex_stiffness[m->flex_stiffnessadr[f]] != 0) {
-      return 1;
-    }
-
-    // standard flex with bending
-    if (!m->flex_interp[f] && m->flex_dim[f] == 2 &&
-        m->flex_bendingadr[f] >= 0) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
-
-// preconditioned CG solve for implicit flex interp
-//   solves (M - h*qDeriv - (h^2+h*d)*K) * qacc = qfrc - h*K*qvel
-//   where K is the flex stiffness, using the already-factored standard system
-//   (M - h*qDeriv) as a preconditioner
-static void flexInterp_cgsolve(const mjModel* m, mjData* d,
-                                mjtNum* qacc, const mjtNum* qfrc, int nv) {
-  mjtNum h = m->opt.timestep;
-  int implicit = (m->opt.integrator == mjINT_IMPLICIT);
-
-  mj_markStack(d);
-
-  // allocate CG work vectors
-  mjtNum* rhs = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* r = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* z = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* p = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* Ap = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* temp = mjSTACKALLOC(d, nv, mjtNum);
-
-  // precompute K_rot cache: same layout as m->flex_stiffness
-  int krot_size = m->nflexstiffness;
-  mjtNum* K_rot_cache = mjSTACKALLOC(d, krot_size, mjtNum);
-  mju_zero(K_rot_cache, krot_size);
-  mjd_flexInterp_cacheKrot(m, d, K_rot_cache);
-
-  // build RHS: rhs = qfrc
-  mju_copy(rhs, qfrc, nv);
-
-  // flex_interp velocity correction: rhs += h*K_interp*qvel (K_interp is NSD)
-  mjd_flexInterp_mul(m, d, rhs, d->qvel, h, 0, K_rot_cache);
-
-  // standard flex bending velocity correction: rhs -= h*K_bend*qvel
-  mjd_flexBend_mul(m, d, rhs, d->qvel, -h, 0);  // rhs -= h*K_bend*v
-
-  // --- helper: compute Ap = A*x ---
-  // A*x = (M - h*qDeriv)*x - (h^2+h*d)*K_interp*x + (h^2+h*d)*K_bend*x
-  #define FLEX_CG_MATVEC(Ap_out, x_in)                                           \
-    mju_mulMatVecSparse(Ap_out, d->qDeriv, x_in, nv, m->D_rownnz, m->D_rowadr,   \
-                        m->D_colind, NULL);                                      \
-    mju_mulSymVecSparse(temp, d->M, x_in, nv, m->M_rownnz, m->M_rowadr,          \
-                        m->M_colind);                                            \
-    mju_addScl(Ap_out, temp, Ap_out, -h, nv);                                    \
-    mjd_flexInterp_mul(m, d, Ap_out, x_in, -(h*h), -h, K_rot_cache);             \
-    mjd_flexBend_mul(m, d, Ap_out, x_in, h*h, h)
-
-  // --- helper: preconditioner solve z = (M - h*qDeriv)^{-1} * r ---
-  #define FLEX_CG_PRECOND(z_out, r_in)                                           \
-    if (implicit) {                                                              \
-      mju_solveLUSparse(z_out, d->qLU, r_in, nv, m->D_rownnz, m->D_rowadr,       \
-                        m->D_diag, m->D_colind, NULL);                           \
-    } else {                                                                     \
-      mju_copy(z_out, r_in, nv);                                                 \
-      mj_solveLD(z_out, d->qH, d->qHDiagInv, nv, 1, m->M_rownnz, m->M_rowadr,    \
-                 m->M_colind, NULL);                                             \
-    }
-
-  // initial residual: r = rhs - A*qacc
-  FLEX_CG_MATVEC(Ap, qacc);
-  mju_sub(r, rhs, Ap, nv);
-
-  // check if already converged
-  mjtNum rnorm = mju_dot(r, r, nv);
-  mjtNum tol = 1e-10 * mju_dot(rhs, rhs, nv);
-  if (rnorm < tol || rnorm < mjMINVAL) {
-    mj_freeStack(d);
-    return;
-  }
-
-  // z = precond(r), p = z
-  FLEX_CG_PRECOND(z, r);
-  mju_copy(p, z, nv);
-  mjtNum rz = mju_dot(r, z, nv);
-
-  // CG iterations
-  int maxiter = 50;
-  for (int iter=0; iter < maxiter; iter++) {
-    FLEX_CG_MATVEC(Ap, p);
-
-    // alpha = rz / dot(p, Ap)
-    mjtNum pAp = mju_dot(p, Ap, nv);
-    if (mju_abs(pAp) < mjMINVAL) break;
-    mjtNum alpha = rz / pAp;
-
-    // qacc += alpha * p
-    mju_addToScl(qacc, p, alpha, nv);
-
-    // r -= alpha * Ap
-    mju_addToScl(r, Ap, -alpha, nv);
-
-    // check convergence
-    rnorm = mju_dot(r, r, nv);
-    if (rnorm < tol || rnorm < mjMINVAL) break;
-
-    // z = precond(r)
-    FLEX_CG_PRECOND(z, r);
-
-    // beta = rz_new / rz
-    mjtNum rz_new = mju_dot(r, z, nv);
-    mjtNum beta = rz_new / mju_max(mjMINVAL, rz);
-
-    // p = z + beta * p
-    mju_addScl(p, z, p, beta, nv);
-    rz = rz_new;
-  }
-
-  #undef FLEX_CG_MATVEC
-  #undef FLEX_CG_PRECOND
-
-  mj_freeStack(d);
-}
-
-
 // return 1 if free joint is eligible for midpoint quaternion integration:
 //   standalone 6-DOF tree with no children, awake, and unconstrained
 static int midpoint_eligible(const mjModel* m, const mjData* d, int jnt) {
@@ -1783,9 +1648,6 @@ void mj_implicitSkip(const mjModel* m, mjData* d, int skipfactor) {
     mju_add(qfrc, d->qfrc_smooth, d->qfrc_constraint, nv);
   }
 
-  // check for flex_interp that needs implicit treatment
-  int has_flex_stiffness = !sleep_filter && flex_has_implicit_stiffness(m);
-
   // factorization
   if (!skipfactor) {
     // implicit
@@ -1835,11 +1697,6 @@ void mj_implicitSkip(const mjModel* m, mjData* d, int skipfactor) {
       mju_copy(qacc, qfrc, nv);
     }
     mj_solveLD(qacc, d->qH, d->qHDiagInv, nv, 1, m->M_rownnz, m->M_rowadr, m->M_colind, dof_awake_ind);
-  }
-
-  // flex: CG correction for implicit flex stiffness
-  if (has_flex_stiffness) {
-    flexInterp_cgsolve(m, d, qacc, qfrc, m->nv);
   }
 
   // count and list joints of free bodies eligible for midpoint integration
@@ -2006,6 +1863,10 @@ void mj_step(const mjModel* m, mjData* d) {
   default:
     mjERROR("invalid integrator");
   }
+
+  // variational flex solve: implicit elasticity, and flex-flex barrier contact unless
+  // disabled by the flexipc flag
+  mj_flexIPC(m, d);
 
   TM_END(mjTIMER_STEP);
 }

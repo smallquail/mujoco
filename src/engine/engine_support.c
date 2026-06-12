@@ -67,7 +67,8 @@ const char* mjDISABLESTRING[mjNDISABLE] = {
   "AutoReset",
   "NativeCCD",
   "Island",
-  "MultiCCD"
+  "MultiCCD",
+  "FlexIPC"
 };
 
 
