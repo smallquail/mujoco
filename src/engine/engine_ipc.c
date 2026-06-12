@@ -904,12 +904,13 @@ static mjtNum caFilterPair(const mjModel* m, const mjIPCPair* p, const mjtNum* v
         if (dist < 0.01*xi) {
           return 1;  // effectively pierced: nothing left to protect reliably
         }
-        // absolute floor: a proportional keep decays geometrically under sustained
-        // load until it drowns in floating-point noise and the pair grinds through;
-        // parking hard-pressed pairs at a small fixed fraction of the thickness is
-        // the invariant working, not a failure
+        // proportional keep: the pair retains a fraction of its remaining centerline
+        // distance each step, decaying geometrically but never crossing. an absolute
+        // floor would be robust to sustained loads at large timesteps, but parked
+        // pairs throttle the whole scene through the global step fraction (per-island
+        // line search is the prerequisite for that, see the large-timestep notes)
         floor = 0;
-        keep = mjIPC_DMARGIN*dist > 0.05*xi ? mjIPC_DMARGIN*dist : 0.05*xi;
+        keep = mjIPC_DMARGIN*dist;
       } else {
         keep = mjIPC_DMARGIN*(dist - xi);
       }

@@ -54,7 +54,7 @@ mjData* MakeDataThreaded(mjModel* m) {
 void DeleteDataThreaded(mjData* d) {
   if (d) {
     mju_threadpool(d, 0);
-    DeleteDataThreaded(d);
+    mj_deleteData(d);
   }
 }
 }  // namespace
