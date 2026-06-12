@@ -30,6 +30,7 @@
 #include "engine/engine_core_constraint.h"
 #include "engine/engine_core_util.h"
 #include "engine/engine_inline.h"
+#include "engine/engine_substep.h"
 #include "engine/engine_macro.h"
 #include "engine/engine_memory.h"
 #include "engine/engine_sleep.h"
@@ -2425,6 +2426,25 @@ void mj_collideElems(const mjModel* m, mjData* d, int f1, int e1, int f2, int e2
       if (b1 >= 0 && b1 == bdata2[edata2[i2]]) {
         return;
       }
+    }
+  }
+
+  // substep solver handoff: owned pairs are handled by the substep solve and
+  // produce no soft contacts; infeasible pairs (bad starts) keep legacy handling, which
+  // separates them until the barrier solve can take over
+  if (!mjDISABLED(mjDSBL_SUBSTEP) && mj_substepPairEligible(m, f1, f2)) {
+    mjtNum vert1[9], vert2[9];
+    for (int i=0; i <= dim1; i++) {
+      int gv = m->flex_vertadr[f1] + m->flex_elem[m->flex_elemdataadr[f1] + e1*(dim1+1) + i];
+      mju_copy3(vert1 + 3*i, d->flexvert_xpos + 3*gv);
+    }
+    for (int i=0; i <= dim2; i++) {
+      int gv = m->flex_vertadr[f2] + m->flex_elem[m->flex_elemdataadr[f2] + e2*(dim2+1) + i];
+      mju_copy3(vert2 + 3*i, d->flexvert_xpos + 3*gv);
+    }
+    if (mj_substepElemDistance(vert1, dim1, vert2, dim2, NULL, NULL) >
+        mj_substepLegacyDistance(m, f1, f2)) {
+      return;
     }
   }
 

@@ -1116,6 +1116,7 @@ void mjXWriter::Option(XMLElement* root) {
     WRITEDSBL("nativeccd",      mjDSBL_NATIVECCD)
     WRITEDSBL("island",         mjDSBL_ISLAND)
     WRITEDSBL("multiccd",       mjDSBL_MULTICCD)
+    WRITEDSBL("substep",        mjDSBL_SUBSTEP)
 #undef WRITEDSBL
 
 #define WRITEENBL(NAME, MASK) \

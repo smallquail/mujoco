@@ -30,6 +30,8 @@ mujoco_test(engine_forward_test)
 
 mujoco_test(engine_inverse_test)
 
+mujoco_test(engine_substep_test)
+
 mujoco_test(engine_island_test)
 
 mujoco_test(engine_io_test ADDITIONAL_LINK_LIBRARIES absl::str_format)

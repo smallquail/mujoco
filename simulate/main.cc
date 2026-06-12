@@ -26,6 +26,39 @@
 #include <thread>
 
 #include <mujoco/mujoco.h>
+
+// internal engine threading API (src/engine/engine_thread.h): used by the variational
+// flex solver's parallel passes; harmless no-op binding for models without flex
+extern "C" void mju_threadpool(mjData* d, int nthread);
+
+namespace {
+// bind a worker pool sized to the physical performance cores (override: MJ_THREADS)
+mjData* MakeDataThreaded(mjModel* m) {
+  mjData* d = mj_makeData(m);
+  if (d) {
+    int nthread = 0;
+    if (const char* env = std::getenv("MJ_THREADS")) {
+      nthread = std::atoi(env);
+    }
+    if (nthread <= 0) {
+      nthread = std::max(1u, std::thread::hardware_concurrency()/2);
+    }
+    if (nthread > 1) {
+      mju_threadpool(d, nthread - 1);
+    }
+  }
+  return d;
+}
+
+// release the pool before freeing mjData (mj_deleteData does not own the pool)
+void DeleteDataThreaded(mjData* d) {
+  if (d) {
+    mju_threadpool(d, 0);
+    mj_deleteData(d);
+  }
+}
+}  // namespace
+
 #include "glfw_adapter.h"
 #include "simulate.h"
 #include "array_safety.h"
@@ -298,14 +331,14 @@ void PhysicsLoop(mj::Simulate& sim) {
       sim.droploadrequest.store(false);
 
       mjData* dnew = nullptr;
-      if (mnew) dnew = mj_makeData(mnew);
+      if (mnew) dnew = MakeDataThreaded(mnew);
       if (dnew) {
         sim.Load(mnew, dnew, sim.dropfilename);
 
         // lock the sim mutex
         const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
 
-        mj_deleteData(d);
+        DeleteDataThreaded(d);
         mj_deleteModel(m);
 
         m = mnew;
@@ -322,14 +355,14 @@ void PhysicsLoop(mj::Simulate& sim) {
       sim.LoadMessage(sim.filename);
       mjModel* mnew = LoadModel(sim.filename, sim);
       mjData* dnew = nullptr;
-      if (mnew) dnew = mj_makeData(mnew);
+      if (mnew) dnew = MakeDataThreaded(mnew);
       if (dnew) {
         sim.Load(mnew, dnew, sim.filename);
 
         // lock the sim mutex
         const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
 
-        mj_deleteData(d);
+        DeleteDataThreaded(d);
         mj_deleteModel(m);
 
         m = mnew;
@@ -464,7 +497,7 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
       // lock the sim mutex
       const std::unique_lock<std::recursive_mutex> lock(sim->mtx);
 
-      d = mj_makeData(m);
+      d = MakeDataThreaded(m);
     }
     if (d) {
       sim->Load(m, d, filename);
@@ -482,7 +515,7 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
   PhysicsLoop(*sim);
 
   // delete everything we allocated
-  mj_deleteData(d);
+  DeleteDataThreaded(d);
   mj_deleteModel(m);
 }
 

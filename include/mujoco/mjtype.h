@@ -71,8 +71,9 @@ typedef enum mjtDisableBit_ {     // disable default feature bitflags
   mjDSBL_NATIVECCD    = 1<<17,    // native convex collision detection
   mjDSBL_ISLAND       = 1<<18,    // constraint island discovery
   mjDSBL_MULTICCD     = 1<<19,    // multiple CCD contact points
+  mjDSBL_SUBSTEP      = 1<<20,    // variational flex solve (implicit elasticity + barriers)
 
-  mjNDISABLE          = 20        // number of disable flags
+  mjNDISABLE          = 21        // number of disable flags
 } mjtDisableBit;
 
 
