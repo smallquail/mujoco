@@ -71,6 +71,14 @@ MJAPI int mj_ipcFeasible(const mjModel* m, mjData* d, mjIPCPair* badpair);
 // barrier solve's extended force plateaus there); pairs above it produce no contacts
 MJAPI mjtNum mj_ipcLegacyDistance(const mjModel* m, int f1, int f2);
 
+// implicit flex stiffness CG (the original engine solve): refines the integrator's
+// local acceleration in place; reads d->qvel as the pre-step velocity
+MJAPI void mj_ipcLegacyCG(const mjModel* m, mjData* d, mjtNum* qacc, const mjtNum* qfrc,
+                          int nv);
+
+// return 1 if any flex needs implicit stiffness treatment (interp or bending)
+MJAPI int mj_ipcHasImplicitStiffness(const mjModel* m);
+
 // barrier projection of the integrated flex state: minimizes the incremental potential
 // (inertia toward the integrated target + barriers on flex-flex distances) over the
 // vertex DOFs of eligible flexes (dim 1 or 2, flex_interp == 0), starting from the

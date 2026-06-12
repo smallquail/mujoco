@@ -1699,6 +1699,12 @@ void mj_implicitSkip(const mjModel* m, mjData* d, int skipfactor) {
     mj_solveLD(qacc, d->qH, d->qHDiagInv, nv, 1, m->M_rownnz, m->M_rowadr, m->M_colind, dof_awake_ind);
   }
 
+  // implicit flex stiffness refinement (must run here: the local qacc is the true
+  // integration acceleration, while d->qacc holds the forward value)
+  if (!sleep_filter && mj_ipcHasImplicitStiffness(m)) {
+    mj_ipcLegacyCG(m, d, qacc, qfrc, m->nv);
+  }
+
   // count and list joints of free bodies eligible for midpoint integration
   int nfree = 0;
   int* free_jntid = NULL;

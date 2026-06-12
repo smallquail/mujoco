@@ -740,7 +740,7 @@ typedef struct {
 } mjIPCElastic;
 
 // any flex needs implicit stiffness treatment (mirror of the engine-internal check)
-static int hasImplicitStiffness(const mjModel* m) {
+int mj_ipcHasImplicitStiffness(const mjModel* m) {
   for (int f=0; f < m->nflex; f++) {
     if (m->flex_rigid[f]) {
       continue;
@@ -1110,20 +1110,88 @@ static void ipcEnergyTask(const mjModel* m, mjData* d, void* arg, int thread_id,
 }
 
 
+// implicit flex stiffness CG (the original engine solve, restored verbatim): called
+// from inside the implicit integrators where the true local qacc lives. a post-hoc
+// formulation was tried and reverted: d->qacc holds the forward (explicit-elasticity)
+// acceleration, not the integrator's implicit one, so any correction reconstructed
+// from it injects the difference as spurious velocity every step, which is fatal for
+// stiff bending (see the variational solver notes)
+void mj_ipcLegacyCG(const mjModel* m, mjData* d, mjtNum* qacc, const mjtNum* qfrc,
+                    int nv) {
+  mjtNum h = m->opt.timestep;
+  int implicit = (m->opt.integrator == mjINT_IMPLICIT);
+  mj_markStack(d);
+  mjtNum* rhs = mjSTACKALLOC(d, nv, mjtNum);
+  mjtNum* r = mjSTACKALLOC(d, nv, mjtNum);
+  mjtNum* z = mjSTACKALLOC(d, nv, mjtNum);
+  mjtNum* p = mjSTACKALLOC(d, nv, mjtNum);
+  mjtNum* Ap = mjSTACKALLOC(d, nv, mjtNum);
+  mjtNum* temp = mjSTACKALLOC(d, nv, mjtNum);
+  int krot_size = m->nflexstiffness;
+  mjtNum* K_rot_cache = mjSTACKALLOC(d, krot_size ? krot_size : 1, mjtNum);
+  mju_zero(K_rot_cache, krot_size);
+  mjd_flexInterp_cacheKrot(m, d, K_rot_cache);
+  mju_copy(rhs, qfrc, nv);
+  mjd_flexInterp_mul(m, d, rhs, d->qvel, h, 0, K_rot_cache);
+  mjd_flexBend_mul(m, d, rhs, d->qvel, -h, 0);
+  #define FLEX_CG_MATVEC(Ap_out, x_in)                                           \
+    mju_mulMatVecSparse(Ap_out, d->qDeriv, x_in, nv, m->D_rownnz, m->D_rowadr,   \
+                        m->D_colind, NULL);                                      \
+    mju_mulSymVecSparse(temp, d->M, x_in, nv, m->M_rownnz, m->M_rowadr,          \
+                        m->M_colind);                                            \
+    mju_addScl(Ap_out, temp, Ap_out, -h, nv);                                    \
+    mjd_flexInterp_mul(m, d, Ap_out, x_in, -(h*h), -h, K_rot_cache);             \
+    mjd_flexBend_mul(m, d, Ap_out, x_in, h*h, h)
+  #define FLEX_CG_PRECOND(z_out, r_in)                                           \
+    if (implicit) {                                                              \
+      mju_solveLUSparse(z_out, d->qLU, r_in, nv, m->D_rownnz, m->D_rowadr,       \
+                        m->D_diag, m->D_colind, NULL);                           \
+    } else {                                                                     \
+      mju_copy(z_out, r_in, nv);                                                 \
+      mj_solveLD(z_out, d->qH, d->qHDiagInv, nv, 1, m->M_rownnz, m->M_rowadr,    \
+                 m->M_colind, NULL);                                             \
+    }
+  FLEX_CG_MATVEC(Ap, qacc);
+  mju_sub(r, rhs, Ap, nv);
+  mjtNum rnorm = mju_dot(r, r, nv);
+  mjtNum tol = 1e-10 * mju_dot(rhs, rhs, nv);
+  if (rnorm < tol || rnorm < mjMINVAL) {
+    mj_freeStack(d);
+    return;
+  }
+  FLEX_CG_PRECOND(z, r);
+  mju_copy(p, z, nv);
+  mjtNum rz = mju_dot(r, z, nv);
+  int maxiter = 50;
+  for (int iter=0; iter < maxiter; iter++) {
+    FLEX_CG_MATVEC(Ap, p);
+    mjtNum pAp = mju_dot(p, Ap, nv);
+    if (fabs(pAp) < mjMINVAL) break;
+    mjtNum alpha = rz / pAp;
+    mju_addToScl(qacc, p, alpha, nv);
+    mju_addToScl(r, Ap, -alpha, nv);
+    rnorm = mju_dot(r, r, nv);
+    if (rnorm < tol || rnorm < mjMINVAL) break;
+    FLEX_CG_PRECOND(z, r);
+    mjtNum rz_new = mju_dot(r, z, nv);
+    mjtNum beta = rz_new / (rz > mjMINVAL ? rz : mjMINVAL);
+    mju_addScl(p, z, p, beta, nv);
+    rz = rz_new;
+  }
+  #undef FLEX_CG_MATVEC
+  #undef FLEX_CG_PRECOND
+  mj_freeStack(d);
+}
+
+
 // barrier projection of the integrated flex state, see header
 void mj_flexIPC(const mjModel* m, mjData* d) {
 
   int nflexvert = m->nflexvert;
   mjtNum h = m->opt.timestep;
 
-  // implicit elastic stage: active under implicit integrators with flex stiffness and no
-  // sleep filtering (the same gating the deleted post-hoc CG used); independent of the
-  // barrier stage, which requires solvable vertex DOFs
-  int elastic = (m->opt.integrator == mjINT_IMPLICIT ||
-                 m->opt.integrator == mjINT_IMPLICITFAST) &&
-                !(mjENABLED(mjENBL_SLEEP) && d->nv_awake < m->nv) && hasImplicitStiffness(m);
-
-  // quick exit: nothing to do
+  // the implicit elastic solve runs inside the integrators (mj_implicitSkip); the
+  // barrier stage below projects the integrated state in the inertia metric
   int any = 0;
   for (int f=0; f < m->nflex; f++) {
     if (ipcSolvable(m, f)) {
@@ -1131,100 +1199,22 @@ void mj_flexIPC(const mjModel* m, mjData* d) {
       break;
     }
   }
-  if (!any && !elastic) {
+  if (!any) {
     return;
   }
 
   mj_markStack(d);
 
-  // implicit elastic model context
+  // inertia-metric energy context for the barrier stage
   mjIPCElastic el;
-  el.mode = elastic;
+  el.mode = 0;
   el.d = d;
   el.h = h;
   el.scat = el.Av = el.tmp = el.rhs = el.Krot = NULL;
-  if (el.mode) {
-    int nv = m->nv;
-    el.scat = mjSTACKALLOC(d, nv, mjtNum);
-    el.Av = mjSTACKALLOC(d, nv, mjtNum);
-    el.tmp = mjSTACKALLOC(d, nv, mjtNum);
-    el.rhs = mjSTACKALLOC(d, nv, mjtNum);
-    if (m->nflexstiffness) {
-      el.Krot = mjSTACKALLOC(d, m->nflexstiffness, mjtNum);
-      mju_zero(el.Krot, m->nflexstiffness);
-      mjd_flexInterp_cacheKrot(m, d, el.Krot);
-    }
 
-    // pre-integration velocity: the integrator advanced qvel by h*qacc
-    mjtNum* vpre = mjSTACKALLOC(d, nv, mjtNum);
-    mju_addScl(vpre, d->qvel, d->qacc, -h, nv);
-
-    // rhs = qfrc_smooth + qfrc_constraint + h*K_interp*vpre - h*K_bend*vpre, exactly as
-    // the engine CG builds it
-    mju_add(el.rhs, d->qfrc_smooth, d->qfrc_constraint, nv);
-    mjd_flexInterp_mul(m, d, el.rhs, vpre, h, 0, el.Krot);
-    mjd_flexBend_mul(m, d, el.rhs, vpre, -h, 0);
-
-    // stage 1: solve A*qacc_corr = rhs over the full nv (the variational smooth solve,
-    // identical system to the deleted post-hoc CG), preconditioned by the engine's own
-    // factorization; this covers all flex DOF layouts including interpolated flexes on
-    // arbitrary joints
-    mjtNum* qcorr = mjSTACKALLOC(d, nv, mjtNum);
-    mjtNum* cr = mjSTACKALLOC(d, nv, mjtNum);
-    mjtNum* cz = mjSTACKALLOC(d, nv, mjtNum);
-    mjtNum* cp = mjSTACKALLOC(d, nv, mjtNum);
-    mjtNum* cAp = mjSTACKALLOC(d, nv, mjtNum);
-    mju_copy(qcorr, d->qacc, nv);
-    elasticAmul(m, &el, cAp, qcorr);
-    mju_sub(cr, el.rhs, cAp, nv);
-    mjtNum rnorm = mju_dot(cr, cr, nv);
-    mjtNum ctol = 1e-10*mju_dot(el.rhs, el.rhs, nv);
-    if (rnorm >= ctol && rnorm >= mjMINVAL) {
-      // preconditioner: the factored standard system (M - h*qDeriv)
-      #define IPC_PRECOND(z_out, r_in)         if (m->opt.integrator == mjINT_IMPLICIT) {           mju_solveLUSparse(z_out, d->qLU, r_in, nv, m->D_rownnz, m->D_rowadr,                             m->D_diag, m->D_colind, NULL);         } else {           mju_copy(z_out, r_in, nv);           mj_solveLD(z_out, d->qH, d->qHDiagInv, nv, 1, m->M_rownnz, m->M_rowadr,                      m->M_colind, NULL);         }
-      IPC_PRECOND(cz, cr);
-      mju_copy(cp, cz, nv);
-      mjtNum crz = mju_dot(cr, cz, nv);
-      for (int cg=0; cg < 50; cg++) {
-        elasticAmul(m, &el, cAp, cp);
-        mjtNum pAp = mju_dot(cp, cAp, nv);
-        if (mju_abs(pAp) < mjMINVAL) {
-          break;
-        }
-        mjtNum calpha = crz/pAp;
-        mju_addToScl(qcorr, cp, calpha, nv);
-        mju_addToScl(cr, cAp, -calpha, nv);
-        rnorm = mju_dot(cr, cr, nv);
-        if (rnorm < ctol || rnorm < mjMINVAL) {
-          break;
-        }
-        IPC_PRECOND(cz, cr);
-        mjtNum crznew = mju_dot(cr, cz, nv);
-        mju_addScl(cp, cz, cp, crznew/(crz > mjMINVAL ? crz : mjMINVAL), nv);
-        crz = crznew;
-      }
-      #undef IPC_PRECOND
-    }
-
-    // apply the correction exactly: undo the position advance, correct velocity and
-    // acceleration, redo the advance (valid for quaternion DOFs via mj_integratePos)
-    mj_integratePos(m, d->qpos, d->qvel, -h);
-    for (int i=0; i < nv; i++) {
-      mjtNum dv = h*(qcorr[i] - d->qacc[i]);
-      d->qvel[i] += dv;
-      d->qacc[i] = qcorr[i];
-    }
-    mj_integratePos(m, d->qpos, d->qvel, h);
-
-    // stage 2 (barrier projection) uses the inertia metric; the elastic correction is
-    // now part of the integrated target gathered below
-    el.mode = 0;
-  }
-
-
-  // barrier stage requires solvable vertices and is gated by the flexipc flag (the
-  // elastic stage above always runs: it replaces the former post-hoc CG)
-  if (!any || mjDISABLED(mjDSBL_FLEXIPC)) {
+  // the barrier stage is gated by the flexipc flag (the implicit elastic solve lives
+  // in the integrators and is unaffected by the flag)
+  if (mjDISABLED(mjDSBL_FLEXIPC)) {
     mj_freeStack(d);
     return;
   }
