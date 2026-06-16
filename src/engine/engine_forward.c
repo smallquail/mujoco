@@ -1973,6 +1973,138 @@ void mj_forward(const mjModel* m, mjData* d) {
 }
 
 
+// total energy for the IPC prototype integrator (inertia + edge-stretch penalty)
+static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, const mjtNum* x,
+                         const mjtNum* xtil, const int* fidx, const mjtNum* mass,
+                         const mjtNum* kE, mjtNum h) {
+  mjtNum E = 0, ih2 = 1.0/(h*h);
+  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+    mjtNum mh = mass[v]*ih2;
+    for (int c=0; c < 3; c++) { mjtNum t = x[3*v+c] - xtil[3*v+c]; E += 0.5*mh*t*t; }
+  }
+  for (int e=0; e < en; e++) {
+    int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+    mjtNum dv[3] = {x[3*a]-x[3*b], x[3*a+1]-x[3*b+1], x[3*a+2]-x[3*b+2]};
+    mjtNum L = sqrt(mju_dot3(dv, dv)), L0 = m->flexedge_length0[ea+e];
+    E += 0.5*kE[e]*(L-L0)*(L-L0);
+  }
+  return E;
+}
+
+
+// IPC-style variational integrator (PROTOTYPE, phase 0a): a single 2D flex, inertia + edge-stretch
+// penalty, NO contact yet -- the cloth WILL self-intersect; the barrier + CCD are the next phase.
+// Minimizes E = sum 1/2 (m/h^2)|x-xtil|^2 + sum 1/2 k(|e|-L0)^2 by projected-Newton + line search.
+// Dense solve (small flex only). Falls back to Euler if there is no 2D flex.
+void mj_IPC(const mjModel* m, mjData* d) {
+  mjtNum h = m->opt.timestep, tc = 0.02, kscale = 1000.0;
+  int f = -1;
+  for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { f = i; break; }
+  if (f < 0) { mj_Euler(m, d); return; }
+  int nfv = m->flex_vertnum[f], va = m->flex_vertadr[f];
+  int ea = m->flex_edgeadr[f], en = m->flex_edgenum[f];
+
+  int* dofadr = (int*) mju_malloc(nfv*sizeof(int));
+  int* fidx   = (int*) mju_malloc(nfv*sizeof(int));
+  mjtNum* mass = (mjtNum*) mju_malloc(nfv*sizeof(mjtNum));
+  int nfree = 0;
+  for (int v=0; v < nfv; v++) {
+    int bid = m->flex_vertbodyid[va+v];
+    dofadr[v] = -1; fidx[v] = -1; mass[v] = 0;
+    if (m->body_dofnum[bid] == 3) {
+      int da = m->body_dofadr[bid];
+      dofadr[v] = da; fidx[v] = nfree++;
+      mass[v] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];   // diagonal (point mass)
+    }
+  }
+  int N = 3*nfree, Na = (N > 0 ? N : 1);
+  mjtNum* kE = (mjtNum*) mju_malloc(en*sizeof(mjtNum));
+  for (int e=0; e < en; e++) {
+    mjtNum iw = m->flexedge_invweight0[ea+e];
+    kE[e] = kscale / ((iw > 1e-12 ? iw : 1e-9) * tc * tc);
+  }
+  mjtNum* x    = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
+  mjtNum* xtil = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
+  mjtNum* xold = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
+  mjtNum* xn   = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
+  mjtNum* grad = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
+  mjtNum* dx   = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
+  mjtNum* rhs  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
+  mjtNum* H    = (mjtNum*) mju_malloc((size_t)Na*Na*sizeof(mjtNum));
+  mjtNum* Hf   = (mjtNum*) mju_malloc((size_t)Na*Na*sizeof(mjtNum));
+
+  const mjtNum* vx = d->flexvert_xpos;
+  for (int v=0; v < nfv; v++) {
+    for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*(va+v)+c];
+    if (fidx[v] >= 0) {
+      int da = dofadr[v];
+      for (int c=0; c < 3; c++)
+        xtil[3*v+c] = vx[3*(va+v)+c] + h*d->qvel[da+c] + h*h*d->qacc_smooth[da+c];
+    } else {
+      for (int c=0; c < 3; c++) xtil[3*v+c] = vx[3*(va+v)+c];   // pinned: fixed
+    }
+  }
+  for (int i=0; i < 3*nfv; i++) x[i] = xtil[i];
+
+  mjtNum ih2 = 1.0/(h*h);
+  for (int it=0; it < 12 && N > 0; it++) {
+    for (int i=0; i < N; i++) grad[i] = 0;
+    for (int i=0; i < N*N; i++) H[i] = 0;
+    for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+      int fi = fidx[v]; mjtNum mh = mass[v]*ih2;
+      for (int c=0; c < 3; c++) { grad[3*fi+c] += mh*(x[3*v+c]-xtil[3*v+c]); H[(3*fi+c)*N+(3*fi+c)] += mh; }
+    }
+    for (int e=0; e < en; e++) {
+      int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+      mjtNum dv[3] = {x[3*a]-x[3*b], x[3*a+1]-x[3*b+1], x[3*a+2]-x[3*b+2]};
+      mjtNum L = sqrt(mju_dot3(dv, dv));
+      if (L < 1e-12) continue;
+      mjtNum L0 = m->flexedge_length0[ea+e], k = kE[e];
+      mjtNum dh[3] = {dv[0]/L, dv[1]/L, dv[2]/L};
+      mjtNum g = k*(L-L0), t = (L > L0) ? k*(1.0 - L0/L) : 0.0;   // PSD-project tangential term
+      mjtNum he[9];
+      for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+        he[3*i+j] = k*dh[i]*dh[j] + t*((i==j?1.0:0.0) - dh[i]*dh[j]);
+      int fa = fidx[a], fb = fidx[b];
+      if (fa >= 0) for (int c=0; c < 3; c++) grad[3*fa+c] += g*dh[c];
+      if (fb >= 0) for (int c=0; c < 3; c++) grad[3*fb+c] -= g*dh[c];
+      for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
+        mjtNum val = he[3*i+j];
+        if (fa >= 0) H[(3*fa+i)*N+(3*fa+j)] += val;
+        if (fb >= 0) H[(3*fb+i)*N+(3*fb+j)] += val;
+        if (fa >= 0 && fb >= 0) { H[(3*fa+i)*N+(3*fb+j)] -= val; H[(3*fb+i)*N+(3*fa+j)] -= val; }
+      }
+    }
+    mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
+    if (sqrt(gn) < 1e-8) break;
+    for (int i=0; i < N*N; i++) Hf[i] = H[i];
+    mju_cholFactor(Hf, N, 1e-12);
+    for (int i=0; i < N; i++) rhs[i] = -grad[i];
+    mju_cholSolve(dx, Hf, rhs, N);
+    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h);
+    mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
+    mjtNum alpha = 1.0;
+    for (int ls=0; ls < 20; ls++) {
+      for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
+      for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
+        for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
+      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h) <= E0 + 1e-4*alpha*gdx) break;
+      alpha *= 0.5;
+    }
+    for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
+  }
+  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+    int da = dofadr[v];
+    for (int c=0; c < 3; c++) { mjtNum dp = x[3*v+c]-xold[3*v+c]; d->qvel[da+c] = dp/h; d->qpos[da+c] += dp; }
+  }
+  d->time += h;
+
+  mju_free(dofadr); mju_free(fidx); mju_free(mass); mju_free(kE);
+  mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
+  mju_free(grad); mju_free(dx); mju_free(rhs); mju_free(H); mju_free(Hf);
+}
+
+
 // advance simulation using control callback
 void mj_step(const mjModel* m, mjData* d) {
   TM_START;
@@ -2001,6 +2133,10 @@ void mj_step(const mjModel* m, mjData* d) {
   case mjINT_IMPLICIT:
   case mjINT_IMPLICITFAST:
     mj_implicit(m, d);
+    break;
+
+  case mjINT_IPC:
+    mj_IPC(m, d);
     break;
 
   default:

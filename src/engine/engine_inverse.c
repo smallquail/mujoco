@@ -160,6 +160,10 @@ static void mj_discreteAcc(const mjModel* m, mjData* d) {
     // set qfrc = (M - dt*qDeriv) * qacc
     mju_mulSymVecSparse(qfrc, d->qH, qacc, m->nv, m->M_rownnz, m->M_rowadr, m->M_colind);
     break;
+
+  case mjINT_IPC:
+    mjERROR("discrete inverse dynamics is not supported by the IPC integrator");
+    return;
   }
 
   // solve for qacc: qfrc = M * qacc
