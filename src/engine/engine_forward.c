@@ -1974,9 +1974,54 @@ void mj_forward(const mjModel* m, mjData* d) {
 
 
 // total energy for the IPC prototype integrator (inertia + edge-stretch penalty)
+// point-triangle: distance, closest point cp, barycentric weights w of cp (for the barrier gradient)
+static mjtNum ipc_ptTri(const mjtNum* p, const mjtNum* a, const mjtNum* b, const mjtNum* c,
+                        mjtNum* cp, mjtNum* w) {
+  mjtNum ab[3], ac[3], ap[3];
+  for (int k=0; k < 3; k++) { ab[k]=b[k]-a[k]; ac[k]=c[k]-a[k]; ap[k]=p[k]-a[k]; }
+  mjtNum d1 = mju_dot3(ab, ap), d2 = mju_dot3(ac, ap);
+  if (d1 <= 0 && d2 <= 0) { w[0]=1; w[1]=0; w[2]=0; }
+  else {
+    mjtNum bp[3]; for (int k=0; k < 3; k++) bp[k] = p[k]-b[k];
+    mjtNum d3 = mju_dot3(ab, bp), d4 = mju_dot3(ac, bp);
+    if (d3 >= 0 && d4 <= d3) { w[0]=0; w[1]=1; w[2]=0; }
+    else {
+      mjtNum vc = d1*d4 - d3*d2;
+      if (vc <= 0 && d1 >= 0 && d3 <= 0) { mjtNum t=d1/(d1-d3); w[0]=1-t; w[1]=t; w[2]=0; }
+      else {
+        mjtNum cq[3]; for (int k=0; k < 3; k++) cq[k] = p[k]-c[k];
+        mjtNum d5 = mju_dot3(ab, cq), d6 = mju_dot3(ac, cq);
+        if (d6 >= 0 && d5 <= d6) { w[0]=0; w[1]=0; w[2]=1; }
+        else {
+          mjtNum vb = d5*d2 - d1*d6;
+          if (vb <= 0 && d2 >= 0 && d6 <= 0) { mjtNum t=d2/(d2-d6); w[0]=1-t; w[1]=0; w[2]=t; }
+          else {
+            mjtNum va = d3*d6 - d5*d4;
+            if (va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0) {
+              mjtNum t=(d4-d3)/((d4-d3)+(d5-d6)); w[0]=0; w[1]=1-t; w[2]=t;
+            } else {
+              mjtNum den = 1.0/(va+vb+vc), t = vb*den, u = vc*den; w[0]=1-t-u; w[1]=t; w[2]=u;
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int k=0; k < 3; k++) cp[k] = w[0]*a[k] + w[1]*b[k] + w[2]*c[k];
+  mjtNum dd[3]; for (int k=0; k < 3; k++) dd[k] = p[k]-cp[k];
+  return sqrt(mju_dot3(dd, dd));
+}
+
+// IPC log-barrier on a surface gap g (C-IPC offset) and its 1st/2nd derivatives, for 0 < g < gh
+static mjtNum ipc_Bg (mjtNum g, mjtNum gh) { return (g > 0 && g < gh) ? -(g-gh)*(g-gh)*log(g/gh) : 0.0; }
+static mjtNum ipc_Bd (mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*u*log(g/gh) - u*u/g; }
+static mjtNum ipc_Bdd(mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*log(g/gh) - 4*u/g + u*u/(g*g); }
+
+// IPC incremental-potential energy: inertia + edge-stretch + vertex-triangle barrier over the
+// per-iteration active pair list (apair: 4 vertex ids per pair)
 static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, const mjtNum* x,
-                         const mjtNum* xtil, const int* fidx, const mjtNum* mass,
-                         const mjtNum* kE, mjtNum h) {
+                         const mjtNum* xtil, const int* fidx, const mjtNum* mass, const mjtNum* kE,
+                         mjtNum h, mjtNum r, mjtNum ghat, mjtNum kappa, int napair, const int* apair) {
   mjtNum E = 0, ih2 = 1.0/(h*h);
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
     mjtNum mh = mass[v]*ih2;
@@ -1988,21 +2033,31 @@ static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, cons
     mjtNum L = sqrt(mju_dot3(dv, dv)), L0 = m->flexedge_length0[ea+e];
     E += 0.5*kE[e]*(L-L0)*(L-L0);
   }
+  for (int p=0; p < napair; p++) {
+    const int* pr = apair + 4*p; mjtNum cp[3], w[3];
+    mjtNum g = ipc_ptTri(&x[3*pr[0]], &x[3*pr[1]], &x[3*pr[2]], &x[3*pr[3]], cp, w) - 2*r;
+    if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+  }
   return E;
 }
 
 
-// IPC-style variational integrator (PROTOTYPE, phase 0a): a single 2D flex, inertia + edge-stretch
-// penalty, NO contact yet -- the cloth WILL self-intersect; the barrier + CCD are the next phase.
-// Minimizes E = sum 1/2 (m/h^2)|x-xtil|^2 + sum 1/2 k(|e|-L0)^2 by projected-Newton + line search.
-// Dense solve (small flex only). Falls back to Euler if there is no 2D flex.
+// IPC-style variational integrator (PROTOTYPE, phases 0a/0b): a single 2D flex -- inertia + edge-
+// stretch penalty + vertex-triangle SELF-CONTACT log-barrier -- by projected-Newton with a step-
+// capped (crude-CCD) line search, starting each step from the last collision-free state.
+// Intersection-free and freeze-free in validation, but PROTOTYPE quality: dense solve + per-step
+// malloc (small flex only), vertex-triangle only (no edge-edge), step-cap is not a rigorous CCD,
+// kappa hardcoded. Falls back to Euler if there is no 2D flex.
 void mj_IPC(const mjModel* m, mjData* d) {
-  mjtNum h = m->opt.timestep, tc = 0.02, kscale = 1000.0;
+  mjtNum h = m->opt.timestep, tc = 0.02, kscale = 1000.0, kappa = 100.0;
   int f = -1;
   for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { f = i; break; }
   if (f < 0) { mj_Euler(m, d); return; }
   int nfv = m->flex_vertnum[f], va = m->flex_vertadr[f];
   int ea = m->flex_edgeadr[f], en = m->flex_edgenum[f];
+  int ne = m->flex_elemnum[f];
+  const int* el = m->flex_elem + m->flex_elemdataadr[f];
+  mjtNum r = m->flex_radius[f], ghat = r;   // contact activates within ghat of the 2r surface gap
 
   int* dofadr = (int*) mju_malloc(nfv*sizeof(int));
   int* fidx   = (int*) mju_malloc(nfv*sizeof(int));
@@ -2023,6 +2078,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mjtNum iw = m->flexedge_invweight0[ea+e];
     kE[e] = kscale / ((iw > 1e-12 ? iw : 1e-9) * tc * tc);
   }
+  int amax = 4*(nfv*16 + 1);                 // active vertex-triangle pairs, 4 vertex ids each
+  int* apair = (int*) mju_malloc(amax*sizeof(int));
   mjtNum* x    = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
   mjtNum* xtil = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
   mjtNum* xold = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
@@ -2044,7 +2101,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < 3; c++) xtil[3*v+c] = vx[3*(va+v)+c];   // pinned: fixed
     }
   }
-  for (int i=0; i < 3*nfv; i++) x[i] = xtil[i];
+  for (int i=0; i < 3*nfv; i++) x[i] = xold[i];   // start from last collision-free state (feasibility)
 
   mjtNum ih2 = 1.0/(h*h);
   for (int it=0; it < 12 && N > 0; it++) {
@@ -2075,20 +2132,46 @@ void mj_IPC(const mjModel* m, mjData* d) {
         if (fa >= 0 && fb >= 0) { H[(3*fa+i)*N+(3*fb+j)] -= val; H[(3*fb+i)*N+(3*fa+j)] -= val; }
       }
     }
+    // vertex-triangle self-contact barrier: build the active set at x, assemble grad + GN Hessian
+    int napair = 0;
+    for (int v=0; v < nfv; v++) for (int e=0; e < ne; e++) {
+      int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
+      if (v == A || v == B || v == C) continue;
+      mjtNum cp[3], w[3];
+      mjtNum dd = ipc_ptTri(&x[3*v], &x[3*A], &x[3*B], &x[3*C], cp, w);
+      mjtNum g = dd - 2*r;
+      if (g <= 0 || g >= ghat) continue;
+      if (4*napair+3 < amax) { int* pr = apair+4*napair; pr[0]=v; pr[1]=A; pr[2]=B; pr[3]=C; napair++; }
+      mjtNum nrm[3]; for (int c=0; c < 3; c++) nrm[c] = (x[3*v+c]-cp[c])/dd;   // dg/dp = n
+      int idv[4] = {v, A, B, C}; mjtNum cw[4] = {1.0, -w[0], -w[1], -w[2]};   // dg/d(point) = cw*n
+      mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+      for (int p=0; p < 4; p++) { int fp = fidx[idv[p]]; if (fp < 0) continue;
+        for (int c=0; c < 3; c++) grad[3*fp+c] += bd*cw[p]*nrm[c]; }
+      for (int p=0; p < 4; p++) for (int q=0; q < 4; q++) {
+        int fp = fidx[idv[p]], fq = fidx[idv[q]]; if (fp < 0 || fq < 0) continue;
+        for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+          H[(3*fp+i)*N+(3*fq+j)] += bdd*cw[p]*cw[q]*nrm[i]*nrm[j];   // Gauss-Newton (PSD)
+      }
+    }
     mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
     if (sqrt(gn) < 1e-8) break;
     for (int i=0; i < N*N; i++) Hf[i] = H[i];
     mju_cholFactor(Hf, N, 1e-12);
     for (int i=0; i < N; i++) rhs[i] = -grad[i];
     mju_cholSolve(dx, Hf, rhs, N);
-    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h);
+    // step-capped (crude-CCD) backtracking line search: cap the max vertex move at 0.4*ghat so no
+    // pair tunnels in one step, then backtrack on the energy (which spikes as a contact closes)
+    mjtNum mx = 0; for (int i=0; i < N; i++) { mjtNum a = dx[i] < 0 ? -dx[i] : dx[i]; if (a > mx) mx = a; }
+    mjtNum cap = (mx > 0.4*ghat) ? (0.4*ghat/mx) : 1.0;
+    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h, r, ghat, kappa, napair, apair);
     mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
-    mjtNum alpha = 1.0;
-    for (int ls=0; ls < 20; ls++) {
+    mjtNum alpha = cap;
+    for (int ls=0; ls < 25; ls++) {
       for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
       for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h) <= E0 + 1e-4*alpha*gdx) break;
+      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h, r, ghat, kappa, napair, apair)
+          <= E0 + 1e-4*alpha*gdx) break;
       alpha *= 0.5;
     }
     for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
@@ -2099,7 +2182,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   d->time += h;
 
-  mju_free(dofadr); mju_free(fidx); mju_free(mass); mju_free(kE);
+  mju_free(dofadr); mju_free(fidx); mju_free(mass); mju_free(kE); mju_free(apair);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(grad); mju_free(dx); mju_free(rhs); mju_free(H); mju_free(Hf);
 }
