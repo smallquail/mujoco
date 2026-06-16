@@ -351,29 +351,22 @@ static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjt
   if (g > 0 && g < thresh) cand[(*nc)++] = con;
 }
 
-// build the candidate-contact list once per step (brute enumeration at x, gated by a velocity-aware
-// threshold so any pair that could close within the step is captured). The Newton loop then only
-// re-tests these candidates each iteration instead of re-enumerating all O(n^2) pairs.
+// hash an integer cell coordinate to a bucket (mask = nbucket-1, power-of-two table)
+static inline int ipc_hash3(int ix, int iy, int iz, int mask) {
+  unsigned int h = (unsigned int)ix*73856093u ^ (unsigned int)iy*19349663u ^ (unsigned int)iz*83492791u;
+  return (int)(h & (unsigned int)mask);
+}
+
+// build the candidate-contact list once per step, gated by a velocity-aware threshold so any pair
+// that could close within the step is captured (the Newton loop then only re-tests candidates).
+// Flex-flex pairs (VT + EE, the O(n^2) part) are culled by a uniform spatial hash with cell size >=
+// max primitive extent + thresh, so two features within thresh land within the 27-cell neighborhood;
+// the few geom features stay brute. Per-vertex/per-edge stamps dedup hash-bucket collisions.
 static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* gv,
                           const mjtNum* ge, int ngv, int nge, mjtNum r, mjtNum thresh,
                           int nfv, int ne, const int* el, int en, int ea, const int* fidx,
                           ipcCon* cand, int candmax) {
   int nc = 0;
-  for (int v=0; v < nfv; v++) for (int e=0; e < ne; e++) {                  // vertex-triangle self
-    int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
-    if (v == A || v == B || v == C) continue;
-    ipcCon con = {0, {v, A, B, C}, -1};
-    ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
-  }
-  for (int e1=0; e1 < en; e1++) {                                          // edge-edge self
-    int a1 = m->flex_edge[2*(ea+e1)], b1 = m->flex_edge[2*(ea+e1)+1];
-    for (int e2=e1+1; e2 < en; e2++) {
-      int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
-      if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;
-      ipcCon con = {1, {a1, b1, a2, b2}, -1};
-      ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
-    }
-  }
   for (int gi=0; gi < m->ngeom; gi++) for (int v=0; v < nfv; v++) {          // flex-vertex vs geom
     if (fidx[v] < 0) continue;
     ipcCon con = {2, {v, 0, 0, 0}, gi};
@@ -387,6 +380,75 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
     ipcCon con = {4, {c, m->flex_edge[2*(ea+e)], m->flex_edge[2*(ea+e)+1], 0}, -1};
     ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
   }
+  if (ne == 0 && en == 0) return nc;
+
+  // cell size = max flex primitive extent + thresh, so neighbors within thresh are within +/-1 cell
+  mjtNum maxext = 0;
+  for (int e=0; e < en; e++) {
+    int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+    mjtNum dd[3]; for (int k=0; k < 3; k++) dd[k] = x[3*a+k]-x[3*b+k];
+    mjtNum L = sqrt(mju_dot3(dd, dd)); if (L > maxext) maxext = L;
+  }
+  mjtNum inv = 1.0/(maxext + thresh + 1e-9);
+  int NB = 4096, mask = NB-1;
+  int* headE  = (int*) mju_malloc(NB*sizeof(int));
+  int* headG  = (int*) mju_malloc(NB*sizeof(int));
+  int* nxtE   = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
+  int* nxtG   = (int*) mju_malloc((en > 0 ? en : 1)*sizeof(int));
+  int* stampE = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
+  int* stampG = (int*) mju_malloc((en > 0 ? en : 1)*sizeof(int));
+  for (int i=0; i < NB; i++) { headE[i] = -1; headG[i] = -1; }
+  for (int e=0; e < ne; e++) stampE[e] = -1;
+  for (int e=0; e < en; e++) stampG[e] = -1;
+
+  // insert elements by centroid, edges by midpoint (one bucket each)
+  for (int e=0; e < ne; e++) {
+    int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
+    int h = ipc_hash3((int)floor((x[3*A]  +x[3*B]  +x[3*C]  )*inv/3),
+                      (int)floor((x[3*A+1]+x[3*B+1]+x[3*C+1])*inv/3),
+                      (int)floor((x[3*A+2]+x[3*B+2]+x[3*C+2])*inv/3), mask);
+    nxtE[e] = headE[h]; headE[h] = e;
+  }
+  for (int e=0; e < en; e++) {
+    int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+    int h = ipc_hash3((int)floor((x[3*a]  +x[3*b]  )*inv/2),
+                      (int)floor((x[3*a+1]+x[3*b+1])*inv/2),
+                      (int)floor((x[3*a+2]+x[3*b+2])*inv/2), mask);
+    nxtG[e] = headG[h]; headG[h] = e;
+  }
+
+  // vertex-triangle self: each vertex queries the element grid's 27-cell neighborhood
+  for (int v=0; v < nfv; v++) {
+    int ix = (int)floor(x[3*v]*inv), iy = (int)floor(x[3*v+1]*inv), iz = (int)floor(x[3*v+2]*inv);
+    for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
+      int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
+      for (int e=headE[h]; e >= 0; e=nxtE[e]) {
+        if (stampE[e] == v) continue; stampE[e] = v;
+        int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
+        if (v==A || v==B || v==C) continue;
+        ipcCon con = {0, {v, A, B, C}, -1};
+        ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+      }
+    }
+  }
+  // edge-edge self: each edge queries the edge grid's 27-cell neighborhood (canonical e2 > e1)
+  for (int e1=0; e1 < en; e1++) {
+    int a1 = m->flex_edge[2*(ea+e1)], b1 = m->flex_edge[2*(ea+e1)+1];
+    int ix = (int)floor((x[3*a1]  +x[3*b1]  )*inv/2),
+        iy = (int)floor((x[3*a1+1]+x[3*b1+1])*inv/2),
+        iz = (int)floor((x[3*a1+2]+x[3*b1+2])*inv/2);
+    for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
+      int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
+      for (int e2=headG[h]; e2 >= 0; e2=nxtG[e2]) {
+        if (e2 <= e1 || stampG[e2] == e1) continue; stampG[e2] = e1;
+        int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
+        if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;
+        ipcCon con = {1, {a1, b1, a2, b2}, -1};
+        ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+      }
+    }
+  }
+  mju_free(headE); mju_free(headG); mju_free(nxtE); mju_free(nxtG); mju_free(stampE); mju_free(stampG);
   return nc;
 }
 
