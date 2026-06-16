@@ -94,6 +94,87 @@ static mjtNum ipc_segSeg(const mjtNum* p1, const mjtNum* p2, const mjtNum* q1, c
   return sqrt(mju_dot3(dd, dd));
 }
 
+// signed distance from a static geom's surface to world point x (positive outside) + outward unit
+// normal n. Closed-form for plane/sphere/capsule/box; returns +large (no contact) for other types.
+static mjtNum ipc_geomDist(int type, const mjtNum* size, const mjtNum* gpos, const mjtNum* gmat,
+                           const mjtNum* x, mjtNum* n) {
+  mjtNum dx[3]; for (int k=0; k < 3; k++) dx[k] = x[k]-gpos[k];
+  if (type == mjGEOM_PLANE) {
+    n[0]=gmat[2]; n[1]=gmat[5]; n[2]=gmat[8];   // local +z axis in world coords
+    return mju_dot3(n, dx);
+  }
+  if (type == mjGEOM_SPHERE) {
+    mjtNum L = sqrt(mju_dot3(dx, dx));
+    if (L < 1e-12) { n[0]=0; n[1]=0; n[2]=1; return -size[0]; }
+    for (int k=0; k < 3; k++) n[k]=dx[k]/L;
+    return L - size[0];
+  }
+  mjtNum p[3]; mju_mulMatTVec3(p, gmat, dx);   // world -> geom-local
+  mjtNum nl[3] = {0,0,0}, dist;
+  if (type == mjGEOM_CAPSULE) {
+    mjtNum hz = size[1], zc = p[2] > hz ? hz : (p[2] < -hz ? -hz : p[2]);
+    mjtNum q[3] = {p[0], p[1], p[2]-zc};       // vector from nearest axis point
+    mjtNum L = sqrt(mju_dot3(q, q));
+    if (L < 1e-12) { nl[0]=1; } else { for (int k=0; k < 3; k++) nl[k]=q[k]/L; }
+    dist = L - size[0];
+  } else if (type == mjGEOM_BOX) {
+    mjtNum q[3]; int outside = 0;
+    for (int k=0; k < 3; k++) {
+      mjtNum c = p[k] > size[k] ? size[k] : (p[k] < -size[k] ? -size[k] : p[k]);
+      q[k] = p[k]-c; if (q[k] != 0) outside = 1;
+    }
+    if (outside) {
+      mjtNum L = sqrt(mju_dot3(q, q)); dist = L;
+      for (int k=0; k < 3; k++) nl[k]=q[k]/L;
+    } else {                                    // inside: least-penetration face
+      int ax = 0; mjtNum best = 1e30;
+      for (int k=0; k < 3; k++) { mjtNum pen = size[k]-(p[k] < 0 ? -p[k] : p[k]); if (pen < best) { best = pen; ax = k; } }
+      dist = -best; nl[ax] = p[ax] > 0 ? 1 : -1;
+    }
+  } else {
+    n[0]=0; n[1]=0; n[2]=1; return 1e30;        // unsupported geom -> no barrier
+  }
+  mju_mulMatVec3(n, gmat, nl);                   // geom-local normal -> world
+  return dist;
+}
+
+// world-space sharp corner vertices of a static geom (features that can poke through a flex face):
+// box -> 8 corners; smooth/infinite geoms have none. Fills out (up to 8*3), returns the count.
+static int ipc_geomVerts(int type, const mjtNum* size, const mjtNum* gpos, const mjtNum* gmat,
+                         mjtNum* out) {
+  if (type != mjGEOM_BOX) return 0;
+  int n = 0;
+  for (int sx=-1; sx <= 1; sx+=2) for (int sy=-1; sy <= 1; sy+=2) for (int sz=-1; sz <= 1; sz+=2) {
+    mjtNum loc[3] = {sx*size[0], sy*size[1], sz*size[2]}, wc[3];
+    mju_mulMatVec3(wc, gmat, loc);
+    for (int k=0; k < 3; k++) out[3*n+k] = gpos[k] + wc[k];
+    n++;
+  }
+  return n;
+}
+
+// world-space sharp edges of a static geom (a geom edge can slice through a flex edge between
+// vertices): box -> 12 edges, each two endpoints (6 mjtNum); others none. Returns the edge count.
+static int ipc_geomEdges(int type, const mjtNum* size, const mjtNum* gpos, const mjtNum* gmat,
+                         mjtNum* out) {
+  if (type != mjGEOM_BOX) return 0;
+  int n = 0;
+  for (int axis=0; axis < 3; axis++) {
+    int a1 = (axis+1)%3, a2 = (axis+2)%3;
+    for (int s1=-1; s1 <= 1; s1+=2) for (int s2=-1; s2 <= 1; s2+=2) {
+      mjtNum lo[3], hi[3], w1[3], w2[3];
+      lo[axis] = -size[axis]; hi[axis] = size[axis];
+      lo[a1] = hi[a1] = s1*size[a1];
+      lo[a2] = hi[a2] = s2*size[a2];
+      mju_mulMatVec3(w1, gmat, lo);
+      mju_mulMatVec3(w2, gmat, hi);
+      for (int k=0; k < 3; k++) { out[6*n+k] = gpos[k]+w1[k]; out[6*n+3+k] = gpos[k]+w2[k]; }
+      n++;
+    }
+  }
+  return n;   // 12
+}
+
 // IPC log-barrier on a surface gap g (C-IPC offset) and its 1st/2nd derivatives, for 0 < g < gh
 static mjtNum ipc_Bg (mjtNum g, mjtNum gh) { return (g > 0 && g < gh) ? -(g-gh)*(g-gh)*log(g/gh) : 0.0; }
 static mjtNum ipc_Bd (mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*u*log(g/gh) - u*u/g; }
@@ -101,9 +182,10 @@ static mjtNum ipc_Bdd(mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*log(g/gh) 
 
 // IPC incremental-potential energy: inertia + edge-stretch + vertex-triangle barrier over the
 // per-iteration active pair list (apair: 4 vertex ids per pair)
-static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, const mjtNum* x,
-                         const mjtNum* xtil, const int* fidx, const mjtNum* mass, const mjtNum* kE,
-                         mjtNum h, mjtNum r, mjtNum ghat, mjtNum kappa, int napair, const int* apair,
+static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int va, int ea, int en,
+                         int ne, const int* el, const mjtNum* x, const mjtNum* xtil,
+                         const int* fidx, const mjtNum* mass, const mjtNum* kE, mjtNum h, mjtNum r,
+                         mjtNum ghat, mjtNum kappa, int napair, const int* apair,
                          int naedge, const int* aedge) {
   mjtNum E = 0, ih2 = 1.0/(h*h);
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
@@ -125,6 +207,33 @@ static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, cons
     const int* pr = aedge + 4*p; mjtNum cp1[3], cp2[3], stp[2];
     mjtNum g = ipc_segSeg(&x[3*pr[0]], &x[3*pr[1]], &x[3*pr[2]], &x[3*pr[3]], cp1, cp2, stp) - 2*r;
     if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+  }
+  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+    for (int gi=0; gi < m->ngeom; gi++) {
+      mjtNum nrm[3];
+      mjtNum g = ipc_geomDist(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                              d->geom_xmat+9*gi, &x[3*v], nrm) - r;
+      if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+    }
+  }
+  for (int gi=0; gi < m->ngeom; gi++) {
+    mjtNum gv[24]; int ngv = ipc_geomVerts(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                                           d->geom_xmat+9*gi, gv);
+    for (int c=0; c < ngv; c++) for (int e=0; e < ne; e++) {
+      mjtNum cp[3], w[3];
+      mjtNum g = ipc_ptTri(&gv[3*c], &x[3*el[3*e]], &x[3*el[3*e+1]], &x[3*el[3*e+2]], cp, w) - r;
+      if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+    }
+  }
+  for (int gi=0; gi < m->ngeom; gi++) {
+    mjtNum ge[72]; int nge = ipc_geomEdges(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                                           d->geom_xmat+9*gi, ge);
+    for (int c=0; c < nge; c++) for (int e=0; e < en; e++) {
+      int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+      mjtNum cp1[3], cp2[3], stp[2];
+      mjtNum g = ipc_segSeg(&ge[6*c], &ge[6*c+3], &x[3*a], &x[3*b], cp1, cp2, stp) - r;
+      if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+    }
   }
   return E;
 }
@@ -268,6 +377,66 @@ void mj_IPC(const mjModel* m, mjData* d) {
         }
       }
     }
+    // flex-vs-static-geom barrier: each free vertex against each (fixed) geom, closed-form distance
+    for (int v=0; v < nfv; v++) { int fv = fidx[v]; if (fv < 0) continue;
+      for (int gi=0; gi < m->ngeom; gi++) {
+        mjtNum nrm[3];
+        mjtNum dgg = ipc_geomDist(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                                  d->geom_xmat+9*gi, &x[3*v], nrm);
+        mjtNum g = dgg - r;   // vertex inflated by flex radius; geom is solid (dg/dx = n)
+        if (g <= 0 || g >= ghat) continue;
+        mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+        for (int c=0; c < 3; c++) grad[3*fv+c] += bd*nrm[c];
+        for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+          H[(3*fv+i)*N+(3*fv+j)] += bdd*nrm[i]*nrm[j];   // Gauss-Newton (PSD), vertex-only block
+      }
+    }
+    // static-geom-corner vs flex-triangle barrier: a sharp geom corner poking through a flex face
+    // (the dual of vertex-vs-geom; corner is fixed, gradient lands on the 3 triangle vertices)
+    for (int gi=0; gi < m->ngeom; gi++) {
+      mjtNum gv[24]; int ngv = ipc_geomVerts(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                                             d->geom_xmat+9*gi, gv);
+      for (int c=0; c < ngv; c++) for (int e=0; e < ne; e++) {
+        int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
+        mjtNum cp[3], w[3];
+        mjtNum dd = ipc_ptTri(&gv[3*c], &x[3*A], &x[3*B], &x[3*C], cp, w);
+        mjtNum g = dd - r;
+        if (g <= 0 || g >= ghat) continue;
+        mjtNum nrm[3]; for (int k=0; k < 3; k++) nrm[k] = (gv[3*c+k]-cp[k])/dd;   // dg/d(corner)=n
+        int idv[3] = {A, B, C}; mjtNum cw[3] = {-w[0], -w[1], -w[2]};   // corner fixed; tri gets -w*n
+        mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+        for (int p=0; p < 3; p++) { int fp = fidx[idv[p]]; if (fp < 0) continue;
+          for (int k=0; k < 3; k++) grad[3*fp+k] += bd*cw[p]*nrm[k]; }
+        for (int p=0; p < 3; p++) for (int q=0; q < 3; q++) {
+          int fp = fidx[idv[p]], fq = fidx[idv[q]]; if (fp < 0 || fq < 0) continue;
+          for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+            H[(3*fp+i)*N+(3*fq+j)] += bdd*cw[p]*cw[q]*nrm[i]*nrm[j];   // Gauss-Newton (PSD)
+        }
+      }
+    }
+    // static-geom-edge vs flex-edge barrier: a sharp geom edge slicing through a flex edge between
+    // vertices (the third feature pair; geom edge fixed, gradient lands on the 2 flex endpoints)
+    for (int gi=0; gi < m->ngeom; gi++) {
+      mjtNum ge[72]; int nge = ipc_geomEdges(m->geom_type[gi], m->geom_size+3*gi, d->geom_xpos+3*gi,
+                                             d->geom_xmat+9*gi, ge);
+      for (int c=0; c < nge; c++) for (int e=0; e < en; e++) {
+        int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
+        mjtNum cp1[3], cp2[3], stp[2];
+        mjtNum dd = ipc_segSeg(&ge[6*c], &ge[6*c+3], &x[3*a], &x[3*b], cp1, cp2, stp);
+        mjtNum g = dd - r;
+        if (g <= 0 || g >= ghat) continue;
+        mjtNum nrm[3]; for (int k=0; k < 3; k++) nrm[k] = (cp1[k]-cp2[k])/dd;   // dg/dcp1 = n
+        int idv[2] = {a, b}; mjtNum cw[2] = {-(1.0-stp[1]), -stp[1]};   // geom edge fixed; flex -w*n
+        mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+        for (int p=0; p < 2; p++) { int fp = fidx[idv[p]]; if (fp < 0) continue;
+          for (int k=0; k < 3; k++) grad[3*fp+k] += bd*cw[p]*nrm[k]; }
+        for (int p=0; p < 2; p++) for (int q=0; q < 2; q++) {
+          int fp = fidx[idv[p]], fq = fidx[idv[q]]; if (fp < 0 || fq < 0) continue;
+          for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+            H[(3*fp+i)*N+(3*fq+j)] += bdd*cw[p]*cw[q]*nrm[i]*nrm[j];   // Gauss-Newton (PSD)
+        }
+      }
+    }
     mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
     if (sqrt(gn) < 1e-8) break;
     for (int i=0; i < N*N; i++) Hf[i] = H[i];
@@ -278,7 +447,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // pair tunnels in one step, then backtrack on the energy (which spikes as a contact closes)
     mjtNum mx = 0; for (int i=0; i < N; i++) { mjtNum a = dx[i] < 0 ? -dx[i] : dx[i]; if (a > mx) mx = a; }
     mjtNum cap = (mx > 0.4*ghat) ? (0.4*ghat/mx) : 1.0;
-    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h, r, ghat, kappa,
+    mjtNum E0 = ipc_energy(m, d, nfv, va, ea, en, ne, el, x, xtil, fidx, mass, kE, h, r, ghat, kappa,
                            napair, apair, naedge, aedge);
     mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
     mjtNum alpha = cap;
@@ -286,7 +455,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
       for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h, r, ghat, kappa,
+      if (ipc_energy(m, d, nfv, va, ea, en, ne, el, xn, xtil, fidx, mass, kE, h, r, ghat, kappa,
                      napair, apair, naedge, aedge) <= E0 + 1e-4*alpha*gdx) break;
       alpha *= 0.5;
     }
