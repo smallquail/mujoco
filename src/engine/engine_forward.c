@@ -1981,7 +1981,17 @@ void mj_step(const mjModel* m, mjData* d) {
   // common to all integrators
   mj_checkPos(m, d);
   mj_checkVel(m, d);
-  mj_forward(m, d);
+  // the IPC integrator does its own contact and reformulates flex stretch as a penalty, so the
+  // constraint assembly + solve in mj_forward is wasted for it. Disable constraints for the
+  // predictor (kinematics, mass and qacc_smooth -- the unconstrained accel -- are unaffected).
+  if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
+    int saved = m->opt.disableflags;
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT;
+    mj_forward(m, d);
+    ((mjModel*) m)->opt.disableflags = saved;
+  } else {
+    mj_forward(m, d);
+  }
   mj_checkAcc(m, d);
 
   // compare forward and inverse solutions if enabled
