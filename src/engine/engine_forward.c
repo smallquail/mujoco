@@ -2012,6 +2012,37 @@ static mjtNum ipc_ptTri(const mjtNum* p, const mjtNum* a, const mjtNum* b, const
   return sqrt(mju_dot3(dd, dd));
 }
 
+// closest distance between segment p1p2 and segment q1q2; closest points cp1, cp2 and the segment
+// parameters st = {s, t} (cp1 = p1+s*(p2-p1), cp2 = q1+t*(q2-q1)). No parallel-edge mollifier yet:
+// the degenerate (near-parallel) branch falls back to s=0, which is fine for non-parallel crossings.
+static mjtNum ipc_segSeg(const mjtNum* p1, const mjtNum* p2, const mjtNum* q1, const mjtNum* q2,
+                         mjtNum* cp1, mjtNum* cp2, mjtNum* st) {
+  mjtNum d1[3], d2[3], rr[3];
+  for (int k=0; k < 3; k++) { d1[k]=p2[k]-p1[k]; d2[k]=q2[k]-q1[k]; rr[k]=p1[k]-q1[k]; }
+  mjtNum a = mju_dot3(d1, d1), e = mju_dot3(d2, d2), fq = mju_dot3(d2, rr);
+  mjtNum s, t;
+  if (a <= 1e-12 && e <= 1e-12) { s = 0; t = 0; }
+  else if (a <= 1e-12) { s = 0; t = fq/e; }
+  else {
+    mjtNum c = mju_dot3(d1, rr);
+    if (e <= 1e-12) { t = 0; s = -c/a; }
+    else {
+      mjtNum b = mju_dot3(d1, d2), den = a*e - b*b;
+      s = (den > 1e-12) ? (b*fq - c*e)/den : 0.0;   // parallel: s=0 (mollifier territory, deferred)
+      s = (s < 0) ? 0 : (s > 1 ? 1 : s);
+      t = (b*s + fq)/e;
+      if (t < 0)      { t = 0; s = -c/a; }
+      else if (t > 1) { t = 1; s = (b - c)/a; }
+    }
+  }
+  s = (s < 0) ? 0 : (s > 1 ? 1 : s);
+  t = (t < 0) ? 0 : (t > 1 ? 1 : t);
+  st[0] = s; st[1] = t;
+  for (int k=0; k < 3; k++) { cp1[k]=p1[k]+s*d1[k]; cp2[k]=q1[k]+t*d2[k]; }
+  mjtNum dd[3]; for (int k=0; k < 3; k++) dd[k] = cp1[k]-cp2[k];
+  return sqrt(mju_dot3(dd, dd));
+}
+
 // IPC log-barrier on a surface gap g (C-IPC offset) and its 1st/2nd derivatives, for 0 < g < gh
 static mjtNum ipc_Bg (mjtNum g, mjtNum gh) { return (g > 0 && g < gh) ? -(g-gh)*(g-gh)*log(g/gh) : 0.0; }
 static mjtNum ipc_Bd (mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*u*log(g/gh) - u*u/g; }
@@ -2021,7 +2052,8 @@ static mjtNum ipc_Bdd(mjtNum g, mjtNum gh) { mjtNum u=g-gh; return -2*log(g/gh) 
 // per-iteration active pair list (apair: 4 vertex ids per pair)
 static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, const mjtNum* x,
                          const mjtNum* xtil, const int* fidx, const mjtNum* mass, const mjtNum* kE,
-                         mjtNum h, mjtNum r, mjtNum ghat, mjtNum kappa, int napair, const int* apair) {
+                         mjtNum h, mjtNum r, mjtNum ghat, mjtNum kappa, int napair, const int* apair,
+                         int naedge, const int* aedge) {
   mjtNum E = 0, ih2 = 1.0/(h*h);
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
     mjtNum mh = mass[v]*ih2;
@@ -2036,6 +2068,11 @@ static mjtNum ipc_energy(const mjModel* m, int nfv, int va, int ea, int en, cons
   for (int p=0; p < napair; p++) {
     const int* pr = apair + 4*p; mjtNum cp[3], w[3];
     mjtNum g = ipc_ptTri(&x[3*pr[0]], &x[3*pr[1]], &x[3*pr[2]], &x[3*pr[3]], cp, w) - 2*r;
+    if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+  }
+  for (int p=0; p < naedge; p++) {
+    const int* pr = aedge + 4*p; mjtNum cp1[3], cp2[3], stp[2];
+    mjtNum g = ipc_segSeg(&x[3*pr[0]], &x[3*pr[1]], &x[3*pr[2]], &x[3*pr[3]], cp1, cp2, stp) - 2*r;
     if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
   }
   return E;
@@ -2080,6 +2117,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   int amax = 4*(nfv*16 + 1);                 // active vertex-triangle pairs, 4 vertex ids each
   int* apair = (int*) mju_malloc(amax*sizeof(int));
+  int aemax = 4*(nfv*32 + 1);                 // active edge-edge pairs, 4 vertex ids each
+  int* aedge = (int*) mju_malloc(aemax*sizeof(int));
   mjtNum* x    = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
   mjtNum* xtil = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
   mjtNum* xold = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
@@ -2153,6 +2192,31 @@ void mj_IPC(const mjModel* m, mjData* d) {
           H[(3*fp+i)*N+(3*fq+j)] += bdd*cw[p]*cw[q]*nrm[i]*nrm[j];   // Gauss-Newton (PSD)
       }
     }
+    // edge-edge self-contact barrier: same barrier/Hessian machinery, closest points via ipc_segSeg
+    int naedge = 0;
+    for (int e1=0; e1 < en; e1++) {
+      int a1 = m->flex_edge[2*(ea+e1)], b1 = m->flex_edge[2*(ea+e1)+1];
+      for (int e2=e1+1; e2 < en; e2++) {
+        int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
+        if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;   // skip edges sharing a vertex
+        mjtNum cp1[3], cp2[3], stp[2];
+        mjtNum dd = ipc_segSeg(&x[3*a1], &x[3*b1], &x[3*a2], &x[3*b2], cp1, cp2, stp);
+        mjtNum g = dd - 2*r;
+        if (g <= 0 || g >= ghat) continue;
+        if (4*naedge+3 < aemax) { int* pr = aedge+4*naedge; pr[0]=a1; pr[1]=b1; pr[2]=a2; pr[3]=b2; naedge++; }
+        mjtNum nrm[3]; for (int c=0; c < 3; c++) nrm[c] = (cp1[c]-cp2[c])/dd;   // dg/dcp1 = n
+        int idv[4] = {a1, b1, a2, b2};
+        mjtNum cw[4] = {1.0-stp[0], stp[0], -(1.0-stp[1]), -stp[1]};   // dg/d(endpoint) = cw*n
+        mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+        for (int p=0; p < 4; p++) { int fp = fidx[idv[p]]; if (fp < 0) continue;
+          for (int c=0; c < 3; c++) grad[3*fp+c] += bd*cw[p]*nrm[c]; }
+        for (int p=0; p < 4; p++) for (int q=0; q < 4; q++) {
+          int fp = fidx[idv[p]], fq = fidx[idv[q]]; if (fp < 0 || fq < 0) continue;
+          for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+            H[(3*fp+i)*N+(3*fq+j)] += bdd*cw[p]*cw[q]*nrm[i]*nrm[j];   // Gauss-Newton (PSD)
+        }
+      }
+    }
     mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
     if (sqrt(gn) < 1e-8) break;
     for (int i=0; i < N*N; i++) Hf[i] = H[i];
@@ -2163,15 +2227,16 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // pair tunnels in one step, then backtrack on the energy (which spikes as a contact closes)
     mjtNum mx = 0; for (int i=0; i < N; i++) { mjtNum a = dx[i] < 0 ? -dx[i] : dx[i]; if (a > mx) mx = a; }
     mjtNum cap = (mx > 0.4*ghat) ? (0.4*ghat/mx) : 1.0;
-    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h, r, ghat, kappa, napair, apair);
+    mjtNum E0 = ipc_energy(m, nfv, va, ea, en, x, xtil, fidx, mass, kE, h, r, ghat, kappa,
+                           napair, apair, naedge, aedge);
     mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
     mjtNum alpha = cap;
     for (int ls=0; ls < 25; ls++) {
       for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
       for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h, r, ghat, kappa, napair, apair)
-          <= E0 + 1e-4*alpha*gdx) break;
+      if (ipc_energy(m, nfv, va, ea, en, xn, xtil, fidx, mass, kE, h, r, ghat, kappa,
+                     napair, apair, naedge, aedge) <= E0 + 1e-4*alpha*gdx) break;
       alpha *= 0.5;
     }
     for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
@@ -2182,7 +2247,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   d->time += h;
 
-  mju_free(dofadr); mju_free(fidx); mju_free(mass); mju_free(kE); mju_free(apair);
+  mju_free(dofadr); mju_free(fidx); mju_free(mass); mju_free(kE); mju_free(apair); mju_free(aedge);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(grad); mju_free(dx); mju_free(rhs); mju_free(H); mju_free(Hf);
 }
