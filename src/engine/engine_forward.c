@@ -1986,7 +1986,10 @@ void mj_step(const mjModel* m, mjData* d) {
   // predictor (kinematics, mass and qacc_smooth -- the unconstrained accel -- are unaffected).
   if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
     int saved = m->opt.disableflags;
-    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT;
+    // IPC does its own contact (barrier) and ignores d->contact, so skip MuJoCo's constraint solve
+    // AND its collision detection in the predictor (the latter otherwise produces native contacts --
+    // e.g. string-inside-bag -- that the integrator never uses but the viewer shows, which misleads).
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT;
     mj_forward(m, d);
     ((mjModel*) m)->opt.disableflags = saved;
   } else {
