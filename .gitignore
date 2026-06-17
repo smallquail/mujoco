@@ -42,3 +42,6 @@ MUJOCO_LOG.TXT
 wasm/**/dist/
 **/node_modules/
 
+# CTest gtest_discover_tests artifacts (written into the test working dirs)
+cmake_test_discovery_*.json
+
