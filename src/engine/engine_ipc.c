@@ -599,143 +599,123 @@ static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjt
   if (g > 0 && g < thresh) cand[(*nc)++] = con;
 }
 
-// hash an integer cell coordinate to a bucket (mask = nbucket-1, power-of-two table)
-static inline int ipc_hash3(int ix, int iy, int iz, int mask) {
-  unsigned int h = (unsigned int)ix*73856093u ^ (unsigned int)iy*19349663u ^ (unsigned int)iz*83492791u;
-  return (int)(h & (unsigned int)mask);
+// descend flex f's element BVH (built and AABB-refreshed by mj_flex at the step's xold), collecting the
+// leaf element ids whose (radius-inflated) node AABB overlaps the query box [c +/- h]. Replaces the
+// hand-rolled uniform spatial hash: same "nearby elements" query, but the engine's hierarchy. The node
+// AABBs already include flex_radius, so a query half of thresh is a conservative superset (no pair within
+// thresh is missed; the narrowphase then filters). stack must hold flex_bvhnum ints.
+static int ipc_bvhBox(const mjModel* m, const mjData* d, int f, const mjtNum* c, const mjtNum* h,
+                      int* stack, int* out, int maxout) {
+  int bvhadr = m->flex_bvhadr[f];
+  if (bvhadr < 0) return 0;
+  const int* child = m->bvh_child + 2*bvhadr;
+  const int* nodeid = m->bvh_nodeid + bvhadr;
+  const mjtNum* aabb = d->bvh_aabb_dyn + 6*(bvhadr - m->nbvhstatic);
+  int ns = 0, nout = 0; stack[ns++] = 0;
+  while (ns) {
+    int node = stack[--ns];
+    const mjtNum* na = aabb + 6*node;                              // [center(3), halfsize(3)]
+    if (mju_abs(na[0]-c[0]) > na[3]+h[0] ||
+        mju_abs(na[1]-c[1]) > na[4]+h[1] ||
+        mju_abs(na[2]-c[2]) > na[5]+h[2]) continue;                // box-box separation -> prune
+    int c0 = child[2*node], c1 = child[2*node+1];
+    if (c0 < 0 && c1 < 0) { if (nout < maxout) out[nout++] = nodeid[node]; }   // leaf -> element id
+    else { if (c0 >= 0) stack[ns++] = c0; if (c1 >= 0) stack[ns++] = c1; }
+  }
+  return nout;
 }
 
 // build the candidate-contact list once per step, gated by a velocity-aware threshold so any pair
 // that could close within the step is captured (the Newton loop then only re-tests candidates).
-// Flex-flex pairs (VT + EE, the O(n^2) part) are culled by a uniform spatial hash with cell size >=
-// max primitive extent + thresh, so two features within thresh land within the 27-cell neighborhood;
-// the few geom features stay brute. Per-vertex/per-edge stamps dedup hash-bucket collisions.
+// Flex-flex and geom-feature-vs-flex pairs are found by querying the flex element BVH (ipc_bvhBox).
 static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* gv,
                           const mjtNum* ge, int ngv, int nge, mjtNum r, mjtNum thresh,
                           int nfv, int ne, const int* el, int en, int ea, const int* fidx,
-                          int doself, ipcCon* cand, int candmax) {
+                          int f, const int* elemedge, int doself, ipcCon* cand, int candmax) {
   int nc = 0;
   for (int gi=0; gi < m->ngeom; gi++) {                                      // flex-vertex vs geom
     if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;       // skip non-colliding
-    // geom-level cull: a bounded geom (mesh/primitive, rbound>0) only needs the bag verts within its
-    // bounding sphere + margin; skip the rest before the per-face distance. Planes (rbound==0) are
-    // infinite, so no cull -- every vertex is checked (cheap: plane distance is O(1)).
-    mjtNum rb = m->geom_rbound[gi];
-    const mjtNum* gc = d->geom_xpos + 3*gi;
-    mjtNum grb2 = (rb > 0) ? (rb+thresh+r)*(rb+thresh+r) : 0;
+    // geom-level cull: bound the bag verts by the geom's true world AABB (the rotated local geom_aabb)
+    // + margin, before the per-face distance. Much tighter than the bounding sphere for the elongated
+    // convex-decomposition slabs. Planes are infinite -> no cull (their distance is O(1) anyway).
+    int isplane = (m->geom_type[gi] == mjGEOM_PLANE);
+    mjtNum wc[3], wh[3], marg = thresh + r;
+    if (!isplane) {
+      const mjtNum* la = m->geom_aabb + 6*gi; const mjtNum* gp = d->geom_xpos+3*gi; const mjtNum* gR = d->geom_xmat+9*gi;
+      mju_mulMatVec3(wc, gR, la); for (int k=0; k < 3; k++) wc[k] += gp[k];           // world AABB center
+      for (int k=0; k < 3; k++) wh[k] = mju_abs(gR[3*k])*la[3] + mju_abs(gR[3*k+1])*la[4] + mju_abs(gR[3*k+2])*la[5];
+    }
     for (int v=0; v < nfv; v++) {
       if (fidx[v] < 0) continue;
-      if (rb > 0) { mjtNum dxg[3]; for (int k=0; k < 3; k++) dxg[k] = x[3*v+k]-gc[k];
-                    if (mju_dot3(dxg, dxg) > grb2) continue; }
+      if (!isplane) {                                                                  // world-AABB cull
+        if (mju_abs(x[3*v]-wc[0]) > wh[0]+marg || mju_abs(x[3*v+1]-wc[1]) > wh[1]+marg ||
+            mju_abs(x[3*v+2]-wc[2]) > wh[2]+marg) continue;
+      }
       ipcCon con = {2, {v, 0, 0, 0}, gi};
       ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
     }
   }
 
-  // ---- one spatial hash over the FLEX primitives, shared by geom-feature and self queries ----
-  // Cells are sized to the flex primitives (small), NOT the geom features: geom vertices point-query
-  // the triangle grid and geom edges are WALKED through the flex-edge grid, so long hull edges don't
-  // blow up the cell size. cell = max flex-edge extent + thresh => a tri/edge sits within +/-1 cell.
-  mjtNum maxext = 0;
-  for (int e=0; e < en; e++) {
-    int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
-    mjtNum dd[3]; for (int k=0; k < 3; k++) dd[k] = x[3*a+k]-x[3*b+k];
-    mjtNum L = sqrt(mju_dot3(dd, dd)); if (L > maxext) maxext = L;
-  }
-  for (int e=0; e < ne; e++) for (int j=0; j < 3; j++) {   // triangle-edge extent (covers en==0 ropes)
-    int A = el[3*e+j], B = el[3*e+(j+1)%3];
-    mjtNum dd[3]; for (int k=0; k < 3; k++) dd[k] = x[3*A+k]-x[3*B+k];
-    mjtNum L = sqrt(mju_dot3(dd, dd)); if (L > maxext) maxext = L;
-  }
-  if (maxext <= 0) return nc;   // no flex primitives: only the flex-vertex-vs-geom set above applies
-  mjtNum inv = 1.0/(maxext + thresh + 1e-9);
-  int NB = 4096, mask = NB-1;
-  int* headE  = (int*) mju_malloc(NB*sizeof(int));
-  int* headG  = (int*) mju_malloc(NB*sizeof(int));
-  int* nxtE   = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
-  int* nxtG   = (int*) mju_malloc((en > 0 ? en : 1)*sizeof(int));
-  int* stampE = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
+  // ---- geom-feature and self candidates via the flex element BVH (ipc_bvhBox) ----
+  int bvhadr = m->flex_bvhadr[f];
+  if (bvhadr < 0 || (ne == 0 && en == 0)) return nc;   // no element BVH -> only flex-vertex-vs-geom
+  int bvhnum = m->flex_bvhnum[f];
+  int* stk    = (int*) mju_malloc((bvhnum > 0 ? bvhnum : 1)*sizeof(int));
+  int* outel  = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
   int* stampG = (int*) mju_malloc((en > 0 ? en : 1)*sizeof(int));
-  for (int i=0; i < NB; i++) { headE[i] = -1; headG[i] = -1; }
-  for (int e=0; e < ne; e++) stampE[e] = -1;
   for (int e=0; e < en; e++) stampG[e] = -1;
+  int qid = 0;
+  // query half >= thresh + r: node AABBs already include one radius, and a candidate is within thresh of
+  // the (one- or two-radius) surface gap, so this is a conservative superset -- no near pair is missed.
+  mjtNum qhv[3] = {thresh+r, thresh+r, thresh+r};
 
-  // insert triangles by centroid, flex edges by midpoint (one bucket each)
-  for (int e=0; e < ne; e++) {
-    int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
-    int h = ipc_hash3((int)floor((x[3*A]  +x[3*B]  +x[3*C]  )*inv/3),
-                      (int)floor((x[3*A+1]+x[3*B+1]+x[3*C+1])*inv/3),
-                      (int)floor((x[3*A+2]+x[3*B+2]+x[3*C+2])*inv/3), mask);
-    nxtE[e] = headE[h]; headE[h] = e;
-  }
-  for (int e=0; e < en; e++) {
-    int a = m->flex_edge[2*(ea+e)], b = m->flex_edge[2*(ea+e)+1];
-    int h = ipc_hash3((int)floor((x[3*a]  +x[3*b]  )*inv/2),
-                      (int)floor((x[3*a+1]+x[3*b+1])*inv/2),
-                      (int)floor((x[3*a+2]+x[3*b+2])*inv/2), mask);
-    nxtG[e] = headG[h]; headG[h] = e;
-  }
-
-  // geom-corner vs flex-triangle (type 3): each geom vertex point-queries the triangle grid.
-  // stamp by geom-vertex id c; self-VT below stamps by (ngv+v), a disjoint id range, so one array serves both.
+  // geom-corner vs flex-triangle (type 3): each geom vertex queries the triangle BVH
   for (int c=0; c < ngv; c++) {
-    int ix=(int)floor(gv[3*c]*inv), iy=(int)floor(gv[3*c+1]*inv), iz=(int)floor(gv[3*c+2]*inv);
-    for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
-      int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
-      for (int e=headE[h]; e >= 0; e=nxtE[e]) {
-        if (stampE[e] == c) continue; stampE[e] = c;
-        ipcCon con = {3, {c, el[3*e], el[3*e+1], el[3*e+2]}, -1};
+    int n = ipc_bvhBox(m, d, f, &gv[3*c], qhv, stk, outel, ne);
+    for (int i=0; i < n; i++) { int e = outel[i];
+      ipcCon con = {3, {c, el[3*e], el[3*e+1], el[3*e+2]}, -1};
+      ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+    }
+  }
+  // geom-edge vs flex-edge (type 4): each geom edge queries the BVH with its (inflated) box, then the
+  // overlapping triangles' edges; dedup the shared edges per query via stampG.
+  for (int c=0; c < nge; c++) {
+    const mjtNum* p0 = &ge[6*c]; const mjtNum* p1 = &ge[6*c+3];
+    mjtNum qc[3], qh[3];
+    for (int k=0; k < 3; k++) { qc[k] = 0.5*(p0[k]+p1[k]); qh[k] = 0.5*mju_abs(p1[k]-p0[k]) + thresh+r; }
+    int n = ipc_bvhBox(m, d, f, qc, qh, stk, outel, ne);
+    qid++;
+    for (int i=0; i < n; i++) { int e = outel[i];
+      for (int j=0; j < 3; j++) { int e2 = elemedge[3*e+j];
+        if (stampG[e2] == qid) continue; stampG[e2] = qid;
+        ipcCon con = {4, {c, m->flex_edge[2*(ea+e2)], m->flex_edge[2*(ea+e2)+1], 0}, -1};
         ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
       }
     }
   }
-  // geom-edge vs flex-edge (type 4): walk each geom edge through the flex-edge grid in <=cell steps,
-  // 27-querying each sample. stamp by geom-edge id c; self-EE below stamps by (nge+e1), disjoint.
-  for (int c=0; c < nge; c++) {
-    const mjtNum* p0 = &ge[6*c]; const mjtNum* p1 = &ge[6*c+3];
-    mjtNum dseg[3]; for (int k=0; k < 3; k++) dseg[k] = p1[k]-p0[k];
-    mjtNum Lg = sqrt(mju_dot3(dseg, dseg));
-    int nstep = (int)(Lg*inv) + 1;
-    for (int s=0; s <= nstep; s++) {
-      mjtNum tt = (mjtNum)s/nstep, pt[3];
-      for (int k=0; k < 3; k++) pt[k] = p0[k] + tt*dseg[k];
-      int ix=(int)floor(pt[0]*inv), iy=(int)floor(pt[1]*inv), iz=(int)floor(pt[2]*inv);
-      for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
-        int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
-        for (int e2=headG[h]; e2 >= 0; e2=nxtG[e2]) {
-          if (stampG[e2] == c) continue; stampG[e2] = c;
-          ipcCon con = {4, {c, m->flex_edge[2*(ea+e2)], m->flex_edge[2*(ea+e2)+1], 0}, -1};
-          ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
-        }
-      }
-    }
-  }
 
-  if (doself && !(ne == 0 && en == 0)) {
-    // vertex-triangle self: each vertex queries the triangle grid's 27-cell neighborhood
+  if (doself) {
+    // vertex-triangle self: each vertex queries the triangle BVH
     for (int v=0; v < nfv; v++) {
-      int ix = (int)floor(x[3*v]*inv), iy = (int)floor(x[3*v+1]*inv), iz = (int)floor(x[3*v+2]*inv);
-      for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
-        int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
-        for (int e=headE[h]; e >= 0; e=nxtE[e]) {
-          if (stampE[e] == ngv+v) continue; stampE[e] = ngv+v;
-          int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
-          if (v==A || v==B || v==C) continue;
-          ipcCon con = {0, {v, A, B, C}, -1};
-          ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
-        }
+      int n = ipc_bvhBox(m, d, f, &x[3*v], qhv, stk, outel, ne);
+      for (int i=0; i < n; i++) { int e = outel[i];
+        int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
+        if (v==A || v==B || v==C) continue;
+        ipcCon con = {0, {v, A, B, C}, -1};
+        ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
       }
     }
-    // edge-edge self: each edge queries the edge grid's 27-cell neighborhood (canonical e2 > e1)
+    // edge-edge self: each flex edge queries the BVH, then the overlapping triangles' edges (canonical
+    // e2 > e1, non-adjacent); dedup per query via stampG.
     for (int e1=0; e1 < en; e1++) {
       int a1 = m->flex_edge[2*(ea+e1)], b1 = m->flex_edge[2*(ea+e1)+1];
-      int ix = (int)floor((x[3*a1]  +x[3*b1]  )*inv/2),
-          iy = (int)floor((x[3*a1+1]+x[3*b1+1])*inv/2),
-          iz = (int)floor((x[3*a1+2]+x[3*b1+2])*inv/2);
-      for (int dz=-1; dz <= 1; dz++) for (int dy=-1; dy <= 1; dy++) for (int dx=-1; dx <= 1; dx++) {
-        int h = ipc_hash3(ix+dx, iy+dy, iz+dz, mask);
-        for (int e2=headG[h]; e2 >= 0; e2=nxtG[e2]) {
-          if (e2 <= e1 || stampG[e2] == nge+e1) continue; stampG[e2] = nge+e1;
+      mjtNum qc[3], qh[3];
+      for (int k=0; k < 3; k++) { qc[k]=0.5*(x[3*a1+k]+x[3*b1+k]); qh[k]=0.5*mju_abs(x[3*a1+k]-x[3*b1+k])+thresh+r; }
+      int n = ipc_bvhBox(m, d, f, qc, qh, stk, outel, ne);
+      qid++;
+      for (int i=0; i < n; i++) { int e = outel[i];
+        for (int j=0; j < 3; j++) { int e2 = elemedge[3*e+j];
+          if (e2 <= e1 || stampG[e2] == qid) continue; stampG[e2] = qid;
           int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
           if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;
           ipcCon con = {1, {a1, b1, a2, b2}, -1};
@@ -744,7 +724,7 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
       }
     }
   }
-  mju_free(headE); mju_free(headG); mju_free(nxtE); mju_free(nxtG); mju_free(stampE); mju_free(stampG);
+  mju_free(stk); mju_free(outel); mju_free(stampG);
   return nc;
 }
 
@@ -1042,7 +1022,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum thresh = 3*ghat + 4*maxdisp;
   int doself = (m->flex_selfcollide[f] != mjFLEXSELF_NONE);   // honor the flex's selfcollide flag
   int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, thresh, nfv, ne, el, en, ea, fidx,
-                             doself, cand, candmax);
+                             f, elemedge, doself, cand, candmax);
   // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
   // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
