@@ -999,6 +999,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // sparse Hessian pattern (mesh + candidate-contact couplings) for the IC(0) preconditioner, once/step
   ipcSparse sp;
   if (N > 0) ipc_spBuild(&sp, N, ne, elems, ncand, cand, fidx);
+  mjtNum g0 = -1;   // initial gradient norm (set on the first Newton iteration), for the relative stop test
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
     for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
@@ -1056,8 +1057,14 @@ void mj_IPC(const mjModel* m, mjData* d) {
           int R = 3*fp+a, C = 3*fq+b; if (C > R) continue;
           sp.val[ipc_spIdx(&sp, R, C)] += w2*cc->n[a]*cc->n[b]; } }
     }
+    // converged when the residual force has dropped well below its initial magnitude. Relative (rather
+    // than the old absolute 1e-8) so the test is scale-invariant across scenes/units: the absolute floor
+    // depends on mass/h^2, kappa, mesh, so a fixed 1e-8 sat at/below the achievable gradient floor for
+    // stiff-contact steps -> Newton ground out useless iterations after it had already converged.
     mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
-    if (sqrt(gn) < 1e-8) break;
+    mjtNum gnorm = sqrt(gn);
+    if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
+    if (gnorm < 1e-7*g0 + 1e-9) break;
     ipc_ic0(&sp, 1e-9);                                       // incomplete-LDL^T factor (signed pivots)
     ipc_pcg(dx, grad, N, &sp, mdiag, ne, elems, estr, ccache, nacon, rcg, zcg, pcg, Hpv);
     // proper IPC line search: alpha bounded by the rigorous additive CCD over the candidate contacts
@@ -1082,14 +1089,19 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
     mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
     mjtNum alpha = cap;
+    int lsok = 0;
     for (int ls=0; ls < 30; ls++) {
       for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
       for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
       if (ipc_energy(m, d, nfv, ne, elems, xn, xtil, fidx, mass, h, r, ghat, kappa,
-                     gv, ge, candLS, nls) <= E0 + 1e-4*alpha*gdx) break;
+                     gv, ge, candLS, nls) <= E0 + 1e-4*alpha*gdx) { lsok = 1; break; }
       alpha *= 0.5;
     }
+    // stagnation guard: if the line search exhausts all backtracks without an energy decrease, the
+    // (descent) Newton step cannot reduce the energy even at alpha -> 0, i.e. we are sitting at the
+    // minimum to numerical precision. Stop instead of grinding out further no-progress iterations.
+    if (!lsok) break;
     for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
   }
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
