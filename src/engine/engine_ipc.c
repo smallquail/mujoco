@@ -416,7 +416,10 @@ typedef struct { mjtNum n[3], cw[4], bdd; int f[4], nidx; } ipcCC;
 // and the rest squared edge lengths Lr2. We consume MuJoCo's P1 FEM membrane energy (engine_passive,
 // Kharevych et al.): E = 1/4 e^T M e with e[edge] = L^2 - L0^2 (frame-invariant). The force is the
 // gradient (matches mj_flexPassiveStretch exactly) and the Hessian is its Gauss-Newton part.
-typedef struct { int vg[3], fv[3]; mjtNum M[6]; mjtNum Lr2[3]; } ipcElem;
+typedef struct { int vg[3], fv[3]; mjtNum M[6]; mjtNum Lr2[3];
+                 mjtNum kD;        // Rayleigh damping coefficient = flex_damping/h (constant)
+                 mjtNum ep[3];     // elongations e_a at the previous step (xold), refreshed each step
+               } ipcElem;
 static const int ipc_eedge[3][2] = {{1, 2}, {2, 0}, {0, 1}};   // local edges (== engine_passive's)
 static inline mjtNum ipc_Mab(const mjtNum* M6, int a, int b) {
   static const int id[3][3] = {{0,1,2},{1,3,4},{2,4,5}};   // 3x3 symmetric from 6 upper-tri entries
@@ -478,8 +481,8 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
       s[b] = es[3*b]*rel[b][0] + es[3*b+1]*rel[b][1] + es[3*b+2]*rel[b][2];   // g_b . rel_b
     }
     for (int a=0; a < 3; a++) {
-      mjtNum ca = 2.0*(ipc_Mab(el->M,a,0)*s[0] + ipc_Mab(el->M,a,1)*s[1] + ipc_Mab(el->M,a,2)*s[2]);
-      mjtNum me = es[9+a];                                 // geometric tension (unclamped)
+      mjtNum ca = 2.0*(1.0+el->kD)*(ipc_Mab(el->M,a,0)*s[0] + ipc_Mab(el->M,a,1)*s[1] + ipc_Mab(el->M,a,2)*s[2]);
+      mjtNum me = es[9+a];                                 // geometric tension (Me_eff, damped)
       int p0 = el->fv[ipc_eedge[a][0]], p1 = el->fv[ipc_eedge[a][1]];
       if (p0 >= 0) for (int k=0; k < 3; k++) Hp[3*p0+k] += ca*es[3*a+k] + me*rel[a][k];
       if (p1 >= 0) for (int k=0; k < 3; k++) Hp[3*p1+k] -= ca*es[3*a+k] + me*rel[a][k];
@@ -543,8 +546,10 @@ static mjtNum ipc_stretchEnergy(int nelem, const ipcElem* elems, const mjtNum* x
   mjtNum E = 0;
   for (int t=0; t < nelem; t++) {
     mjtNum d[3][3], e[3]; ipc_elemEval(&elems[t], x, d, e);
-    const mjtNum* M = elems[t].M;
-    for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) E += 0.25*e[a]*ipc_Mab(M,a,b)*e[b];
+    const mjtNum* M = elems[t].M; mjtNum kD = elems[t].kD;
+    mjtNum de[3]; for (int a=0; a < 3; a++) de[a] = e[a] - elems[t].ep[a];   // elongation change (damping)
+    for (int a=0; a < 3; a++) for (int b=0; b < 3; b++)
+      E += 0.25*ipc_Mab(M,a,b)*(e[a]*e[b] + kD*de[a]*de[b]);   // elastic + dissipative incremental potl
   }
   return E;
 }
@@ -749,22 +754,46 @@ static void ipc_addBlock(long long* key, int* nk, int fi, int fj, int N) {
   }
 }
 
+// cache of the sorted-unique mesh+diagonal keys: these never change for a given model, so re-qsorting
+// them every step (the dominant cost of the pattern build) is wasted. Rebuilt when (model,N) changes.
+// NOTE: single-threaded assumption (one model stepped at a time) -- fine for single-env CPU eval.
+static const mjModel* g_spm = NULL;
+static int g_spN = -1, g_spNmk = 0;
+static long long* g_spMkeys = NULL;
+
 // build the lower-tri CSR pattern + column structure from mesh elements + candidate contacts
-static void ipc_spBuild(ipcSparse* sp, int N, int ne, const ipcElem* elems,
+static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ipcElem* elems,
                         int ncand, const ipcCon* cand, const int* fidx) {
   sp->N = N;
-  int cap = N + 81*ne + 1;                                  // upper bound on generated keys
-  for (int c=0; c < ncand; c++) cap += 144;                 // contacts: up to 4 verts -> 16 pairs * 9
-  long long* key = (long long*) mju_malloc(cap*sizeof(long long));
-  int nk = 0;
-  for (int i=0; i < N; i++) key[nk++] = (long long)i*N + i;          // diagonal
-  for (int t=0; t < ne; t++) for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
-    ipc_addBlock(key, &nk, elems[t].fv[i], elems[t].fv[j], N);       // membrane: element verts
-  for (int c=0; c < ncand; c++) {                                    // contact: involved verts
-    int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
-    for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(key, &nk, fidx[v[i]], fidx[v[j]], N);
+  // (re)build the cached mesh+diagonal sorted-unique keys only when the model/N changes
+  if (m != g_spm || N != g_spN) {
+    int mcap = N + 81*ne + 1;
+    long long* mk = (long long*) mju_malloc(mcap*sizeof(long long));
+    int nmk = 0;
+    for (int i=0; i < N; i++) mk[nmk++] = (long long)i*N + i;          // diagonal
+    for (int t=0; t < ne; t++) for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
+      ipc_addBlock(mk, &nmk, elems[t].fv[i], elems[t].fv[j], N);       // membrane: element verts
+    qsort(mk, nmk, sizeof(long long), ipc_cmpll);
+    int u = 0; for (int i=0; i < nmk; i++) if (i==0 || mk[i] != mk[i-1]) mk[u++] = mk[i];  // dedup in place
+    mju_free(g_spMkeys); g_spMkeys = mk; g_spNmk = u; g_spm = m; g_spN = N;
   }
-  qsort(key, nk, sizeof(long long), ipc_cmpll);
+  // contact keys (variable per step): collect + sort, then merge with the cached mesh keys
+  int ccap = 1; for (int c=0; c < ncand; c++) ccap += 144;
+  long long* ck = (long long*) mju_malloc(ccap*sizeof(long long));
+  int nck = 0;
+  for (int c=0; c < ncand; c++) {
+    int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
+    for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
+  }
+  qsort(ck, nck, sizeof(long long), ipc_cmpll);
+  // merge the two sorted lists into a sorted-unique key list (avoids re-sorting the big mesh list)
+  long long* key = (long long*) mju_malloc((g_spNmk + nck + 1)*sizeof(long long));
+  int nk = 0, ia = 0, ib = 0; long long prev = -1;
+  while (ia < g_spNmk || ib < nck) {
+    long long v = (ib >= nck || (ia < g_spNmk && g_spMkeys[ia] <= ck[ib])) ? g_spMkeys[ia++] : ck[ib++];
+    if (v != prev) { key[nk++] = v; prev = v; }
+  }
+  mju_free(ck);
   // dedup -> nnz
   int nnz = 0;
   for (int i=0; i < nk; i++) if (i == 0 || key[i] != key[i-1]) nnz++;
@@ -915,7 +944,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int j=0; j < 6; j++) elems[t].M[j] = (sa >= 0) ? m->flex_stiffness[sa + 21*t + j] : 0;
     for (int a=0; a < 3; a++) {
       mjtNum L0 = m->flexedge_length0[ea + elemedge[3*t+a]]; elems[t].Lr2[a] = L0*L0;
+      elems[t].ep[a] = 0;
     }
+    elems[t].kD = (h > 0) ? m->flex_damping[f]/h : 0;   // stiffness-prop. Rayleigh damping (Kharevych 5.2)
   }
   int amax = nfv*64 + 1024;                   // capacity of the active-contact list
   ipcCon* acon = (ipcCon*) mju_malloc(amax*sizeof(ipcCon));
@@ -996,9 +1027,31 @@ void mj_IPC(const mjModel* m, mjData* d) {
   int doself = (m->flex_selfcollide[f] != mjFLEXSELF_NONE);   // honor the flex's selfcollide flag
   int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, thresh, nfv, ne, el, en, ea, fidx,
                              doself, cand, candmax);
+  // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
+  // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
+  // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
+  if (ncand == 0) for (int i=0; i < 3*nfv; i++) x[i] = xtil[i];
   // sparse Hessian pattern (mesh + candidate-contact couplings) for the IC(0) preconditioner, once/step
+  // Rayleigh damping uses the previous-step elongations e_prev = e(xold); xold is fixed over the Newton
+  // loop, so cache e_prev once per step. Only needed when damping is on.
+  if (m->flex_damping[f] > 0)
+    for (int t=0; t < ne; t++) { mjtNum dtmp[3][3]; ipc_elemEval(&elems[t], xold, dtmp, elems[t].ep); }
   ipcSparse sp;
-  if (N > 0) ipc_spBuild(&sp, N, ne, elems, ncand, cand, fidx);
+  if (N > 0) ipc_spBuild(m, &sp, N, ne, elems, ncand, cand, fidx);
+  // precompute element -> CSR scatter indices once per step (the pattern is fixed over the Newton loop), so
+  // the per-Newton assembly avoids a binary-search ipc_spIdx per matrix entry. -1 marks skipped entries
+  // (upper-tri or pinned vertex). Order matches the assembly loop: idx = (i*3+j)*9 + a*3+b.
+  int* escat = (N > 0) ? (int*) mju_malloc(ne*81*sizeof(int)) : NULL;
+  if (N > 0) for (int t=0; t < ne; t++) {
+    const ipcElem* elem = &elems[t]; int k = 0;
+    for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
+      int fi = elem->fv[i], fj = elem->fv[j];
+      for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
+        int R = 3*fi+a, C = 3*fj+b;
+        escat[t*81 + k++] = (fi < 0 || fj < 0 || C > R) ? -1 : ipc_spIdx(&sp, R, C);
+      }
+    }
+  }
   mjtNum g0 = -1;   // initial gradient norm (set on the first Newton iteration), for the relative stop test
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
@@ -1015,9 +1068,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int t=0; t < ne; t++) {
       const ipcElem* elem = &elems[t]; mjtNum* es = estr + 12*t;
       mjtNum d[3][3], e3[3]; ipc_elemEval(elem, x, d, e3);
-      mjtNum Me[3];                                          // Me[b] = sum_a M[a,b] e[a] (edge tension)
+      mjtNum kD = elem->kD, ee[3];                           // ee = effective (damped) elongation:
+      for (int a=0; a < 3; a++) ee[a] = (1.0+kD)*e3[a] - kD*elem->ep[a];   // (L^2-L0^2) + kD(L^2-Lprev^2)
+      mjtNum Me[3];                                          // Me[b] = sum_a M[a,b] ee[a] (edge tension)
       for (int b=0; b < 3; b++)
-        Me[b] = ipc_Mab(elem->M,0,b)*e3[0] + ipc_Mab(elem->M,1,b)*e3[1] + ipc_Mab(elem->M,2,b)*e3[2];
+        Me[b] = ipc_Mab(elem->M,0,b)*ee[0] + ipc_Mab(elem->M,1,b)*ee[1] + ipc_Mab(elem->M,2,b)*ee[2];
       for (int a=0; a < 3; a++) { for (int k=0; k < 3; k++) es[3*a+k] = d[a][k]; es[9+a] = Me[a]; }
       for (int b=0; b < 3; b++) {                            // grad[n] += sum_b Me[b] g_b[n] (= -force)
         int p0 = elem->fv[ipc_eedge[b][0]], p1 = elem->fv[ipc_eedge[b][1]];
@@ -1029,19 +1084,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int a=0; a < 3; a++) { for (int i=0; i < 9; i++) G[a][i] = 0;
         int p = ipc_eedge[a][0], q = ipc_eedge[a][1];
         for (int k=0; k < 3; k++) { G[a][3*p+k] = d[a][k]; G[a][3*q+k] = -d[a][k]; } }
-      for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {   // Gauss-Newton part
-        mjtNum m2 = 2.0*ipc_Mab(elem->M, a, b);
+      for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {   // Gauss-Newton part (x(1+kD) from damping)
+        mjtNum m2 = 2.0*(1.0+kD)*ipc_Mab(elem->M, a, b);
         for (int I=0; I < 9; I++) for (int J=0; J < 9; J++) He[I][J] += m2*G[a][I]*G[b][J]; }
       for (int a=0; a < 3; a++) {                            // geometric stress part
         int p = ipc_eedge[a][0], q = ipc_eedge[a][1];
         for (int k=0; k < 3; k++) {
           He[3*p+k][3*p+k] += Me[a]; He[3*q+k][3*q+k] += Me[a];
           He[3*p+k][3*q+k] -= Me[a]; He[3*q+k][3*p+k] -= Me[a]; } }
-      for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {   // scatter lower-tri into sp
-        int fi = elem->fv[i], fj = elem->fv[j]; if (fi < 0 || fj < 0) continue;
+      for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {   // scatter lower-tri into sp (precomputed idx)
+        int base = t*81 + (i*3+j)*9;
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
-          int R = 3*fi+a, C = 3*fj+b; if (C > R) continue;
-          sp.val[ipc_spIdx(&sp, R, C)] += He[3*i+a][3*j+b]; } }
+          int id = escat[base + a*3+b]; if (id >= 0) sp.val[id] += He[3*i+a][3*j+b]; } }
     }
     // assemble active contacts: re-test the per-step candidate list at x (gate 0<g<ghat), accumulating
     // grad + caching the GN blocks (acon/ccache); then scatter the contact blocks into sp
@@ -1116,8 +1170,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int c=0; c < 3; c++) { d->qvel[da+c] = dpl[c]/h; d->qpos[qa+c] += dpl[c]; }
   }
   d->time += h;
-
   if (N > 0) ipc_spFree(&sp);
+  mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS);
   mju_free(gv); mju_free(ge); mju_free(estr);
