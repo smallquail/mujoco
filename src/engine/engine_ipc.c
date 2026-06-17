@@ -1049,6 +1049,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
   }
   mjtNum g0 = -1;   // initial gradient norm (set on the first Newton iteration), for the relative stop test
+  // active-set re-test: after the first Newton iter, only candidates with gap < ghat are re-tested for the
+  // barrier (the contact interface). cgap is kept a valid LOWER BOUND for the rest by decrementing it each
+  // iter by delta = 4*alpha*max|dx| (a bound on how fast any gap can shrink), and refreshing it exactly
+  // when a candidate enters the set. So the lower bound crosses ghat no later than the true gap (no active
+  // contact is ever missed in the barrier), and the CCD's cgap-based step cap stays conservative (safe).
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
     for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
@@ -1093,11 +1098,17 @@ void mj_IPC(const mjModel* m, mjData* d) {
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int id = escat[base + a*3+b]; if (id >= 0) sp.val[id] += He[3*i+a][3*j+b]; } }
     }
-    // assemble active contacts: re-test the per-step candidate list at x (gate 0<g<ghat), accumulating
-    // grad + caching the GN blocks (acon/ccache); then scatter the contact blocks into sp
+    // assemble active contacts. First Newton iter: scan all candidates (initializes cgap exactly). Later
+    // iters: only re-test the active set {cgap < ghat} (cgap is a maintained lower bound, so this set
+    // contains every candidate that is or could be active). grad/acon/ccache get the active barrier blocks.
     int nacon = 0;
-    for (int c=0; c < ncand; c++)
-      ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
+    if (it == 0) {
+      for (int c=0; c < ncand; c++)
+        ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
+    } else {
+      for (int c=0; c < ncand; c++) if (cgap[c] < ghat)
+        ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
+    }
     for (int c=0; c < nacon; c++) {                          // contact GN: bdd * (cw n)(cw n)^T
       const ipcCC* cc = &ccache[c];
       for (int p=0; p < cc->nidx; p++) for (int q=0; q < cc->nidx; q++) {
@@ -1117,6 +1128,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     if (gnorm < 1e-7*g0 + 1e-9) break;
     ipc_ic0(&sp, 1e-9);                                       // incomplete-LDL^T factor (signed pivots)
     ipc_pcg(dx, grad, N, &sp, mdiag, ne, elems, estr, ccache, nacon, rcg, zcg, pcg, Hpv);
+    mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
+    for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
+                                  if (n2 > maxdx) maxdx = n2; }
+    maxdx = sqrt(maxdx);
     // proper IPC line search: alpha bounded by the rigorous additive CCD over the candidate contacts
     // (alpha -> ~1 when nothing is closing, so the full Newton step resolves contacts; no pair can
     // cross), then Armijo backtrack on the energy (which iterates the candidate set, so it sees
@@ -1153,6 +1168,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // minimum to numerical precision. Stop instead of grinding out further no-progress iterations.
     if (!lsok) break;
     for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
+    // keep cgap a valid lower bound: every gap can shrink by at most 4 vertices * the max vertex step
+    mjtNum dgap = 4.0*alpha*maxdx;
+    for (int c=0; c < ncand; c++) cgap[c] -= dgap;
   }
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
     int da = dofadr[v];
