@@ -125,7 +125,7 @@ static void ipc_closestOnPoly(const mjtNum* p, const float* vbase, const int* pv
 // signed distance from a static geom's surface to world point x (positive outside) + outward unit
 // normal n. Closed-form for plane/sphere/capsule/box; returns +large (no contact) for other types.
 static mjtNum ipc_geomDist(const mjModel* m, int gi, const mjtNum* gpos, const mjtNum* gmat,
-                           const mjtNum* x, mjtNum* n) {
+                           const mjtNum* x, mjtNum* n, mjtNum cutoff) {
   int type = m->geom_type[gi]; const mjtNum* size = m->geom_size + 3*gi;
   mjtNum dx[3]; for (int k=0; k < 3; k++) dx[k] = x[k]-gpos[k];
   if (type == mjGEOM_MESH) {
@@ -149,6 +149,10 @@ static mjtNum ipc_geomDist(const mjModel* m, int gi, const mjtNum* gpos, const m
       if (dd > maxd) { maxd = dd; bestn = pnl; }
     }
     if (maxd <= 0) { mju_mulMatVec3(n, gmat, bestn); return maxd; }   // inside: penetration
+    // far reject: maxd (max signed plane distance) is a LOWER bound on the true distance for a convex
+    // hull, so if it already exceeds the cutoff the closest-point search can't bring it into range --
+    // skip the O(faces) loop (this is what makes the per-vertex broadphase against a mesh affordable).
+    if (maxd > cutoff) { mju_mulMatVec3(n, gmat, bestn); return maxd; }
     mjtNum best = 1e30, bc[3] = {0,0,0};                              // outside: true closest point
     for (int p=0; p < pn; p++) {
       const mjtNum* pnl = m->mesh_polynormal + 3*(polyadr+p);
@@ -290,7 +294,7 @@ typedef struct { int type; int idx[4]; int gi; } ipcCon;
 // world-space static-geom corners/edges. Single source of the per-type contact geometry.
 static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, const mjtNum* x,
                          const mjtNum* gv, const mjtNum* ge, mjtNum r,
-                         mjtNum* n, int* idv, mjtNum* cw, int* nidx) {
+                         mjtNum* n, int* idv, mjtNum* cw, int* nidx, mjtNum cutoff) {
   switch (con->type) {
   case 0: {   // vertex-triangle self-contact (v against triangle A,B,C)
     int v=con->idx[0], A=con->idx[1], B=con->idx[2], C=con->idx[3];
@@ -310,7 +314,7 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
   }
   case 2: {   // flex-vertex v vs static geom gi surface
     int v=con->idx[0], gi=con->gi;
-    mjtNum dd = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, &x[3*v], n);
+    mjtNum dd = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, &x[3*v], n, cutoff + r);
     idv[0]=v; cw[0]=1; *nidx=1;
     return dd - r;
   }
@@ -357,7 +361,7 @@ static mjtNum ipc_conGapAdv(const ipcCon* con, const mjModel* m, const mjData* d
   case 0:  return ipc_ptTri(P[0], P[1], P[2], P[3], cp, w) - 2*r;
   case 1:  return ipc_segSeg(P[0], P[1], P[2], P[3], c1, c2, st) - 2*r;
   case 2:  { mjtNum nn[3];
-             return ipc_geomDist(m, con->gi, d->geom_xpos+3*con->gi, d->geom_xmat+9*con->gi, P[0], nn) - r; }
+             return ipc_geomDist(m, con->gi, d->geom_xpos+3*con->gi, d->geom_xmat+9*con->gi, P[0], nn, 1e30) - r; }
   case 3:  return ipc_ptTri(&gv[3*con->idx[0]], P[0], P[1], P[2], cp, w) - r;
   default: { const mjtNum* eg = &ge[6*con->idx[0]]; return ipc_segSeg(eg, eg+3, P[0], P[1], c1, c2, st) - r; }
   }
@@ -443,7 +447,7 @@ static void ipc_try(ipcCon con, const mjModel* m, const mjData* d, const mjtNum*
                     const int* fidx, mjtNum* grad,
                     ipcCon* acon, ipcCC* ccache, int* nacon, int amax, mjtNum* gout) {
   mjtNum n[3], cw[4]; int idv[4], nidx;
-  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx);
+  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx, ghat);
   *gout = g;   // cache the gap at x so CCD (g0) and the E0 energy can reuse it without recomputing
   if (g <= 0 || g >= ghat) return;
   if (*nacon >= amax) return;
@@ -578,7 +582,7 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
   E += ipc_stretchEnergy(nelem, elems, x);
   for (int c=0; c < nacon; c++) {
     mjtNum n[3], cw[4]; int idv[4], nidx;
-    mjtNum g = ipc_conGap(&acon[c], m, d, x, gv, ge, r, n, idv, cw, &nidx);
+    mjtNum g = ipc_conGap(&acon[c], m, d, x, gv, ge, r, n, idv, cw, &nidx, 1e30);
     if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
   }
   return E;
@@ -591,7 +595,7 @@ static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjt
                         ipcCon* cand, int* nc, int candmax) {
   if (*nc >= candmax) return;
   mjtNum n[3], cw[4]; int idv[4], nidx;
-  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx);
+  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx, thresh);
   if (g > 0 && g < thresh) cand[(*nc)++] = con;
 }
 
@@ -613,8 +617,16 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
   int nc = 0;
   for (int gi=0; gi < m->ngeom; gi++) {                                      // flex-vertex vs geom
     if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;       // skip non-colliding
+    // geom-level cull: a bounded geom (mesh/primitive, rbound>0) only needs the bag verts within its
+    // bounding sphere + margin; skip the rest before the per-face distance. Planes (rbound==0) are
+    // infinite, so no cull -- every vertex is checked (cheap: plane distance is O(1)).
+    mjtNum rb = m->geom_rbound[gi];
+    const mjtNum* gc = d->geom_xpos + 3*gi;
+    mjtNum grb2 = (rb > 0) ? (rb+thresh+r)*(rb+thresh+r) : 0;
     for (int v=0; v < nfv; v++) {
       if (fidx[v] < 0) continue;
+      if (rb > 0) { mjtNum dxg[3]; for (int k=0; k < 3; k++) dxg[k] = x[3*v+k]-gc[k];
+                    if (mju_dot3(dxg, dxg) > grb2) continue; }
       ipcCon con = {2, {v, 0, 0, 0}, gi};
       ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
     }
@@ -782,6 +794,10 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
   long long* ck = (long long*) mju_malloc(ccap*sizeof(long long));
   int nck = 0;
   for (int c=0; c < ncand; c++) {
+    // flex-vs-geom contacts (type >= 2) couple flex verts that already share a mesh element (a vertex, a
+    // triangle, or a mesh edge), so their couplings are already in the mesh pattern -- skip them. Only
+    // self-contacts (types 0,1) couple verts from different elements and add new pattern entries.
+    if (cand[c].type >= 2) continue;
     int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
     for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
   }
@@ -1212,7 +1228,7 @@ mjtNum mj_ipcSegSeg(const mjtNum* p1, const mjtNum* p2, const mjtNum* q1, const 
 
 // signed distance (+ outward unit normal n) from geom gi's surface to world point x, at d's pose
 mjtNum mj_ipcGeomDist(const mjModel* m, const mjData* d, int gi, const mjtNum* x, mjtNum* n) {
-  return ipc_geomDist(m, gi, d->geom_xpos + 3*gi, d->geom_xmat + 9*gi, x, n);
+  return ipc_geomDist(m, gi, d->geom_xpos + 3*gi, d->geom_xmat + 9*gi, x, n, 1e30);
 }
 
 // world-space sharp vertices / edges of geom gi at d's pose (out sized by caller); returns the count
