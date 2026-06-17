@@ -414,7 +414,7 @@ typedef struct { mjtNum n[3], cw[4], bdd; int f[4], nidx; } ipcCC;
 // Hessian diagonal (for the Jacobi preconditioner), and cache the GN block (ccache) + contact (acon).
 static void ipc_try(ipcCon con, const mjModel* m, const mjData* d, const mjtNum* x,
                     const mjtNum* gv, const mjtNum* ge, mjtNum r, mjtNum ghat, mjtNum kappa,
-                    const int* fidx, mjtNum* grad, mjtNum* diagH,
+                    const int* fidx, mjtNum* grad, mjtNum* blockP,
                     ipcCon* acon, ipcCC* ccache, int* nacon, int amax, mjtNum* gout) {
   mjtNum n[3], cw[4]; int idv[4], nidx;
   mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx);
@@ -429,9 +429,10 @@ static void ipc_try(ipcCon con, const mjModel* m, const mjData* d, const mjtNum*
     int fp = fidx[idv[p]];
     cc->cw[p] = cw[p]; cc->f[p] = fp;
     if (fp < 0) continue;
-    for (int k=0; k < 3; k++) {
-      grad[3*fp+k]  += bd*cw[p]*n[k];
-      diagH[3*fp+k] += bdd*cw[p]*cw[p]*n[k]*n[k];
+    mjtNum w2 = bdd*cw[p]*cw[p];                                  // self-node GN block: w2 * n n^T
+    for (int i=0; i < 3; i++) {
+      grad[3*fp+i] += bd*cw[p]*n[i];
+      for (int j=0; j < 3; j++) blockP[9*fp + 3*i + j] += w2*n[i]*n[j];
     }
   }
   acon[*nacon] = con;
@@ -464,15 +465,40 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
   }
 }
 
-// matrix-free preconditioned CG: solve H dx = -grad with a Jacobi (diagH) preconditioner
-static void ipc_pcg(mjtNum* dx, const mjtNum* grad, int N, const mjtNum* diagH, const mjtNum* mdiag,
+// inverse of a symmetric positive-definite 3x3 (row-major; only [0,1,2,4,5,8] read). In-place safe
+// (all of A is read before any of out is written). The per-node diagonal block is SPD: the inertia
+// term mh*I (mh>0) plus PSD stretch/contact blocks.
+static void ipc_sym3inv(const mjtNum* A, mjtNum* out) {
+  mjtNum a=A[0], b=A[1], c=A[2], d=A[4], e=A[5], f=A[8];
+  mjtNum c00 = d*f - e*e, c01 = c*e - b*f, c02 = b*e - c*d;
+  mjtNum det = a*c00 + b*c01 + c*c02;
+  mjtNum s = (fabs(det) > 1e-30) ? 1.0/det : 0.0;
+  mjtNum c11 = a*f - c*c, c12 = b*c - a*e, c22 = a*d - b*b;
+  out[0]=c00*s; out[1]=c01*s; out[2]=c02*s;
+  out[3]=c01*s; out[4]=c11*s; out[5]=c12*s;
+  out[6]=c02*s; out[7]=c12*s; out[8]=c22*s;
+}
+
+// apply the per-node 3x3 block-Jacobi preconditioner z = Pinv*r (Pinv = N/3 blocks of 3x3 each)
+static void ipc_blockPrec(mjtNum* z, const mjtNum* r, const mjtNum* Pinv, int N) {
+  for (int v=0; v < N; v += 3) {
+    const mjtNum* B = Pinv + 3*v;
+    z[v]   = B[0]*r[v] + B[1]*r[v+1] + B[2]*r[v+2];
+    z[v+1] = B[3]*r[v] + B[4]*r[v+1] + B[5]*r[v+2];
+    z[v+2] = B[6]*r[v] + B[7]*r[v+1] + B[8]*r[v+2];
+  }
+}
+
+// matrix-free preconditioned CG: solve H dx = -grad with a 3x3 block-Jacobi preconditioner (Pinv =
+// the inverted per-node diagonal blocks). Block Jacobi captures the within-node stretch/contact
+// anisotropy that scalar Jacobi mis-scales; the node-to-node coupling stays in the matrix-free H*p.
+static void ipc_pcg(mjtNum* dx, const mjtNum* grad, int N, const mjtNum* Pinv, const mjtNum* mdiag,
                     int en, const mjtNum* he, const int* efa, const int* efb,
                     const ipcCC* ccache, int nacon, mjtNum* rcg, mjtNum* zcg, mjtNum* pcg, mjtNum* Hp) {
   mjtNum rz = 0, r0 = 0;
-  for (int i=0; i < N; i++) {
-    dx[i] = 0; rcg[i] = -grad[i]; zcg[i] = rcg[i]/diagH[i];
-    pcg[i] = zcg[i]; rz += rcg[i]*zcg[i]; r0 += rcg[i]*rcg[i];
-  }
+  for (int i=0; i < N; i++) { dx[i] = 0; rcg[i] = -grad[i]; r0 += rcg[i]*rcg[i]; }
+  ipc_blockPrec(zcg, rcg, Pinv, N);
+  for (int i=0; i < N; i++) { pcg[i] = zcg[i]; rz += rcg[i]*zcg[i]; }
   if (r0 < 1e-30) return;
   for (int it=0; it < 200; it++) {
     ipc_applyH(pcg, Hp, N, mdiag, en, he, efa, efb, ccache, nacon);
@@ -482,8 +508,8 @@ static void ipc_pcg(mjtNum* dx, const mjtNum* grad, int N, const mjtNum* diagH, 
     mjtNum rr = 0;
     for (int i=0; i < N; i++) { dx[i] += alpha*pcg[i]; rcg[i] -= alpha*Hp[i]; rr += rcg[i]*rcg[i]; }
     if (rr < 1e-8*r0) break;
-    mjtNum rznew = 0;
-    for (int i=0; i < N; i++) { zcg[i] = rcg[i]/diagH[i]; rznew += rcg[i]*zcg[i]; }
+    ipc_blockPrec(zcg, rcg, Pinv, N);
+    mjtNum rznew = 0; for (int i=0; i < N; i++) rznew += rcg[i]*zcg[i];
     mjtNum beta = rznew/rz; rz = rznew;
     for (int i=0; i < N; i++) pcg[i] = zcg[i] + beta*pcg[i];
   }
@@ -756,8 +782,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum* xn   = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
   mjtNum* grad = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* dx   = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
-  mjtNum* mdiag= (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // inertia diagonal (Jacobi precond base)
-  mjtNum* diagH= (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // full Hessian diagonal (preconditioner)
+  mjtNum* mdiag= (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // inertia diagonal (for the H*p apply)
+  mjtNum* blockP=(mjtNum*) mju_malloc(3*Na*sizeof(mjtNum)); // per-node 3x3 Hessian-diagonal blocks
+                                                            // (3x3 block-Jacobi preconditioner)
   mjtNum* rcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // CG residual / search-dir / Hp buffers
   mjtNum* zcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* pcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
@@ -799,7 +826,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
   int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, thresh, nfv, ne, el, en, ea, fidx,
                              doself, cand, candmax);
   for (int it=0; it < 12 && N > 0; it++) {
-    for (int i=0; i < N; i++) { grad[i] = 0; diagH[i] = mdiag[i]; }
+    for (int i=0; i < N; i++) grad[i] = 0;
+    for (int i=0; i < 3*N; i++) blockP[i] = 0;
+    for (int fi=0; fi < N/3; fi++) for (int c=0; c < 3; c++)   // inertia block: mh*I per node
+      blockP[9*fi + 3*c + c] = mdiag[3*fi+c];
     for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
       int fi = fidx[v]; mjtNum mh = mass[v]*ih2;
       for (int c=0; c < 3; c++) grad[3*fi+c] += mh*(x[3*v+c]-xtil[3*v+c]);
@@ -815,18 +845,22 @@ void mj_IPC(const mjModel* m, mjData* d) {
       mjtNum gg = k*(L-L0), t = (L > L0) ? k*(1.0 - L0/L) : 0.0;   // PSD-project tangential term
       for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
         heb[3*i+j] = k*dh[i]*dh[j] + t*((i==j?1.0:0.0) - dh[i]*dh[j]);   // 3x3 block (off-diag in applyH)
-      if (fa >= 0) for (int c=0; c < 3; c++) { grad[3*fa+c] += gg*dh[c]; diagH[3*fa+c] += heb[3*c+c]; }
-      if (fb >= 0) for (int c=0; c < 3; c++) { grad[3*fb+c] -= gg*dh[c]; diagH[3*fb+c] += heb[3*c+c]; }
+      // edge Hessian is [[heb,-heb],[-heb,heb]]; the per-node diagonal block is +heb for both ends
+      if (fa >= 0) { for (int c=0; c < 3; c++) grad[3*fa+c] += gg*dh[c];
+                     for (int i=0; i < 9; i++) blockP[9*fa+i] += heb[i]; }
+      if (fb >= 0) { for (int c=0; c < 3; c++) grad[3*fb+c] -= gg*dh[c];
+                     for (int i=0; i < 9; i++) blockP[9*fb+i] += heb[i]; }
     }
     // assemble active contacts: re-test the per-step candidate list at the current x (gate 0<g<ghat),
-    // accumulating grad + Hessian diagonal and caching the GN blocks (acon/ccache) for the solve + LS
+    // accumulating grad + the per-node Hessian blocks and caching the GN blocks (acon/ccache)
     int nacon = 0;
     for (int c=0; c < ncand; c++)
-      ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, diagH, acon, ccache, &nacon, amax,
+      ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, blockP, acon, ccache, &nacon, amax,
               &cgap[c]);
     mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i];
     if (sqrt(gn) < 1e-8) break;
-    ipc_pcg(dx, grad, N, diagH, mdiag, en, he, efa, efb, ccache, nacon, rcg, zcg, pcg, Hpv);
+    for (int fi=0; fi < N/3; fi++) ipc_sym3inv(blockP + 9*fi, blockP + 9*fi);   // invert node blocks
+    ipc_pcg(dx, grad, N, blockP, mdiag, en, he, efa, efb, ccache, nacon, rcg, zcg, pcg, Hpv);
     // proper IPC line search: alpha bounded by the rigorous additive CCD over the candidate contacts
     // (alpha -> ~1 when nothing is closing, so the full Newton step resolves contacts; no pair can
     // cross), then Armijo backtrack on the energy (which iterates the candidate set, so it sees
@@ -870,7 +904,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS);
   mju_free(gv); mju_free(ge); mju_free(he); mju_free(efa); mju_free(efb);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
-  mju_free(grad); mju_free(dx); mju_free(mdiag); mju_free(diagH);
+  mju_free(grad); mju_free(dx); mju_free(mdiag); mju_free(blockP);
   mju_free(rcg); mju_free(zcg); mju_free(pcg); mju_free(Hpv);
 }
 
