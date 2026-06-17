@@ -1981,15 +1981,15 @@ void mj_step(const mjModel* m, mjData* d) {
   // common to all integrators
   mj_checkPos(m, d);
   mj_checkVel(m, d);
-  // the IPC integrator does its own contact and reformulates flex stretch as a penalty, so the
-  // constraint assembly + solve in mj_forward is wasted for it. Disable constraints for the
-  // predictor (kinematics, mass and qacc_smooth -- the unconstrained accel -- are unaffected).
+  // The IPC integrator owns contact (barrier) and the flex elasticity (implicit, from flex_stiffness),
+  // so for the predictor we want the free-flight state x~ = x + h*v + h^2*a from inertia + gravity
+  // ONLY. Disable, for the predictor mj_forward: the constraint solve and collision detection (IPC
+  // ignores d->contact; the native contacts only mislead the viewer) AND the passive forces -- the
+  // FEM elastic spring is stiff and computed EXPLICITLY in qacc_smooth, which would make x~ blow up
+  // for the light flex vertices and double-count the elasticity the IPC solve adds implicitly.
   if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
     int saved = m->opt.disableflags;
-    // IPC does its own contact (barrier) and ignores d->contact, so skip MuJoCo's constraint solve
-    // AND its collision detection in the predictor (the latter otherwise produces native contacts --
-    // e.g. string-inside-bag -- that the integrator never uses but the viewer shows, which misleads).
-    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT;
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING;
     mj_forward(m, d);
     ((mjModel*) m)->opt.disableflags = saved;
   } else {
