@@ -302,15 +302,15 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
     for (int k=0; k < 3; k++) n[k] = (x[3*v+k]-cp[k])/dd;
     idv[0]=v; idv[1]=A; idv[2]=B; idv[3]=C;
     cw[0]=1; cw[1]=-w[0]; cw[2]=-w[1]; cw[3]=-w[2]; *nidx=4;
-    return dd - (rad[v] + r);   // point radius + flex (triangle) radius; rad[v]==r for flex self
+    return dd - (rad[v] + rad[A]);   // point radius + triangle (flex) radius; per-flex for cross-flex contact
   }
-  case 1: {   // edge-edge self-contact (edge a1b1 against edge a2b2)
+  case 1: {   // edge-edge contact (edge a1b1 against edge a2b2): flex self OR cross-flex
     int a1=con->idx[0], b1=con->idx[1], a2=con->idx[2], b2=con->idx[3];
     mjtNum cp1[3], cp2[3], st[2], dd = ipc_segSeg(&x[3*a1], &x[3*b1], &x[3*a2], &x[3*b2], cp1, cp2, st);
     for (int k=0; k < 3; k++) n[k] = (cp1[k]-cp2[k])/dd;
     idv[0]=a1; idv[1]=b1; idv[2]=a2; idv[3]=b2;
     cw[0]=1-st[0]; cw[1]=st[0]; cw[2]=-(1-st[1]); cw[3]=-st[1]; *nidx=4;
-    return dd - 2*r;
+    return dd - (rad[a1] + rad[a2]);   // both edges' (flex) radii
   }
   case 2: {   // free point v (flex vertex or rigid sphere) vs static geom gi surface
     int v=con->idx[0], gi=con->gi;
@@ -324,7 +324,7 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
     mjtNum cp[3], w[3], dd = ipc_ptTri(corner, &x[3*A], &x[3*B], &x[3*C], cp, w);
     for (int k=0; k < 3; k++) n[k] = (corner[k]-cp[k])/dd;
     idv[0]=A; idv[1]=B; idv[2]=C; cw[0]=-w[0]; cw[1]=-w[1]; cw[2]=-w[2]; *nidx=3;
-    return dd - r;
+    return dd - rad[A];   // flex triangle radius
   }
   case 5: {   // rigid point p1 vs rigid point p2 (sphere-sphere)
     int p1=con->idx[0], p2=con->idx[1];
@@ -340,7 +340,7 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
     mjtNum cp1[3], cp2[3], st[2], dd = ipc_segSeg(eg, eg+3, &x[3*a], &x[3*b], cp1, cp2, st);
     for (int k=0; k < 3; k++) n[k] = (cp1[k]-cp2[k])/dd;
     idv[0]=a; idv[1]=b; cw[0]=-(1-st[1]); cw[1]=-st[1]; *nidx=2;
-    return dd - r;
+    return dd - rad[a];   // flex edge radius
   }
   }
 }
@@ -367,14 +367,14 @@ static mjtNum ipc_conGapAdv(const ipcCon* con, const mjModel* m, const mjData* d
     for (int k=0; k < 3; k++) P[q][k] = x[3*v[q]+k] + (fq >= 0 ? t*dxw[3*fq+k] : 0.0); }
   mjtNum cp[3], w[3], c1[3], c2[3], st[2];
   switch (con->type) {
-  case 0:  return ipc_ptTri(P[0], P[1], P[2], P[3], cp, w) - (rad[con->idx[0]] + r);
-  case 1:  return ipc_segSeg(P[0], P[1], P[2], P[3], c1, c2, st) - 2*r;
+  case 0:  return ipc_ptTri(P[0], P[1], P[2], P[3], cp, w) - (rad[con->idx[0]] + rad[con->idx[1]]);
+  case 1:  return ipc_segSeg(P[0], P[1], P[2], P[3], c1, c2, st) - (rad[con->idx[0]] + rad[con->idx[2]]);
   case 2:  { mjtNum nn[3];
              return ipc_geomDist(m, con->gi, d->geom_xpos+3*con->gi, d->geom_xmat+9*con->gi, P[0], nn, 1e30) - rad[con->idx[0]]; }
-  case 3:  return ipc_ptTri(&gv[3*con->idx[0]], P[0], P[1], P[2], cp, w) - r;
+  case 3:  return ipc_ptTri(&gv[3*con->idx[0]], P[0], P[1], P[2], cp, w) - rad[con->idx[1]];
   case 5:  { mjtNum dd=0; for (int k=0; k < 3; k++){ mjtNum t=P[0][k]-P[1][k]; dd+=t*t; }
              return mju_sqrt(dd) - (rad[con->idx[0]]+rad[con->idx[1]]); }
-  default: { const mjtNum* eg = &ge[6*con->idx[0]]; return ipc_segSeg(eg, eg+3, P[0], P[1], c1, c2, st) - r; }
+  default: { const mjtNum* eg = &ge[6*con->idx[0]]; return ipc_segSeg(eg, eg+3, P[0], P[1], c1, c2, st) - rad[con->idx[1]]; }
   }
 }
 
@@ -646,8 +646,9 @@ static int ipc_bvhBox(const mjModel* m, const mjData* d, int f, const mjtNum* c,
 // Flex-flex and geom-feature-vs-flex pairs are found by querying the flex element BVH (ipc_bvhBox).
 static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* gv,
                           const mjtNum* ge, int ngv, int nge, mjtNum r, const mjtNum* rad, mjtNum thresh,
-                          mjtNum threshGeom, int nfv, int npt, int ne, const int* el, int en, int ea,
-                          const int* fidx, int f, const int* elemedge, int doself, ipcCon* cand, int candmax) {
+                          mjtNum threshGeom, int nfv, int npt, const int* fidx,
+                          const int* flist, const int* fxadr, int nfd, const int* pt2flex,
+                          ipcCon* cand, int candmax) {
   int nc = 0;
   for (int gi=0; gi < m->ngeom; gi++) {                                      // free point (flex vert / sphere) vs geom
     if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;       // skip non-colliding
@@ -679,91 +680,90 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
     ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
   }
 
-  // ---- geom-feature and self candidates via the flex element BVH (ipc_bvhBox) ----
-  int bvhadr = m->flex_bvhadr[f];
-  if (bvhadr < 0 || (ne == 0 && en == 0)) return nc;   // no element BVH -> only flex-vertex-vs-geom
-  int bvhnum = m->flex_bvhnum[f];
-  int* stk    = (int*) mju_malloc((bvhnum > 0 ? bvhnum : 1)*sizeof(int));
-  int* outel  = (int*) mju_malloc((ne > 0 ? ne : 1)*sizeof(int));
-  int* stampG = (int*) mju_malloc((en > 0 ? en : 1)*sizeof(int));
-  for (int e=0; e < en; e++) stampG[e] = -1;
+  // ---- BVH-based candidates over ALL dim-2 flexes: geom-feature, sphere-vs-flex, and flex-vs-flex VT/EE.
+  // Each query is against one flex's element BVH (ipc_bvhBox); triangle/edge vertices are mapped from the
+  // queried flex's local indices to the combined free-point space (fxadr[k] + local). flex-vs-flex contact
+  // is SELF when the querying vertex/edge is in the queried flex (gated by that flex's selfcollide) and
+  // INTER-FLEX otherwise (always on). Scratch buffers are sized for the largest flex. ----
+  int maxbvh = 1, maxel = 1, maxen = 1;
+  for (int k=0; k < nfd; k++) { int fk = flist[k];
+    if (m->flex_bvhnum[fk] > maxbvh) maxbvh = m->flex_bvhnum[fk];
+    if (m->flex_elemnum[fk] > maxel) maxel = m->flex_elemnum[fk];
+    if (m->flex_edgenum[fk] > maxen) maxen = m->flex_edgenum[fk]; }
+  int* stk    = (int*) mju_malloc(maxbvh*sizeof(int));
+  int* outel  = (int*) mju_malloc(maxel*sizeof(int));
+  int* stampG = (int*) mju_malloc(maxen*sizeof(int));
+  for (int e=0; e < maxen; e++) stampG[e] = -1;
   int qid = 0;
-  // query half >= thresh + r: node AABBs already include one radius, and a candidate is within thresh of
-  // the (one- or two-radius) surface gap, so this is a conservative superset -- no near pair is missed.
-  mjtNum qhv[3] = {thresh+r, thresh+r, thresh+r};
 
-  // rigid point (sphere) vs flex triangle: each sphere center queries the triangle BVH (reuses the
-  // vertex-triangle type 0, with the sphere as the "vertex" -> gap = dd - (rad[sphere]+r), coupling the
-  // sphere dof and the triangle's flex dofs). Always on (not gated by self-collide); the sphere is never
-  // a member of a flex triangle so no self-skip is needed. Generated BEFORE the (potentially huge) flex
-  // geom-feature candidate flood so the few sphere candidates are never crowded out by the candmax cap --
-  // that crowd-out previously dropped the sphere's contact mid-fall and let it tunnel through the bag.
-  for (int p=nfv; p < npt; p++) {
-    mjtNum qh[3] = {thresh+rad[p], thresh+rad[p], thresh+rad[p]};
-    int n = ipc_bvhBox(m, d, f, &x[3*p], qh, stk, outel, ne);
-    for (int i=0; i < n; i++) { int e = outel[i];
-      ipcCon con = {0, {p, el[3*e], el[3*e+1], el[3*e+2]}, -1};
-      ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
-    }
-  }
+  for (int k=0; k < nfd; k++) {                       // query flex fk's element BVH
+    int fk = flist[k];
+    int ne_k = m->flex_elemnum[fk], ea_k = m->flex_edgeadr[fk], off_k = fxadr[k];
+    if (m->flex_bvhadr[fk] < 0 || ne_k == 0) continue;
+    const int* el_k  = m->flex_elem + m->flex_elemdataadr[fk];
+    const int* eme_k = m->flex_elemedge + m->flex_elemedgeadr[fk];
+    mjtNum rk = m->flex_radius[fk];
+    int doself_k = (m->flex_selfcollide[fk] != mjFLEXSELF_NONE);
 
-  // geom-corner vs flex-triangle (type 3): each geom vertex queries the triangle BVH. The geom is STATIC,
-  // so this is a one-sided contact -- a pair can only close at the flex's speed. It uses the tighter
-  // threshGeom (vs the two-sided sphere/self thresh): the geom features (a 36-piece convex decomposition
-  // here -> ~1600 edges, ~1000 corners) otherwise generate hundreds of thousands of far candidates that
-  // overflow candmax and crowd out the near, contact-relevant ones (which let the bag sink into the bin).
-  mjtNum qhvG[3] = {threshGeom+r, threshGeom+r, threshGeom+r};
-  for (int c=0; c < ngv; c++) {
-    int n = ipc_bvhBox(m, d, f, &gv[3*c], qhvG, stk, outel, ne);
-    for (int i=0; i < n; i++) { int e = outel[i];
-      ipcCon con = {3, {c, el[3*e], el[3*e+1], el[3*e+2]}, -1};
-      ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax);
+    // rigid point (sphere) vs flex triangle (type 0). Generated first so the few sphere candidates are
+    // never crowded out of candmax by the (potentially huge) geom-feature flood -> no ball tunneling.
+    for (int p=nfv; p < npt; p++) {
+      mjtNum qh[3] = {thresh+rad[p], thresh+rad[p], thresh+rad[p]};
+      int n = ipc_bvhBox(m, d, fk, &x[3*p], qh, stk, outel, ne_k);
+      for (int i=0; i < n; i++) { int e = outel[i];
+        ipcCon con = {0, {p, off_k+el_k[3*e], off_k+el_k[3*e+1], off_k+el_k[3*e+2]}, -1};
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); }
     }
-  }
-  // geom-edge vs flex-edge (type 4): each geom edge queries the BVH with its (inflated) box, then the
-  // overlapping triangles' edges; dedup the shared edges per query via stampG.
-  for (int c=0; c < nge; c++) {
-    const mjtNum* p0 = &ge[6*c]; const mjtNum* p1 = &ge[6*c+3];
-    mjtNum qc[3], qh[3];
-    for (int k=0; k < 3; k++) { qc[k] = 0.5*(p0[k]+p1[k]); qh[k] = 0.5*mju_abs(p1[k]-p0[k]) + threshGeom+r; }
-    int n = ipc_bvhBox(m, d, f, qc, qh, stk, outel, ne);
-    qid++;
-    for (int i=0; i < n; i++) { int e = outel[i];
-      for (int j=0; j < 3; j++) { int e2 = elemedge[3*e+j];
-        if (stampG[e2] == qid) continue; stampG[e2] = qid;
-        ipcCon con = {4, {c, m->flex_edge[2*(ea+e2)], m->flex_edge[2*(ea+e2)+1], 0}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax);
-      }
+    // geom-corner vs flex triangle (type 3); geom is static (one-sided) -> tighter threshGeom (the
+    // convex-decomposition bin's ~1600 edges otherwise overflow candmax and drop the bag-bin contacts).
+    mjtNum qhvG[3] = {threshGeom+rk, threshGeom+rk, threshGeom+rk};
+    for (int c=0; c < ngv; c++) {
+      int n = ipc_bvhBox(m, d, fk, &gv[3*c], qhvG, stk, outel, ne_k);
+      for (int i=0; i < n; i++) { int e = outel[i];
+        ipcCon con = {3, {c, off_k+el_k[3*e], off_k+el_k[3*e+1], off_k+el_k[3*e+2]}, -1};
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax); }
     }
-  }
-
-  if (doself) {
-    // vertex-triangle self: each vertex queries the triangle BVH
+    // geom-edge vs flex edge (type 4); dedup the shared triangle edges per query via stampG.
+    for (int c=0; c < nge; c++) {
+      const mjtNum* p0 = &ge[6*c]; const mjtNum* p1 = &ge[6*c+3]; mjtNum qc[3], qh[3];
+      for (int kk=0; kk<3; kk++) { qc[kk]=0.5*(p0[kk]+p1[kk]); qh[kk]=0.5*mju_abs(p1[kk]-p0[kk])+threshGeom+rk; }
+      int n = ipc_bvhBox(m, d, fk, qc, qh, stk, outel, ne_k); qid++;
+      for (int i=0; i < n; i++) { int e = outel[i];
+        for (int j=0; j<3; j++) { int e2 = eme_k[3*e+j]; if (stampG[e2]==qid) continue; stampG[e2]=qid;
+          ipcCon con = {4, {c, off_k+m->flex_edge[2*(ea_k+e2)], off_k+m->flex_edge[2*(ea_k+e2)+1], 0}, -1};
+          ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax); } }
+    }
+    // flex vertex vs flex triangle (type 0): self (same flex, gated by selfcollide) + inter-flex (always).
+    // Asymmetric (vert vs tri), so all verts query every flex's BVH -- both directions are distinct contacts.
     for (int v=0; v < nfv; v++) {
-      int n = ipc_bvhBox(m, d, f, &x[3*v], qhv, stk, outel, ne);
+      int kv = pt2flex[v];
+      if (kv == k && !doself_k) continue;              // self-contact disabled for this flex
+      mjtNum qh[3] = {thresh+rad[v], thresh+rad[v], thresh+rad[v]};
+      int n = ipc_bvhBox(m, d, fk, &x[3*v], qh, stk, outel, ne_k);
       for (int i=0; i < n; i++) { int e = outel[i];
-        int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
-        if (v==A || v==B || v==C) continue;
+        int A=off_k+el_k[3*e], B=off_k+el_k[3*e+1], C=off_k+el_k[3*e+2];
+        if (kv == k && (v==A||v==B||v==C)) continue;   // skip the self-adjacent triangle
         ipcCon con = {0, {v, A, B, C}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
-      }
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); }
     }
-    // edge-edge self: each flex edge queries the BVH, then the overlapping triangles' edges (canonical
-    // e2 > e1, non-adjacent); dedup per query via stampG.
-    for (int e1=0; e1 < en; e1++) {
-      int a1 = m->flex_edge[2*(ea+e1)], b1 = m->flex_edge[2*(ea+e1)+1];
-      mjtNum qc[3], qh[3];
-      for (int k=0; k < 3; k++) { qc[k]=0.5*(x[3*a1+k]+x[3*b1+k]); qh[k]=0.5*mju_abs(x[3*a1+k]-x[3*b1+k])+thresh+r; }
-      int n = ipc_bvhBox(m, d, f, qc, qh, stk, outel, ne);
-      qid++;
-      for (int i=0; i < n; i++) { int e = outel[i];
-        for (int j=0; j < 3; j++) { int e2 = elemedge[3*e+j];
-          if (e2 <= e1 || stampG[e2] == qid) continue; stampG[e2] = qid;
-          int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
-          if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;
-          ipcCon con = {1, {a1, b1, a2, b2}, -1};
-          ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
-        }
+    // flex edge vs flex edge (type 1): symmetric, so canonical -- querying flex kj <= k, and e2 > e1 within
+    // a flex. Self (kj==k) gated by selfcollide; inter-flex (kj<k) always.
+    for (int kj=0; kj <= k; kj++) {
+      int self = (kj == k); if (self && !doself_k) continue;
+      int fj = flist[kj], ea_j = m->flex_edgeadr[fj], en_j = m->flex_edgenum[fj], off_j = fxadr[kj];
+      for (int e1=0; e1 < en_j; e1++) {
+        int a1 = off_j+m->flex_edge[2*(ea_j+e1)], b1 = off_j+m->flex_edge[2*(ea_j+e1)+1];
+        mjtNum qc[3], qh[3];
+        for (int kk=0; kk<3; kk++) { qc[kk]=0.5*(x[3*a1+kk]+x[3*b1+kk]); qh[kk]=0.5*mju_abs(x[3*a1+kk]-x[3*b1+kk])+thresh+rad[a1]; }
+        int n = ipc_bvhBox(m, d, fk, qc, qh, stk, outel, ne_k); qid++;
+        for (int i=0; i < n; i++) { int e = outel[i];
+          for (int j=0; j<3; j++) { int e2 = eme_k[3*e+j];
+            if (self && e2 <= e1) continue;            // canonical within a flex
+            if (stampG[e2] == qid) continue; stampG[e2] = qid;
+            int a2 = off_k+m->flex_edge[2*(ea_k+e2)], b2 = off_k+m->flex_edge[2*(ea_k+e2)+1];
+            if (a1==a2||a1==b2||b1==a2||b1==b2) continue;   // shared vertex -> adjacent, skip
+            ipcCon con = {1, {a1, b1, a2, b2}, -1};
+            ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); } }
       }
     }
   }
@@ -961,14 +961,24 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum h = m->opt.timestep;
   if (m != g_kappaM) { g_kappa = IPC_KAPPA0; g_kappaM = m; }
   mjtNum kappa = g_kappa;
-  int f = -1;
-  for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { f = i; break; }
-  if (f < 0) { mj_Euler(m, d); return; }
-  int nfv = m->flex_vertnum[f], va = m->flex_vertadr[f];
-  int ea = m->flex_edgeadr[f], en = m->flex_edgenum[f];
-  int ne = m->flex_elemnum[f];
-  const int* el = m->flex_elem + m->flex_elemdataadr[f];
-  mjtNum r = m->flex_radius[f], ghat = r;   // contact activates within ghat of the 2r surface gap
+  // all dim-2 flexes participate in the IPC solve (was: only the first). Their vertices are concatenated
+  // into the free-point array in flex order; fxadr[k] is the free-point offset of dim-2 flex flist[k].
+  int nfd = 0;
+  for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) nfd++;
+  if (nfd == 0) { mj_Euler(m, d); return; }
+  int* flist = (int*) mju_malloc(nfd*sizeof(int));   // the dim-2 flex ids
+  int* fxadr = (int*) mju_malloc(nfd*sizeof(int));   // free-point offset of each dim-2 flex
+  int nfv = 0, ne = 0;                               // total dim-2 flex verts / elements (all flexes)
+  for (int i=0, k=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) {
+    flist[k] = i; fxadr[k] = nfv; nfv += m->flex_vertnum[i]; ne += m->flex_elemnum[i]; k++;
+  }
+  int f = flist[0];   // flex 0 sets the global barrier scale (ghat); all dim-2 flexes are solved + collide
+  mjtNum r = m->flex_radius[f], ghat = r;   // contact activates within ghat of the surface gap
+  // free-point -> global flex-vertex index (into flex_vertbodyid / flexvert_xpos), and -> dim-2 flex slot k
+  int* pt2vg   = (int*) mju_malloc((nfv > 0 ? nfv : 1)*sizeof(int));
+  int* pt2flex = (int*) mju_malloc((nfv > 0 ? nfv : 1)*sizeof(int));
+  for (int k=0; k < nfd; k++) { int va_k = m->flex_vertadr[flist[k]], nv_k = m->flex_vertnum[flist[k]];
+    for (int lv=0; lv < nv_k; lv++) { pt2vg[fxadr[k] + lv] = va_k + lv; pt2flex[fxadr[k] + lv] = k; } }
 
   // free points = bodies with 3 slide DOFs: the flex vertices (elastic) plus any standalone 3-slide body
   // carrying a sphere geom (rigid point). Generic so rigid/ABD bodies can extend this later -- a free point
@@ -976,7 +986,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // xold POSITION source differs (flex vertex vs geom center). Count the spheres first to size the arrays.
   char* isflexvert = (char*) mju_malloc((m->nbody > 0 ? m->nbody : 1)*sizeof(char));
   for (int b=0; b < m->nbody; b++) isflexvert[b] = 0;
-  for (int v=0; v < nfv; v++) isflexvert[m->flex_vertbodyid[va+v]] = 1;
+  for (int v=0; v < nfv; v++) isflexvert[m->flex_vertbodyid[pt2vg[v]]] = 1;
   int nsph = 0;
   for (int b=0; b < m->nbody; b++) {
     if (isflexvert[b] || m->body_dofnum[b] != 3 || m->jnt_type[m->body_jntadr[b]] != mjJNT_SLIDE) continue;
@@ -992,13 +1002,17 @@ void mj_IPC(const mjModel* m, mjData* d) {
   int* pbody  = (int*) mju_malloc(npt*sizeof(int));          // body id, for the slide-frame rotation R
   int* pgeom  = (int*) mju_malloc(npt*sizeof(int));          // sphere geom id (>=0); -1 for a flex vertex
   int nfree = 0;
-  for (int v=0; v < nfv; v++) {
-    int bid = m->flex_vertbodyid[va+v];
-    dofadr[v] = -1; qpadr[v] = -1; fidx[v] = -1; mass[v] = 0; rad[v] = r; pbody[v] = bid; pgeom[v] = -1;
-    if (m->body_dofnum[bid] == 3) {
-      int da = m->body_dofadr[bid];
-      dofadr[v] = da; qpadr[v] = m->jnt_qposadr[m->body_jntadr[bid]]; fidx[v] = nfree++;
-      mass[v] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];   // diagonal (point mass)
+  for (int k=0; k < nfd; k++) {                               // flex vertices, per dim-2 flex
+    int fi = flist[k]; mjtNum rk = m->flex_radius[fi];
+    int va_k = m->flex_vertadr[fi], nv_k = m->flex_vertnum[fi];
+    for (int lv=0; lv < nv_k; lv++) {
+      int v = fxadr[k] + lv, bid = m->flex_vertbodyid[va_k + lv];
+      dofadr[v] = -1; qpadr[v] = -1; fidx[v] = -1; mass[v] = 0; rad[v] = rk; pbody[v] = bid; pgeom[v] = -1;
+      if (m->body_dofnum[bid] == 3) {
+        int da = m->body_dofadr[bid];
+        dofadr[v] = da; qpadr[v] = m->jnt_qposadr[m->body_jntadr[bid]]; fidx[v] = nfree++;
+        mass[v] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];   // diagonal (point mass)
+      }
     }
   }
   for (int b=0, p=nfv; b < m->nbody; b++) {                  // append the rigid sphere points
@@ -1015,19 +1029,23 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   mju_free(isflexvert);
   int N = 3*nfree, Na = (N > 0 ? N : 1);
-  // FEM membrane elements: consume MuJoCo's precomputed flex_stiffness metric (from the model's
-  // <elasticity young=.../> tag) per element + the rest squared edge lengths. No hand-rolled springs.
-  int sa = m->flex_stiffnessadr[f];
-  const int* elemedge = m->flex_elemedge + m->flex_elemedgeadr[f];
+  // FEM membrane elements (all dim-2 flexes): consume MuJoCo's precomputed flex_stiffness metric (from the
+  // model's <elasticity young=.../> tag) per element + the rest squared edge lengths. No hand-rolled springs.
+  // Element vertex indices are mapped from per-flex local (el_k) to the combined free-point space (fxadr[k]+).
   ipcElem* elems = (ipcElem*) mju_malloc((ne > 0 ? ne : 1)*sizeof(ipcElem));
-  for (int t=0; t < ne; t++) {
-    for (int i=0; i < 3; i++) { elems[t].vg[i] = el[3*t+i]; elems[t].fv[i] = fidx[el[3*t+i]]; }
-    for (int j=0; j < 6; j++) elems[t].M[j] = (sa >= 0) ? m->flex_stiffness[sa + 21*t + j] : 0;
-    for (int a=0; a < 3; a++) {
-      mjtNum L0 = m->flexedge_length0[ea + elemedge[3*t+a]]; elems[t].Lr2[a] = L0*L0;
-      elems[t].ep[a] = 0;
+  for (int k=0, et=0; k < nfd; k++) {
+    int fi = flist[k], sa_k = m->flex_stiffnessadr[fi], ea_k = m->flex_edgeadr[fi], ne_k = m->flex_elemnum[fi];
+    const int* el_k = m->flex_elem + m->flex_elemdataadr[fi];
+    const int* eme_k = m->flex_elemedge + m->flex_elemedgeadr[fi];
+    mjtNum kD_k = (h > 0) ? m->flex_damping[fi]/h : 0;          // stiffness-prop. Rayleigh damping
+    for (int t=0; t < ne_k; t++, et++) {
+      for (int i=0; i < 3; i++) { int gp = fxadr[k] + el_k[3*t+i]; elems[et].vg[i] = gp; elems[et].fv[i] = fidx[gp]; }
+      for (int j=0; j < 6; j++) elems[et].M[j] = (sa_k >= 0) ? m->flex_stiffness[sa_k + 21*t + j] : 0;
+      for (int a=0; a < 3; a++) {
+        mjtNum L0 = m->flexedge_length0[ea_k + eme_k[3*t+a]]; elems[et].Lr2[a] = L0*L0; elems[et].ep[a] = 0;
+      }
+      elems[et].kD = kD_k;
     }
-    elems[t].kD = (h > 0) ? m->flex_damping[f]/h : 0;   // stiffness-prop. Rayleigh damping (Kharevych 5.2)
   }
   int amax = npt*64 + 1024;                   // capacity of the active-contact list
   ipcCon* acon = (ipcCon*) mju_malloc(amax*sizeof(ipcCon));
@@ -1076,7 +1094,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   const mjtNum* vx = d->flexvert_xpos;
   for (int v=0; v < npt; v++) {
     // xold position source: flex vertex from flexvert_xpos, rigid sphere from its geom center
-    if (pgeom[v] < 0) for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*(va+v)+c];
+    if (pgeom[v] < 0) for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*pt2vg[v]+c];
     else              for (int c=0; c < 3; c++) xold[3*v+c] = d->geom_xpos[3*pgeom[v]+c];
     if (fidx[v] >= 0) {
       int da = dofadr[v];
@@ -1113,9 +1131,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // 36-piece convex-decomposition bin (~1600 edges) generate ~600k candidates that overflow candmax and
   // drop the edge-edge contacts -> the bag sinks into the bin. ghat + 2*maxdisp keeps the count ~160k.
   mjtNum threshGeom = ghat + 2.0*maxdisp;
-  int doself = (m->flex_selfcollide[f] != mjFLEXSELF_NONE);   // honor the flex's selfcollide flag
-  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, rad, thresh, threshGeom, nfv, npt, ne, el, en, ea, fidx,
-                             f, elemedge, doself, cand, candmax);
+  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, rad, thresh, threshGeom, nfv, npt, fidx,
+                             flist, fxadr, nfd, pt2flex, cand, candmax);
   // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
   // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
@@ -1292,6 +1309,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
   mju_free(rad); mju_free(pbody); mju_free(pgeom);
+  mju_free(flist); mju_free(fxadr); mju_free(pt2vg); mju_free(pt2flex);
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS);
   mju_free(gv); mju_free(ge); mju_free(estr);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
