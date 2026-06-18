@@ -356,6 +356,18 @@ static void ipc_conVerts(const ipcCon* con, int* v, int* nv) {
   }
 }
 
+// per-contact barrier activation distance d_hat. Never exceeds the global ghat, but shrinks to the
+// thinnest participating radius: a thin flex (e.g. a drawstring sitting in a thick bag's sleeve) then
+// gets a proportionally thin barrier zone instead of resting deep inside the thick neighbour's zone
+// (which keeps it permanently active + ratchets kappa -> ill-conditioned). Geom features carry no
+// radius (excluded by ipc_conVerts), so geom/flex and sphere/flex contacts keep the global ghat.
+static mjtNum ipc_conGhat(const ipcCon* con, const mjtNum* rad, mjtNum ghat) {
+  int vv[4], nvv; ipc_conVerts(con, vv, &nvv);
+  mjtNum g = ghat;
+  for (int q = 0; q < nvv; q++) if (rad[vv[q]] < g) g = rad[vv[q]];
+  return g;
+}
+
 // surface gap of a contact with its flex vertices advanced by t*dxw (geom features fixed); gap-only,
 // for the CCD conservative advancement (recomputes the closest feature at the advanced configuration).
 static mjtNum ipc_conGapAdv(const ipcCon* con, const mjModel* m, const mjData* d, const mjtNum* x,
@@ -463,11 +475,12 @@ static void ipc_try(ipcCon con, const mjModel* m, const mjData* d, const mjtNum*
                     const int* fidx, mjtNum* grad,
                     ipcCon* acon, ipcCC* ccache, int* nacon, int amax, mjtNum* gout) {
   mjtNum n[3], cw[4]; int idv[4], nidx;
-  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, ghat);
+  mjtNum ghc = ipc_conGhat(&con, rad, ghat);   // per-contact barrier width (thin for thin participants)
+  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, ghat);   // detection cutoff stays global
   *gout = g;   // cache the gap at x so CCD (g0) and the E0 energy can reuse it without recomputing
-  if (g <= 0 || g >= ghat) return;
+  if (g <= 0 || g >= ghc) return;
   if (*nacon >= amax) return;
-  mjtNum bd = kappa*ipc_Bd(g, ghat), bdd = kappa*ipc_Bdd(g, ghat);
+  mjtNum bd = kappa*ipc_Bd(g, ghc), bdd = kappa*ipc_Bdd(g, ghc);
   ipcCC* cc = &ccache[*nacon];
   cc->bdd = bdd; cc->nidx = nidx;
   for (int k=0; k < 3; k++) cc->n[k] = n[k];
@@ -598,12 +611,15 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
   E += ipc_stretchEnergy(nelem, elems, x);
   for (int c=0; c < nacon; c++) {
     mjtNum n[3], cw[4]; int idv[4], nidx;
+    mjtNum ghc = ipc_conGhat(&acon[c], rad, ghat);
     mjtNum g = ipc_conGap(&acon[c], m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, 1e30);
-    if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
+    if (g > 0 && g < ghc) E += kappa*ipc_Bg(g, ghc);
   }
   return E;
 }
 
+
+static inline mjtNum ipc_fmin(mjtNum a, mjtNum b) { return a < b ? a : b; }
 
 // append a candidate contact if its gap at x is below the (margin-inflated) detection threshold
 static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjtNum* x,
@@ -646,7 +662,7 @@ static int ipc_bvhBox(const mjModel* m, const mjData* d, int f, const mjtNum* c,
 // Flex-flex and geom-feature-vs-flex pairs are found by querying the flex element BVH (ipc_bvhBox).
 static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* gv,
                           const mjtNum* ge, int ngv, int nge, mjtNum r, const mjtNum* rad, mjtNum thresh,
-                          mjtNum threshGeom, int nfv, int npt, const int* fidx,
+                          mjtNum threshGeom, mjtNum maxdisp, int nfv, int npt, const int* fidx,
                           const int* flist, const int* fxadr, int nfd, const int* pt2flex,
                           ipcCon* cand, int candmax) {
   int nc = 0;
@@ -708,11 +724,12 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
     // rigid point (sphere) vs flex triangle (type 0). Generated first so the few sphere candidates are
     // never crowded out of candmax by the (potentially huge) geom-feature flood -> no ball tunneling.
     for (int p=nfv; p < npt; p++) {
-      mjtNum qh[3] = {thresh+rad[p], thresh+rad[p], thresh+rad[p]};
+      mjtNum thp = 3.0*ipc_fmin(r, ipc_fmin(rad[p], rk)) + 4.0*maxdisp;   // per-pair band: thinner radius sets it
+      mjtNum qh[3] = {thp+rad[p], thp+rad[p], thp+rad[p]};
       int n = ipc_bvhBox(m, d, fk, &x[3*p], qh, stk, outel, ne_k);
       for (int i=0; i < n; i++) { int e = outel[i];
         ipcCon con = {0, {p, off_k+el_k[3*e], off_k+el_k[3*e+1], off_k+el_k[3*e+2]}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); }
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, thp, cand, &nc, candmax); }
     }
     // geom-corner vs flex triangle (type 3); geom is static (one-sided) -> tighter threshGeom (the
     // convex-decomposition bin's ~1600 edges otherwise overflow candmax and drop the bag-bin contacts).
@@ -738,13 +755,14 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
     for (int v=0; v < nfv; v++) {
       int kv = pt2flex[v];
       if (kv == k && !doself_k) continue;              // self-contact disabled for this flex
-      mjtNum qh[3] = {thresh+rad[v], thresh+rad[v], thresh+rad[v]};
+      mjtNum thv = 3.0*ipc_fmin(r, ipc_fmin(rad[v], rk)) + 4.0*maxdisp;   // per-pair band: thinner flex sets it
+      mjtNum qh[3] = {thv+rad[v], thv+rad[v], thv+rad[v]};
       int n = ipc_bvhBox(m, d, fk, &x[3*v], qh, stk, outel, ne_k);
       for (int i=0; i < n; i++) { int e = outel[i];
         int A=off_k+el_k[3*e], B=off_k+el_k[3*e+1], C=off_k+el_k[3*e+2];
         if (kv == k && (v==A||v==B||v==C)) continue;   // skip the self-adjacent triangle
         ipcCon con = {0, {v, A, B, C}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); }
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, thv, cand, &nc, candmax); }
     }
     // flex edge vs flex edge (type 1): symmetric, so canonical -- querying flex kj <= k, and e2 > e1 within
     // a flex. Self (kj==k) gated by selfcollide; inter-flex (kj<k) always.
@@ -753,8 +771,9 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
       int fj = flist[kj], ea_j = m->flex_edgeadr[fj], en_j = m->flex_edgenum[fj], off_j = fxadr[kj];
       for (int e1=0; e1 < en_j; e1++) {
         int a1 = off_j+m->flex_edge[2*(ea_j+e1)], b1 = off_j+m->flex_edge[2*(ea_j+e1)+1];
+        mjtNum the = 3.0*ipc_fmin(r, ipc_fmin(rad[a1], rk)) + 4.0*maxdisp;   // per-pair band
         mjtNum qc[3], qh[3];
-        for (int kk=0; kk<3; kk++) { qc[kk]=0.5*(x[3*a1+kk]+x[3*b1+kk]); qh[kk]=0.5*mju_abs(x[3*a1+kk]-x[3*b1+kk])+thresh+rad[a1]; }
+        for (int kk=0; kk<3; kk++) { qc[kk]=0.5*(x[3*a1+kk]+x[3*b1+kk]); qh[kk]=0.5*mju_abs(x[3*a1+kk]-x[3*b1+kk])+the+rad[a1]; }
         int n = ipc_bvhBox(m, d, fk, qc, qh, stk, outel, ne_k); qid++;
         for (int i=0; i < n; i++) { int e = outel[i];
           for (int j=0; j<3; j++) { int e2 = eme_k[3*e+j];
@@ -763,7 +782,7 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
             int a2 = off_k+m->flex_edge[2*(ea_k+e2)], b2 = off_k+m->flex_edge[2*(ea_k+e2)+1];
             if (a1==a2||a1==b2||b1==a2||b1==b2) continue;   // shared vertex -> adjacent, skip
             ipcCon con = {1, {a1, b1, a2, b2}, -1};
-            ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax); } }
+            ipc_addCand(con, m, d, x, gv, ge, r, rad, the, cand, &nc, candmax); } }
       }
     }
   }
@@ -798,7 +817,8 @@ static long long* g_spMkeys = NULL;
 
 // build the lower-tri CSR pattern + column structure from mesh elements + candidate contacts
 static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ipcElem* elems,
-                        int ncand, const ipcCon* cand, const int* fidx) {
+                        int ncand, const ipcCon* cand, const mjtNum* cgap, const mjtNum* rad,
+                        mjtNum ghat, const int* fidx) {
   sp->N = N;
   // (re)build the cached mesh+diagonal sorted-unique keys only when the model/N changes
   if (m != g_spm || N != g_spN) {
@@ -822,6 +842,8 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
     // Types that couple nodes NOT sharing an element add new pattern entries and MUST be included: flex
     // self-contact (0,1), sphere-vs-flex (0, sphere node <-> triangle), and sphere-vs-sphere (5).
     if (cand[c].type >= 2 && cand[c].type != 5) continue;
+    mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);   // couple ONLY active contacts (gap within their ghat):
+    if (cgap[c] >= ghc) continue;                     // inactive inter-flex pairs (~99%) add no pattern block
     int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
     for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
   }
@@ -951,9 +973,10 @@ static void ipc_icApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 // adaptive barrier stiffness (IPC, Li et al. 2020 sec.4): a fixed kappa cannot serve both light and heavy
 // contacts -- too soft lets the minimum gap collapse toward 0, which ill-conditions the log barrier and
 // (because the CCD then caps each Newton step to keep gap > 0.2*gap) collapses the step size and stalls
-// Newton. kappa persists across steps and is doubled when the min active gap falls below 0.2*ghat,
-// relaxed (gently) when it stays comfortably open, clamped to [IPC_KAPPA0, IPC_KAPPAMAX].
-#define IPC_KAPPA0   100.0
+// Newton. kappa persists across steps; it is doubled only when tightness is BROAD (>5% of active contacts
+// below 0.2 of their per-contact ghat) rather than for a single constrained outlier (which used to pin it at
+// the cap and diverge), and decayed when contacts are broadly open. Clamped to [IPC_KAPPA0, IPC_KAPPAMAX].
+#define IPC_KAPPA0   1000.0
 #define IPC_KAPPAMAX 1.0e6
 static mjtNum g_kappa = 0; static const mjModel* g_kappaM = NULL;
 
@@ -1131,7 +1154,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // 36-piece convex-decomposition bin (~1600 edges) generate ~600k candidates that overflow candmax and
   // drop the edge-edge contacts -> the bag sinks into the bin. ghat + 2*maxdisp keeps the count ~160k.
   mjtNum threshGeom = ghat + 2.0*maxdisp;
-  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, rad, thresh, threshGeom, nfv, npt, fidx,
+  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, rad, thresh, threshGeom, maxdisp, nfv, npt, fidx,
                              flist, fxadr, nfd, pt2flex, cand, candmax);
   // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
@@ -1143,7 +1166,15 @@ void mj_IPC(const mjModel* m, mjData* d) {
   if (m->flex_damping[f] > 0)
     for (int t=0; t < ne; t++) { mjtNum dtmp[3][3]; ipc_elemEval(&elems[t], xold, dtmp, elems[t].ep); }
   ipcSparse sp;
-  if (N > 0) ipc_spBuild(m, &sp, N, ne, elems, ncand, cand, fidx);
+  // mark active inter-flex/sphere candidates (gap already within their per-contact ghat) so the IC0 pattern
+  // couples only those (~hundreds) instead of all ~15k candidates (~99% inactive). gap here == iter-0 gap
+  // (x is unchanged until the Newton loop); geom contacts (types 2/3/4) add no coupling so they're skipped.
+  for (int c=0; c < ncand; c++) {
+    if (cand[c].type >= 2 && cand[c].type != 5) continue;
+    mjtNum nn[3], cw[4]; int iv[4], nidx;
+    cgap[c] = ipc_conGap(&cand[c], m, d, x, gv, ge, r, rad, nn, iv, cw, &nidx, thresh);
+  }
+  if (N > 0) ipc_spBuild(m, &sp, N, ne, elems, ncand, cand, cgap, rad, ghat, fidx);
   // precompute element -> CSR scatter indices once per step (the pattern is fixed over the Newton loop), so
   // the per-Newton assembly avoids a binary-search ipc_spIdx per matrix entry. -1 marks skipped entries
   // (upper-tri or pinned vertex). Order matches the assembly loop: idx = (i*3+j)*9 + a*3+b.
@@ -1164,7 +1195,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // iter by delta = 4*alpha*max|dx| (a bound on how fast any gap can shrink), and refreshing it exactly
   // when a candidate enters the set. So the lower bound crosses ghat no later than the true gap (no active
   // contact is ever missed in the barrier), and the CCD's cgap-based step cap stays conservative (safe).
-  mjtNum dmin0 = ghat;   // min active gap at the start of the step (iter 0), for the kappa adaptation
+  int nact0 = 0, nlt02 = 0, nlt06 = 0;   // active contacts at iter 0: total, ratio<0.2, ratio<0.6 (kappa adapt)
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
     for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
@@ -1231,8 +1262,12 @@ void mj_IPC(const mjModel* m, mjData* d) {
           if (id >= 0) sp.val[id] += w2*cc->n[a]*cc->n[b];   // drop it (degrades preconditioner, never corrupts)
         } }
     }
-    // iter-0 cgap holds the exact start-of-step gaps for all candidates -> the min active gap for kappa
-    if (it == 0) for (int c=0; c < ncand; c++) if (cgap[c] > 0 && cgap[c] < dmin0) dmin0 = cgap[c];
+    // iter-0 cgap holds the exact start-of-step gaps -> active-contact tightness stats for the kappa adapt
+    if (it == 0) for (int c=0; c < ncand; c++) if (cgap[c] > 0) {
+      mjtNum ghc_c = ipc_conGhat(&cand[c], rad, ghat);
+      mjtNum ratio = cgap[c] / ghc_c;
+      if (cgap[c] < ghc_c) { nact0++; if (ratio < 0.2) nlt02++; if (ratio < 0.6) nlt06++; }
+    }
     // converged when the residual force has dropped well below its initial magnitude. Relative (rather
     // than the old absolute 1e-8) so the test is scale-invariant across scenes/units: the absolute floor
     // depends on mass/h^2, kappa, mesh, so a fixed 1e-8 sat at/below the achievable gradient floor for
@@ -1255,7 +1290,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // E0 = energy at the current x. Reuse the gaps ipc_try just cached for the barrier term, so no
     // candidate closest-point is recomputed here (the line-search trials below are at xn, so they do).
     mjtNum E0 = ipc_energyBase(m, npt, ne, elems, x, xtil, fidx, mass, h);
-    for (int c=0; c < ncand; c++) if (cgap[c] > 0 && cgap[c] < ghat) E0 += kappa*ipc_Bg(cgap[c], ghat);
+    for (int c=0; c < ncand; c++) if (cgap[c] > 0) {
+      mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);
+      if (cgap[c] < ghc) E0 += kappa*ipc_Bg(cgap[c], ghc);
+    }
     // line-search subset: a candidate can contribute to the barrier at xn = x + alpha*dx (alpha in
     // [0,cap], cap<=1) only if its gap can drop below ghat. Its gap drop over a full step is bounded
     // by the sum of |dx| over its flex vertices, so keep only c with cgap[c] < ghat + that bound.
@@ -1288,10 +1326,19 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int c=0; c < ncand; c++) cgap[c] -= dgap;
   }
   // adapt kappa for the next step: stiffen if the min gap collapsed (barrier too soft), relax if it stayed
-  // comfortably open. Wide hysteresis [0.2, 0.8]*ghat avoids oscillation; gentle relax so it doesn't undo.
+  // comfortably open. Wide hysteresis [0.2, 0.8] (as a fraction of each contact's own ghat_c) avoids
+  // oscillation; gentle relax so it doesn't undo. Per-contact ratio so a thin participant in a tight
+  // channel doesn't ratchet kappa just because its gap is small in absolute terms.
+  // robust adaptation: ramp only when tightness is BROAD (>5% of active contacts deep in their barrier),
+  // not on a single constrained outlier (one 4um string contact used to pin kappa at the cap and diverge);
+  // decay when contacts are broadly open (>95% past 0.6 of their ghat_c); hold otherwise. The CCD already
+  // guarantees non-penetration, so kappa only needs to keep the bulk well-conditioned, not chase one gap.
   if (ncand > 0) {
-    if (dmin0 < 0.2*ghat && g_kappa < IPC_KAPPAMAX) { g_kappa *= 2.0; if (g_kappa > IPC_KAPPAMAX) g_kappa = IPC_KAPPAMAX; }
-    else if (dmin0 > 0.8*ghat && g_kappa > IPC_KAPPA0) { g_kappa *= 0.8; if (g_kappa < IPC_KAPPA0) g_kappa = IPC_KAPPA0; }
+    if (nact0 > 0 && nlt02*20 > nact0 && g_kappa < IPC_KAPPAMAX) {
+      g_kappa *= 2.0; if (g_kappa > IPC_KAPPAMAX) g_kappa = IPC_KAPPAMAX;
+    } else if ((nact0 == 0 || nlt06*20 <= nact0) && g_kappa > IPC_KAPPA0) {
+      g_kappa *= 0.8; if (g_kappa < IPC_KAPPA0) g_kappa = IPC_KAPPA0;
+    }
   }
   for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     int da = dofadr[v];
