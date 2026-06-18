@@ -948,8 +948,19 @@ static void ipc_icApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 // Intersection-free and freeze-free in validation, but PROTOTYPE quality: dense solve + per-step
 // malloc (small flex only), vertex-triangle only (no edge-edge), step-cap is not a rigorous CCD,
 // kappa hardcoded. Falls back to Euler if there is no 2D flex.
+// adaptive barrier stiffness (IPC, Li et al. 2020 sec.4): a fixed kappa cannot serve both light and heavy
+// contacts -- too soft lets the minimum gap collapse toward 0, which ill-conditions the log barrier and
+// (because the CCD then caps each Newton step to keep gap > 0.2*gap) collapses the step size and stalls
+// Newton. kappa persists across steps and is doubled when the min active gap falls below 0.2*ghat,
+// relaxed (gently) when it stays comfortably open, clamped to [IPC_KAPPA0, IPC_KAPPAMAX].
+#define IPC_KAPPA0   100.0
+#define IPC_KAPPAMAX 1.0e6
+static mjtNum g_kappa = 0; static const mjModel* g_kappaM = NULL;
+
 void mj_IPC(const mjModel* m, mjData* d) {
-  mjtNum h = m->opt.timestep, kappa = 100.0;
+  mjtNum h = m->opt.timestep;
+  if (m != g_kappaM) { g_kappa = IPC_KAPPA0; g_kappaM = m; }
+  mjtNum kappa = g_kappa;
   int f = -1;
   for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { f = i; break; }
   if (f < 0) { mj_Euler(m, d); return; }
@@ -1136,6 +1147,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // iter by delta = 4*alpha*max|dx| (a bound on how fast any gap can shrink), and refreshing it exactly
   // when a candidate enters the set. So the lower bound crosses ghat no later than the true gap (no active
   // contact is ever missed in the barrier), and the CCD's cgap-based step cap stays conservative (safe).
+  mjtNum dmin0 = ghat;   // min active gap at the start of the step (iter 0), for the kappa adaptation
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
     for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
@@ -1202,6 +1214,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
           if (id >= 0) sp.val[id] += w2*cc->n[a]*cc->n[b];   // drop it (degrades preconditioner, never corrupts)
         } }
     }
+    // iter-0 cgap holds the exact start-of-step gaps for all candidates -> the min active gap for kappa
+    if (it == 0) for (int c=0; c < ncand; c++) if (cgap[c] > 0 && cgap[c] < dmin0) dmin0 = cgap[c];
     // converged when the residual force has dropped well below its initial magnitude. Relative (rather
     // than the old absolute 1e-8) so the test is scale-invariant across scenes/units: the absolute floor
     // depends on mass/h^2, kappa, mesh, so a fixed 1e-8 sat at/below the achievable gradient floor for
@@ -1255,6 +1269,12 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // keep cgap a valid lower bound: every gap can shrink by at most 4 vertices * the max vertex step
     mjtNum dgap = 4.0*alpha*maxdx;
     for (int c=0; c < ncand; c++) cgap[c] -= dgap;
+  }
+  // adapt kappa for the next step: stiffen if the min gap collapsed (barrier too soft), relax if it stayed
+  // comfortably open. Wide hysteresis [0.2, 0.8]*ghat avoids oscillation; gentle relax so it doesn't undo.
+  if (ncand > 0) {
+    if (dmin0 < 0.2*ghat && g_kappa < IPC_KAPPAMAX) { g_kappa *= 2.0; if (g_kappa > IPC_KAPPAMAX) g_kappa = IPC_KAPPAMAX; }
+    else if (dmin0 > 0.8*ghat && g_kappa > IPC_KAPPA0) { g_kappa *= 0.8; if (g_kappa < IPC_KAPPA0) g_kappa = IPC_KAPPA0; }
   }
   for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     int da = dofadr[v];
