@@ -293,16 +293,16 @@ typedef struct { int type; int idx[4]; int gi; } ipcCon;
 // vertices idv[*nidx] and their weights cw (dg/d(vertex_p) = cw[p]*n). gv/ge are the precomputed
 // world-space static-geom corners/edges. Single source of the per-type contact geometry.
 static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, const mjtNum* x,
-                         const mjtNum* gv, const mjtNum* ge, mjtNum r,
+                         const mjtNum* gv, const mjtNum* ge, mjtNum r, const mjtNum* rad,
                          mjtNum* n, int* idv, mjtNum* cw, int* nidx, mjtNum cutoff) {
   switch (con->type) {
-  case 0: {   // vertex-triangle self-contact (v against triangle A,B,C)
+  case 0: {   // vertex-triangle: flex self-contact, OR a rigid point (sphere) vs a flex triangle A,B,C
     int v=con->idx[0], A=con->idx[1], B=con->idx[2], C=con->idx[3];
     mjtNum cp[3], w[3], dd = ipc_ptTri(&x[3*v], &x[3*A], &x[3*B], &x[3*C], cp, w);
     for (int k=0; k < 3; k++) n[k] = (x[3*v+k]-cp[k])/dd;
     idv[0]=v; idv[1]=A; idv[2]=B; idv[3]=C;
     cw[0]=1; cw[1]=-w[0]; cw[2]=-w[1]; cw[3]=-w[2]; *nidx=4;
-    return dd - 2*r;
+    return dd - (rad[v] + r);   // point radius + flex (triangle) radius; rad[v]==r for flex self
   }
   case 1: {   // edge-edge self-contact (edge a1b1 against edge a2b2)
     int a1=con->idx[0], b1=con->idx[1], a2=con->idx[2], b2=con->idx[3];
@@ -312,11 +312,11 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
     cw[0]=1-st[0]; cw[1]=st[0]; cw[2]=-(1-st[1]); cw[3]=-st[1]; *nidx=4;
     return dd - 2*r;
   }
-  case 2: {   // flex-vertex v vs static geom gi surface
+  case 2: {   // free point v (flex vertex or rigid sphere) vs static geom gi surface
     int v=con->idx[0], gi=con->gi;
-    mjtNum dd = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, &x[3*v], n, cutoff + r);
+    mjtNum dd = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, &x[3*v], n, cutoff + rad[v]);
     idv[0]=v; cw[0]=1; *nidx=1;
-    return dd - r;
+    return dd - rad[v];
   }
   case 3: {   // static geom corner gv[idx0] vs flex triangle A,B,C
     const mjtNum* corner = &gv[3*con->idx[0]];
@@ -325,6 +325,14 @@ static mjtNum ipc_conGap(const ipcCon* con, const mjModel* m, const mjData* d, c
     for (int k=0; k < 3; k++) n[k] = (corner[k]-cp[k])/dd;
     idv[0]=A; idv[1]=B; idv[2]=C; cw[0]=-w[0]; cw[1]=-w[1]; cw[2]=-w[2]; *nidx=3;
     return dd - r;
+  }
+  case 5: {   // rigid point p1 vs rigid point p2 (sphere-sphere)
+    int p1=con->idx[0], p2=con->idx[1];
+    mjtNum dv[3], dd=0;
+    for (int k=0; k < 3; k++) { dv[k] = x[3*p1+k]-x[3*p2+k]; dd += dv[k]*dv[k]; } dd = mju_sqrt(dd);
+    for (int k=0; k < 3; k++) n[k] = dv[k]/dd;
+    idv[0]=p1; idv[1]=p2; cw[0]=1; cw[1]=-1; *nidx=2;
+    return dd - (rad[p1]+rad[p2]);
   }
   default: {  // case 4: static geom edge ge[idx0] vs flex edge a,b
     const mjtNum* eg = &ge[6*con->idx[0]];
@@ -343,6 +351,7 @@ static void ipc_conVerts(const ipcCon* con, int* v, int* nv) {
   case 0: case 1: v[0]=con->idx[0]; v[1]=con->idx[1]; v[2]=con->idx[2]; v[3]=con->idx[3]; *nv=4; break;
   case 2: v[0]=con->idx[0]; *nv=1; break;
   case 3: v[0]=con->idx[1]; v[1]=con->idx[2]; v[2]=con->idx[3]; *nv=3; break;   // flex triangle A,B,C
+  case 5: v[0]=con->idx[0]; v[1]=con->idx[1]; *nv=2; break;                     // sphere-sphere (both points)
   default: v[0]=con->idx[1]; v[1]=con->idx[2]; *nv=2; break;                    // flex edge a,b
   }
 }
@@ -351,18 +360,20 @@ static void ipc_conVerts(const ipcCon* con, int* v, int* nv) {
 // for the CCD conservative advancement (recomputes the closest feature at the advanced configuration).
 static mjtNum ipc_conGapAdv(const ipcCon* con, const mjModel* m, const mjData* d, const mjtNum* x,
                             const mjtNum* dxw, mjtNum t, const mjtNum* gv, const mjtNum* ge,
-                            mjtNum r, const int* fidx) {
+                            mjtNum r, const mjtNum* rad, const int* fidx) {
   int v[4], nv; mjtNum P[4][3];
   ipc_conVerts(con, v, &nv);
   for (int q=0; q < nv; q++) { int fq = fidx[v[q]];
     for (int k=0; k < 3; k++) P[q][k] = x[3*v[q]+k] + (fq >= 0 ? t*dxw[3*fq+k] : 0.0); }
   mjtNum cp[3], w[3], c1[3], c2[3], st[2];
   switch (con->type) {
-  case 0:  return ipc_ptTri(P[0], P[1], P[2], P[3], cp, w) - 2*r;
+  case 0:  return ipc_ptTri(P[0], P[1], P[2], P[3], cp, w) - (rad[con->idx[0]] + r);
   case 1:  return ipc_segSeg(P[0], P[1], P[2], P[3], c1, c2, st) - 2*r;
   case 2:  { mjtNum nn[3];
-             return ipc_geomDist(m, con->gi, d->geom_xpos+3*con->gi, d->geom_xmat+9*con->gi, P[0], nn, 1e30) - r; }
+             return ipc_geomDist(m, con->gi, d->geom_xpos+3*con->gi, d->geom_xmat+9*con->gi, P[0], nn, 1e30) - rad[con->idx[0]]; }
   case 3:  return ipc_ptTri(&gv[3*con->idx[0]], P[0], P[1], P[2], cp, w) - r;
+  case 5:  { mjtNum dd=0; for (int k=0; k < 3; k++){ mjtNum t=P[0][k]-P[1][k]; dd+=t*t; }
+             return mju_sqrt(dd) - (rad[con->idx[0]]+rad[con->idx[1]]); }
   default: { const mjtNum* eg = &ge[6*con->idx[0]]; return ipc_segSeg(eg, eg+3, P[0], P[1], c1, c2, st) - r; }
   }
 }
@@ -371,13 +382,17 @@ static mjtNum ipc_conGapAdv(const ipcCon* con, const mjModel* m, const mjData* d
 // candidate's surface gap above 20% of its current value -- conservative advancement, no tunneling.
 // For self pairs the common (mean) displacement is removed so coherent motion (free fall) isn't
 // throttled; geom features are fixed so only the flex side's speed bounds the gap-shrink rate.
+// IMPORTANT: mean-removal is only valid when the pair can genuinely move together. A sphere-vs-flex
+// contact (type 0 with the "vertex" a rigid point, idx[0]>=nfv) is NOT such a pair -- the flex side may
+// be blocked (e.g. the bag bottom pinned against the bin floor) so it cannot follow the sphere. Removing
+// the mean there underestimates the gap-shrink rate and lets the sphere punch through, so it is excluded.
 static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* dxw,
-                      const mjtNum* gv, const mjtNum* ge, mjtNum r, const int* fidx,
-                      const ipcCon* cand, int ncand, const mjtNum* cgap) {
+                      const mjtNum* gv, const mjtNum* ge, mjtNum r, const mjtNum* rad, int nfv,
+                      const int* fidx, const ipcCon* cand, int ncand, const mjtNum* cgap) {
   mjtNum alpha = 1.0;
   for (int c=0; c < ncand; c++) {
     const ipcCon* con = &cand[c];
-    int v[4], nv, self = (con->type <= 1);
+    int v[4], nv, self = (con->type <= 1) && (con->idx[0] < nfv);   // genuine flex-flex self-contact only
     ipc_conVerts(con, v, &nv);
     mjtNum dp[4][3], mean[3] = {0,0,0};
     for (int q=0; q < nv; q++) { int fq = fidx[v[q]];
@@ -393,6 +408,7 @@ static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const 
     else if (con->type == 1) { mjtNum a0=0,b0=0;
       for (int q=0;q<2;q++){ mjtNum s=sqrt(mju_dot3(dp[q],dp[q])); if (s>a0) a0=s; }
       for (int q=2;q<4;q++){ mjtNum s=sqrt(mju_dot3(dp[q],dp[q])); if (s>b0) b0=s; } l=a0+b0; }
+    else if (con->type == 5) { l = sqrt(mju_dot3(dp[0],dp[0])) + sqrt(mju_dot3(dp[1],dp[1])); }  // both move
     else { l=0; for (int q=0;q<nv;q++){ mjtNum s=sqrt(mju_dot3(dp[q],dp[q])); if (s>l) l=s; } }
     if (l < 1e-12) continue;
     mjtNum g0 = cgap[c];   // gap at x, cached by ipc_try this Newton iter (== ipc_conGapAdv at t=0)
@@ -400,7 +416,7 @@ static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const 
     if (l <= 0.8*g0) continue;   // full alpha=1 step shrinks gap by <= l, stays above the 20% floor
     mjtNum gtarget = 0.2*g0, t = 0;
     for (int it=0; it < 32; it++) {
-      mjtNum g = ipc_conGapAdv(con, m, d, x, dxw, t, gv, ge, r, fidx);
+      mjtNum g = ipc_conGapAdv(con, m, d, x, dxw, t, gv, ge, r, rad, fidx);
       mjtNum room = g - gtarget;
       if (room <= 1e-9*g0) break;
       t += room / l;
@@ -443,11 +459,11 @@ static void ipc_elemEval(const ipcElem* el, const mjtNum* x, mjtNum d[3][3], mjt
 // evaluate a candidate contact at x; if active (0<g<ghat) accumulate its barrier gradient and the
 // Hessian diagonal (for the Jacobi preconditioner), and cache the GN block (ccache) + contact (acon).
 static void ipc_try(ipcCon con, const mjModel* m, const mjData* d, const mjtNum* x,
-                    const mjtNum* gv, const mjtNum* ge, mjtNum r, mjtNum ghat, mjtNum kappa,
+                    const mjtNum* gv, const mjtNum* ge, mjtNum r, const mjtNum* rad, mjtNum ghat, mjtNum kappa,
                     const int* fidx, mjtNum* grad,
                     ipcCon* acon, ipcCC* ccache, int* nacon, int amax, mjtNum* gout) {
   mjtNum n[3], cw[4]; int idv[4], nidx;
-  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx, ghat);
+  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, ghat);
   *gout = g;   // cache the gap at x so CCD (g0) and the E0 energy can reuse it without recomputing
   if (g <= 0 || g >= ghat) return;
   if (*nacon >= amax) return;
@@ -572,7 +588,7 @@ static mjtNum ipc_energyBase(const mjModel* m, int nfv, int nelem, const ipcElem
 
 static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, const ipcElem* elems,
                          const mjtNum* x, const mjtNum* xtil, const int* fidx, const mjtNum* mass,
-                         mjtNum h, mjtNum r, mjtNum ghat, mjtNum kappa,
+                         mjtNum h, mjtNum r, const mjtNum* rad, mjtNum ghat, mjtNum kappa,
                          const mjtNum* gv, const mjtNum* ge, const ipcCon* acon, int nacon) {
   mjtNum E = 0, ih2 = 1.0/(h*h);
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
@@ -582,7 +598,7 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
   E += ipc_stretchEnergy(nelem, elems, x);
   for (int c=0; c < nacon; c++) {
     mjtNum n[3], cw[4]; int idv[4], nidx;
-    mjtNum g = ipc_conGap(&acon[c], m, d, x, gv, ge, r, n, idv, cw, &nidx, 1e30);
+    mjtNum g = ipc_conGap(&acon[c], m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, 1e30);
     if (g > 0 && g < ghat) E += kappa*ipc_Bg(g, ghat);
   }
   return E;
@@ -591,11 +607,11 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
 
 // append a candidate contact if its gap at x is below the (margin-inflated) detection threshold
 static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjtNum* x,
-                        const mjtNum* gv, const mjtNum* ge, mjtNum r, mjtNum thresh,
+                        const mjtNum* gv, const mjtNum* ge, mjtNum r, const mjtNum* rad, mjtNum thresh,
                         ipcCon* cand, int* nc, int candmax) {
   if (*nc >= candmax) return;
   mjtNum n[3], cw[4]; int idv[4], nidx;
-  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, n, idv, cw, &nidx, thresh);
+  mjtNum g = ipc_conGap(&con, m, d, x, gv, ge, r, rad, n, idv, cw, &nidx, thresh);
   if (g > 0 && g < thresh) cand[(*nc)++] = con;
 }
 
@@ -629,31 +645,38 @@ static int ipc_bvhBox(const mjModel* m, const mjData* d, int f, const mjtNum* c,
 // that could close within the step is captured (the Newton loop then only re-tests candidates).
 // Flex-flex and geom-feature-vs-flex pairs are found by querying the flex element BVH (ipc_bvhBox).
 static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, const mjtNum* gv,
-                          const mjtNum* ge, int ngv, int nge, mjtNum r, mjtNum thresh,
-                          int nfv, int ne, const int* el, int en, int ea, const int* fidx,
-                          int f, const int* elemedge, int doself, ipcCon* cand, int candmax) {
+                          const mjtNum* ge, int ngv, int nge, mjtNum r, const mjtNum* rad, mjtNum thresh,
+                          mjtNum threshGeom, int nfv, int npt, int ne, const int* el, int en, int ea,
+                          const int* fidx, int f, const int* elemedge, int doself, ipcCon* cand, int candmax) {
   int nc = 0;
-  for (int gi=0; gi < m->ngeom; gi++) {                                      // flex-vertex vs geom
+  for (int gi=0; gi < m->ngeom; gi++) {                                      // free point (flex vert / sphere) vs geom
     if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;       // skip non-colliding
-    // geom-level cull: bound the bag verts by the geom's true world AABB (the rotated local geom_aabb)
-    // + margin, before the per-face distance. Much tighter than the bounding sphere for the elongated
-    // convex-decomposition slabs. Planes are infinite -> no cull (their distance is O(1) anyway).
+    // geom-level cull: bound the points by the geom's true world AABB (the rotated local geom_aabb)
+    // + per-point margin, before the per-face distance. Much tighter than the bounding sphere for the
+    // elongated convex-decomposition slabs. Planes are infinite -> no cull (their distance is O(1) anyway).
     int isplane = (m->geom_type[gi] == mjGEOM_PLANE);
-    mjtNum wc[3], wh[3], marg = thresh + r;
+    mjtNum wc[3], wh[3];
     if (!isplane) {
       const mjtNum* la = m->geom_aabb + 6*gi; const mjtNum* gp = d->geom_xpos+3*gi; const mjtNum* gR = d->geom_xmat+9*gi;
       mju_mulMatVec3(wc, gR, la); for (int k=0; k < 3; k++) wc[k] += gp[k];           // world AABB center
       for (int k=0; k < 3; k++) wh[k] = mju_abs(gR[3*k])*la[3] + mju_abs(gR[3*k+1])*la[4] + mju_abs(gR[3*k+2])*la[5];
     }
-    for (int v=0; v < nfv; v++) {
+    for (int v=0; v < npt; v++) {
       if (fidx[v] < 0) continue;
+      mjtNum marg = thresh + rad[v];
       if (!isplane) {                                                                  // world-AABB cull
         if (mju_abs(x[3*v]-wc[0]) > wh[0]+marg || mju_abs(x[3*v+1]-wc[1]) > wh[1]+marg ||
             mju_abs(x[3*v+2]-wc[2]) > wh[2]+marg) continue;
       }
       ipcCon con = {2, {v, 0, 0, 0}, gi};
-      ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+      ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
     }
+  }
+
+  // sphere-sphere (type 5): all pairs of rigid points -- nsph is tiny so the O(nsph^2) scan is cheap
+  for (int p=nfv; p < npt; p++) for (int q=p+1; q < npt; q++) {
+    ipcCon con = {5, {p, q, 0, 0}, -1};
+    ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
   }
 
   // ---- geom-feature and self candidates via the flex element BVH (ipc_bvhBox) ----
@@ -669,12 +692,32 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
   // the (one- or two-radius) surface gap, so this is a conservative superset -- no near pair is missed.
   mjtNum qhv[3] = {thresh+r, thresh+r, thresh+r};
 
-  // geom-corner vs flex-triangle (type 3): each geom vertex queries the triangle BVH
+  // rigid point (sphere) vs flex triangle: each sphere center queries the triangle BVH (reuses the
+  // vertex-triangle type 0, with the sphere as the "vertex" -> gap = dd - (rad[sphere]+r), coupling the
+  // sphere dof and the triangle's flex dofs). Always on (not gated by self-collide); the sphere is never
+  // a member of a flex triangle so no self-skip is needed. Generated BEFORE the (potentially huge) flex
+  // geom-feature candidate flood so the few sphere candidates are never crowded out by the candmax cap --
+  // that crowd-out previously dropped the sphere's contact mid-fall and let it tunnel through the bag.
+  for (int p=nfv; p < npt; p++) {
+    mjtNum qh[3] = {thresh+rad[p], thresh+rad[p], thresh+rad[p]};
+    int n = ipc_bvhBox(m, d, f, &x[3*p], qh, stk, outel, ne);
+    for (int i=0; i < n; i++) { int e = outel[i];
+      ipcCon con = {0, {p, el[3*e], el[3*e+1], el[3*e+2]}, -1};
+      ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
+    }
+  }
+
+  // geom-corner vs flex-triangle (type 3): each geom vertex queries the triangle BVH. The geom is STATIC,
+  // so this is a one-sided contact -- a pair can only close at the flex's speed. It uses the tighter
+  // threshGeom (vs the two-sided sphere/self thresh): the geom features (a 36-piece convex decomposition
+  // here -> ~1600 edges, ~1000 corners) otherwise generate hundreds of thousands of far candidates that
+  // overflow candmax and crowd out the near, contact-relevant ones (which let the bag sink into the bin).
+  mjtNum qhvG[3] = {threshGeom+r, threshGeom+r, threshGeom+r};
   for (int c=0; c < ngv; c++) {
-    int n = ipc_bvhBox(m, d, f, &gv[3*c], qhv, stk, outel, ne);
+    int n = ipc_bvhBox(m, d, f, &gv[3*c], qhvG, stk, outel, ne);
     for (int i=0; i < n; i++) { int e = outel[i];
       ipcCon con = {3, {c, el[3*e], el[3*e+1], el[3*e+2]}, -1};
-      ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+      ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax);
     }
   }
   // geom-edge vs flex-edge (type 4): each geom edge queries the BVH with its (inflated) box, then the
@@ -682,14 +725,14 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
   for (int c=0; c < nge; c++) {
     const mjtNum* p0 = &ge[6*c]; const mjtNum* p1 = &ge[6*c+3];
     mjtNum qc[3], qh[3];
-    for (int k=0; k < 3; k++) { qc[k] = 0.5*(p0[k]+p1[k]); qh[k] = 0.5*mju_abs(p1[k]-p0[k]) + thresh+r; }
+    for (int k=0; k < 3; k++) { qc[k] = 0.5*(p0[k]+p1[k]); qh[k] = 0.5*mju_abs(p1[k]-p0[k]) + threshGeom+r; }
     int n = ipc_bvhBox(m, d, f, qc, qh, stk, outel, ne);
     qid++;
     for (int i=0; i < n; i++) { int e = outel[i];
       for (int j=0; j < 3; j++) { int e2 = elemedge[3*e+j];
         if (stampG[e2] == qid) continue; stampG[e2] = qid;
         ipcCon con = {4, {c, m->flex_edge[2*(ea+e2)], m->flex_edge[2*(ea+e2)+1], 0}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, threshGeom, cand, &nc, candmax);
       }
     }
   }
@@ -702,7 +745,7 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
         int A = el[3*e], B = el[3*e+1], C = el[3*e+2];
         if (v==A || v==B || v==C) continue;
         ipcCon con = {0, {v, A, B, C}, -1};
-        ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+        ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
       }
     }
     // edge-edge self: each flex edge queries the BVH, then the overlapping triangles' edges (canonical
@@ -719,7 +762,7 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
           int a2 = m->flex_edge[2*(ea+e2)], b2 = m->flex_edge[2*(ea+e2)+1];
           if (a1==a2 || a1==b2 || b1==a2 || b1==b2) continue;
           ipcCon con = {1, {a1, b1, a2, b2}, -1};
-          ipc_addCand(con, m, d, x, gv, ge, r, thresh, cand, &nc, candmax);
+          ipc_addCand(con, m, d, x, gv, ge, r, rad, thresh, cand, &nc, candmax);
         }
       }
     }
@@ -774,10 +817,11 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
   long long* ck = (long long*) mju_malloc(ccap*sizeof(long long));
   int nck = 0;
   for (int c=0; c < ncand; c++) {
-    // flex-vs-geom contacts (type >= 2) couple flex verts that already share a mesh element (a vertex, a
-    // triangle, or a mesh edge), so their couplings are already in the mesh pattern -- skip them. Only
-    // self-contacts (types 0,1) couple verts from different elements and add new pattern entries.
-    if (cand[c].type >= 2) continue;
+    // flex-vs-geom contacts (types 3,4) and point-vs-geom (type 2) couple only flex verts that already
+    // share a mesh element (or a single point), so their couplings are already in the mesh pattern -- skip.
+    // Types that couple nodes NOT sharing an element add new pattern entries and MUST be included: flex
+    // self-contact (0,1), sphere-vs-flex (0, sphere node <-> triangle), and sphere-vs-sphere (5).
+    if (cand[c].type >= 2 && cand[c].type != 5) continue;
     int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
     for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
   }
@@ -915,20 +959,50 @@ void mj_IPC(const mjModel* m, mjData* d) {
   const int* el = m->flex_elem + m->flex_elemdataadr[f];
   mjtNum r = m->flex_radius[f], ghat = r;   // contact activates within ghat of the 2r surface gap
 
-  int* dofadr = (int*) mju_malloc(nfv*sizeof(int));
-  int* qpadr  = (int*) mju_malloc(nfv*sizeof(int));   // qpos address (NOT dof address: differs after
-  int* fidx   = (int*) mju_malloc(nfv*sizeof(int));   // free/ball joints, which have more qpos than dof)
-  mjtNum* mass = (mjtNum*) mju_malloc(nfv*sizeof(mjtNum));
+  // free points = bodies with 3 slide DOFs: the flex vertices (elastic) plus any standalone 3-slide body
+  // carrying a sphere geom (rigid point). Generic so rigid/ABD bodies can extend this later -- a free point
+  // just needs dof/qpos addr, mass, radius, and its body (for the local-slide-frame rotation R); only the
+  // xold POSITION source differs (flex vertex vs geom center). Count the spheres first to size the arrays.
+  char* isflexvert = (char*) mju_malloc((m->nbody > 0 ? m->nbody : 1)*sizeof(char));
+  for (int b=0; b < m->nbody; b++) isflexvert[b] = 0;
+  for (int v=0; v < nfv; v++) isflexvert[m->flex_vertbodyid[va+v]] = 1;
+  int nsph = 0;
+  for (int b=0; b < m->nbody; b++) {
+    if (isflexvert[b] || m->body_dofnum[b] != 3 || m->jnt_type[m->body_jntadr[b]] != mjJNT_SLIDE) continue;
+    for (int g=m->body_geomadr[b]; g < m->body_geomadr[b]+m->body_geomnum[b]; g++)
+      if (m->geom_type[g] == mjGEOM_SPHERE) { nsph++; break; }
+  }
+  int npt = nfv + nsph;
+  int* dofadr = (int*) mju_malloc(npt*sizeof(int));
+  int* qpadr  = (int*) mju_malloc(npt*sizeof(int));   // qpos address (NOT dof address: differs after
+  int* fidx   = (int*) mju_malloc(npt*sizeof(int));   // free/ball joints, which have more qpos than dof)
+  mjtNum* mass = (mjtNum*) mju_malloc(npt*sizeof(mjtNum));
+  mjtNum* rad  = (mjtNum*) mju_malloc(npt*sizeof(mjtNum));   // per-point radius (flex_radius / sphere size)
+  int* pbody  = (int*) mju_malloc(npt*sizeof(int));          // body id, for the slide-frame rotation R
+  int* pgeom  = (int*) mju_malloc(npt*sizeof(int));          // sphere geom id (>=0); -1 for a flex vertex
   int nfree = 0;
   for (int v=0; v < nfv; v++) {
     int bid = m->flex_vertbodyid[va+v];
-    dofadr[v] = -1; qpadr[v] = -1; fidx[v] = -1; mass[v] = 0;
+    dofadr[v] = -1; qpadr[v] = -1; fidx[v] = -1; mass[v] = 0; rad[v] = r; pbody[v] = bid; pgeom[v] = -1;
     if (m->body_dofnum[bid] == 3) {
       int da = m->body_dofadr[bid];
       dofadr[v] = da; qpadr[v] = m->jnt_qposadr[m->body_jntadr[bid]]; fidx[v] = nfree++;
       mass[v] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];   // diagonal (point mass)
     }
   }
+  for (int b=0, p=nfv; b < m->nbody; b++) {                  // append the rigid sphere points
+    if (isflexvert[b] || m->body_dofnum[b] != 3 || m->jnt_type[m->body_jntadr[b]] != mjJNT_SLIDE) continue;
+    int gsph = -1;
+    for (int g=m->body_geomadr[b]; g < m->body_geomadr[b]+m->body_geomnum[b]; g++)
+      if (m->geom_type[g] == mjGEOM_SPHERE) { gsph = g; break; }
+    if (gsph < 0) continue;
+    int da = m->body_dofadr[b];
+    dofadr[p] = da; qpadr[p] = m->jnt_qposadr[m->body_jntadr[b]]; fidx[p] = nfree++;
+    mass[p] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];
+    rad[p] = m->geom_size[3*gsph]; pbody[p] = b; pgeom[p] = gsph;
+    p++;
+  }
+  mju_free(isflexvert);
   int N = 3*nfree, Na = (N > 0 ? N : 1);
   // FEM membrane elements: consume MuJoCo's precomputed flex_stiffness metric (from the model's
   // <elasticity young=.../> tag) per element + the rest squared edge lengths. No hand-rolled springs.
@@ -944,10 +1018,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
     elems[t].kD = (h > 0) ? m->flex_damping[f]/h : 0;   // stiffness-prop. Rayleigh damping (Kharevych 5.2)
   }
-  int amax = nfv*64 + 1024;                   // capacity of the active-contact list
+  int amax = npt*64 + 1024;                   // capacity of the active-contact list
   ipcCon* acon = (ipcCon*) mju_malloc(amax*sizeof(ipcCon));
   ipcCC* ccache = (ipcCC*) mju_malloc(amax*sizeof(ipcCC));
-  int candmax = nfv*128 + 4096;               // capacity of the per-step candidate list
+  int candmax = npt*192 + 8192;               // capacity of the per-step candidate list (sized for the
+                                              // geom-feature-heavy bag-in-bin contact: ~160k at npt~1100)
   ipcCon* cand = (ipcCon*) mju_malloc(candmax*sizeof(ipcCon));
   mjtNum* cgap = (mjtNum*) mju_malloc(candmax*sizeof(mjtNum));   // per-candidate gap at x (try->ccd/E0)
   ipcCon* candLS = (ipcCon*) mju_malloc(candmax*sizeof(ipcCon)); // line-search subset (can activate this step)
@@ -973,10 +1048,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     ngv += ipc_geomVerts(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, gv+3*ngv);
     nge += ipc_geomEdges(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, ge+6*nge);
   }
-  mjtNum* x    = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
-  mjtNum* xtil = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
-  mjtNum* xold = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
-  mjtNum* xn   = (mjtNum*) mju_malloc(3*nfv*sizeof(mjtNum));
+  mjtNum* x    = (mjtNum*) mju_malloc(3*npt*sizeof(mjtNum));
+  mjtNum* xtil = (mjtNum*) mju_malloc(3*npt*sizeof(mjtNum));
+  mjtNum* xold = (mjtNum*) mju_malloc(3*npt*sizeof(mjtNum));
+  mjtNum* xn   = (mjtNum*) mju_malloc(3*npt*sizeof(mjtNum));
   mjtNum* grad = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* dx   = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* mdiag= (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // inertia diagonal (for the H*p apply)
@@ -988,45 +1063,52 @@ void mj_IPC(const mjModel* m, mjData* d) {
                                                                            // (full, PSD-projected, this Newton iter)
 
   const mjtNum* vx = d->flexvert_xpos;
-  for (int v=0; v < nfv; v++) {
-    for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*(va+v)+c];
+  for (int v=0; v < npt; v++) {
+    // xold position source: flex vertex from flexvert_xpos, rigid sphere from its geom center
+    if (pgeom[v] < 0) for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*(va+v)+c];
+    else              for (int c=0; c < 3; c++) xold[3*v+c] = d->geom_xpos[3*pgeom[v]+c];
     if (fidx[v] >= 0) {
       int da = dofadr[v];
-      // qvel/qacc_smooth are in the vertex body's local slide frame; map to WORLD via the body
-      // rotation R (= d->xmat) since the solve and flexvert_xpos are in world coordinates. (R=I for
-      // unrotated bodies, e.g. the cloth; non-identity when the flex is nested in a rotated body.)
-      const mjtNum* R = d->xmat + 9*m->flex_vertbodyid[va+v];
+      // qvel/qacc_smooth are in the body's local slide frame; map to WORLD via the body rotation R
+      // (= d->xmat). R=I for unrotated bodies (cloth, the balls); non-identity for the rotated bag.
+      const mjtNum* R = d->xmat + 9*pbody[v];
       mjtNum vw[3], aw[3];
       mju_mulMatVec3(vw, R, d->qvel + da);
       mju_mulMatVec3(aw, R, d->qacc_smooth + da);
       for (int c=0; c < 3; c++)
-        xtil[3*v+c] = vx[3*(va+v)+c] + h*vw[c] + h*h*aw[c];
+        xtil[3*v+c] = xold[3*v+c] + h*vw[c] + h*h*aw[c];
     } else {
-      for (int c=0; c < 3; c++) xtil[3*v+c] = vx[3*(va+v)+c];   // pinned: fixed
+      for (int c=0; c < 3; c++) xtil[3*v+c] = xold[3*v+c];   // pinned: fixed
     }
   }
-  for (int i=0; i < 3*nfv; i++) x[i] = xold[i];   // start from last collision-free state (feasibility)
+  for (int i=0; i < 3*npt; i++) x[i] = xold[i];   // start from last collision-free state (feasibility)
 
   mjtNum ih2 = 1.0/(h*h);
   for (int i=0; i < N; i++) mdiag[i] = 0;                          // inertia diagonal (fixed per step)
-  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+  for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     int fi = fidx[v]; for (int c=0; c < 3; c++) mdiag[3*fi+c] = mass[v]*ih2;
   }
   // build the candidate-contact list once per step: detection threshold inflated by the predictor
   // displacement so any pair that could close during the step is captured (verified by gap checks)
   mjtNum maxdisp = 0;
-  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+  for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     mjtNum dd[3]; for (int c=0; c < 3; c++) dd[c] = xtil[3*v+c]-xold[3*v+c];
     mjtNum L = sqrt(mju_dot3(dd, dd)); if (L > maxdisp) maxdisp = L;
   }
   mjtNum thresh = 3*ghat + 4*maxdisp;
+  // Static geom features (the bin) collide one-sided with the flex -- only the flex side moves, so a pair
+  // closes at most at the flex speed. Their detection margin can therefore be half the two-sided sphere/self
+  // margin (which budgets 2*maxdisp of approach from each side). Using the full thresh here makes the
+  // 36-piece convex-decomposition bin (~1600 edges) generate ~600k candidates that overflow candmax and
+  // drop the edge-edge contacts -> the bag sinks into the bin. ghat + 2*maxdisp keeps the count ~160k.
+  mjtNum threshGeom = ghat + 2.0*maxdisp;
   int doself = (m->flex_selfcollide[f] != mjFLEXSELF_NONE);   // honor the flex's selfcollide flag
-  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, thresh, nfv, ne, el, en, ea, fidx,
+  int ncand = ipc_candidates(m, d, x, gv, ge, ngv, nge, r, rad, thresh, threshGeom, nfv, npt, ne, el, en, ea, fidx,
                              f, elemedge, doself, cand, candmax);
   // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
   // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
-  if (ncand == 0) for (int i=0; i < 3*nfv; i++) x[i] = xtil[i];
+  if (ncand == 0) for (int i=0; i < 3*npt; i++) x[i] = xtil[i];
   // sparse Hessian pattern (mesh + candidate-contact couplings) for the IC(0) preconditioner, once/step
   // Rayleigh damping uses the previous-step elongations e_prev = e(xold); xold is fixed over the Newton
   // loop, so cache e_prev once per step. Only needed when damping is on.
@@ -1059,7 +1141,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
     for (int fi=0; fi < N/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
       sp.val[ipc_spIdx(&sp, 3*fi+c, 3*fi+c)] += mdiag[3*fi+c];
-    for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+    for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
       int fi = fidx[v]; mjtNum mh = mass[v]*ih2;
       for (int c=0; c < 3; c++) grad[3*fi+c] += mh*(x[3*v+c]-xtil[3*v+c]);
     }
@@ -1104,10 +1186,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     int nacon = 0;
     if (it == 0) {
       for (int c=0; c < ncand; c++)
-        ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
+        ipc_try(cand[c], m, d, x, gv, ge, r, rad, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
     } else {
       for (int c=0; c < ncand; c++) if (cgap[c] < ghat)
-        ipc_try(cand[c], m, d, x, gv, ge, r, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
+        ipc_try(cand[c], m, d, x, gv, ge, r, rad, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
     }
     for (int c=0; c < nacon; c++) {                          // contact GN: bdd * (cw n)(cw n)^T
       const ipcCC* cc = &ccache[c];
@@ -1116,7 +1198,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
         mjtNum w2 = cc->bdd*cc->cw[p]*cc->cw[q];
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int R = 3*fp+a, C = 3*fq+b; if (C > R) continue;
-          sp.val[ipc_spIdx(&sp, R, C)] += w2*cc->n[a]*cc->n[b]; } }
+          int id = ipc_spIdx(&sp, R, C);              // -1 if this coupling was not in the pattern:
+          if (id >= 0) sp.val[id] += w2*cc->n[a]*cc->n[b];   // drop it (degrades preconditioner, never corrupts)
+        } }
     }
     // converged when the residual force has dropped well below its initial magnitude. Relative (rather
     // than the old absolute 1e-8) so the test is scale-invariant across scenes/units: the absolute floor
@@ -1136,10 +1220,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // (alpha -> ~1 when nothing is closing, so the full Newton step resolves contacts; no pair can
     // cross), then Armijo backtrack on the energy (which iterates the candidate set, so it sees
     // contacts activating during the step). Replaces the arbitrary 0.4*ghat step-cap.
-    mjtNum cap = ipc_ccd(m, d, x, dx, gv, ge, r, fidx, cand, ncand, cgap);
+    mjtNum cap = ipc_ccd(m, d, x, dx, gv, ge, r, rad, nfv, fidx, cand, ncand, cgap);
     // E0 = energy at the current x. Reuse the gaps ipc_try just cached for the barrier term, so no
     // candidate closest-point is recomputed here (the line-search trials below are at xn, so they do).
-    mjtNum E0 = ipc_energyBase(m, nfv, ne, elems, x, xtil, fidx, mass, h);
+    mjtNum E0 = ipc_energyBase(m, npt, ne, elems, x, xtil, fidx, mass, h);
     for (int c=0; c < ncand; c++) if (cgap[c] > 0 && cgap[c] < ghat) E0 += kappa*ipc_Bg(cgap[c], ghat);
     // line-search subset: a candidate can contribute to the barrier at xn = x + alpha*dx (alpha in
     // [0,cap], cap<=1) only if its gap can drop below ghat. Its gap drop over a full step is bounded
@@ -1156,10 +1240,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mjtNum alpha = cap;
     int lsok = 0;
     for (int ls=0; ls < 30; ls++) {
-      for (int i=0; i < 3*nfv; i++) xn[i] = x[i];
-      for (int v=0; v < nfv; v++) if (fidx[v] >= 0) { int fi = fidx[v];
+      for (int i=0; i < 3*npt; i++) xn[i] = x[i];
+      for (int v=0; v < npt; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      if (ipc_energy(m, d, nfv, ne, elems, xn, xtil, fidx, mass, h, r, ghat, kappa,
+      if (ipc_energy(m, d, npt, ne, elems, xn, xtil, fidx, mass, h, r, rad, ghat, kappa,
                      gv, ge, candLS, nls) <= E0 + 1e-4*alpha*gdx) { lsok = 1; break; }
       alpha *= 0.5;
     }
@@ -1167,17 +1251,17 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // (descent) Newton step cannot reduce the energy even at alpha -> 0, i.e. we are sitting at the
     // minimum to numerical precision. Stop instead of grinding out further no-progress iterations.
     if (!lsok) break;
-    for (int i=0; i < 3*nfv; i++) x[i] = xn[i];
+    for (int i=0; i < 3*npt; i++) x[i] = xn[i];
     // keep cgap a valid lower bound: every gap can shrink by at most 4 vertices * the max vertex step
     mjtNum dgap = 4.0*alpha*maxdx;
     for (int c=0; c < ncand; c++) cgap[c] -= dgap;
   }
-  for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
+  for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     int da = dofadr[v];
     int qa = qpadr[v];   // qpos by joint qposadr; qvel/accel by dof address
     // x/xold are world; the slide dofs are in the body-local frame -> map the world displacement back
     // through R^T (= d->xmat^T). For an unrotated body this is the identity (dp_local == dp_world).
-    const mjtNum* R = d->xmat + 9*m->flex_vertbodyid[va+v];
+    const mjtNum* R = d->xmat + 9*pbody[v];
     mjtNum dpw[3], dpl[3];
     for (int c=0; c < 3; c++) dpw[c] = x[3*v+c] - xold[3*v+c];
     mju_mulMatTVec3(dpl, R, dpw);
@@ -1187,6 +1271,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   if (N > 0) ipc_spFree(&sp);
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
+  mju_free(rad); mju_free(pbody); mju_free(pgeom);
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS);
   mju_free(gv); mju_free(ge); mju_free(estr);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
