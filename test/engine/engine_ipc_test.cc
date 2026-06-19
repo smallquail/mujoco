@@ -295,5 +295,108 @@ TEST_F(IpcTest, ContactBlocksTunneling) {
   mj_deleteModel(m);
 }
 
+//---------------------------------- affine (ABD) rigid bodies -------------------------------------
+
+// lowest corner height of an axis-half-size-h box geom g, at the current kinematics
+static mjtNum LowestCorner(const mjModel* m, const mjData* d, int g, mjtNum h) {
+  const mjtNum* xp = d->geom_xpos + 3*g;
+  const mjtNum* xm = d->geom_xmat + 9*g;
+  mjtNum minz = 1e30;
+  for (int c = 0; c < 8; c++) {
+    mjtNum cg[3] = {(c&1 ? h : -h), (c&2 ? h : -h), (c&4 ? h : -h)};
+    mjtNum z = xp[2] + xm[6]*cg[0] + xm[7]*cg[1] + xm[8]*cg[2];
+    if (z < minz) minz = z;
+  }
+  return minz;
+}
+
+// a free-joint rigid body steps as an affine (ABD) body: after one step its linear velocity is g*dt and
+// it neither rotates nor gains angular velocity (free fall carried exactly by the rigid predictor).
+TEST_F(IpcTest, AffineBodyFreeFall) {
+  constexpr char xml[] = R"(
+  <mujoco>
+    <option timestep="0.002" integrator="ipc"/>
+    <worldbody>
+      <body name="box" pos="0 0 1">
+        <freejoint/>
+        <geom type="box" size="0.1 0.1 0.1" density="1000"/>
+      </body>
+    </worldbody>
+  </mujoco>)";
+  mjModel* m = Load(xml);
+  mjData* d = mj_makeData(m);
+  mj_step(m, d);
+  EXPECT_NEAR(d->qvel[2], m->opt.gravity[2]*m->opt.timestep, 1e-6);   // vz = g*dt
+  EXPECT_NEAR(d->qvel[0], 0, 1e-8);
+  EXPECT_NEAR(d->qvel[1], 0, 1e-8);
+  for (int i = 0; i < 3; i++) EXPECT_NEAR(d->qvel[3+i], 0, 1e-7);     // no spurious angular velocity
+  EXPECT_NEAR(d->qpos[3], 1, 1e-7);                                   // quaternion still identity
+  EXPECT_NEAR(d->qpos[4], 0, 1e-7);
+  EXPECT_NEAR(d->qpos[5], 0, 1e-7);
+  EXPECT_NEAR(d->qpos[6], 0, 1e-7);
+  EXPECT_FALSE(std::isnan(d->qpos[2]));
+  mj_deleteData(d);
+  mj_deleteModel(m);
+}
+
+// CCD guarantee for an affine body: a box driven hard at a plane cannot tunnel through in one step
+TEST_F(IpcTest, AffineBodyNoTunnel) {
+  constexpr char xml[] = R"(
+  <mujoco>
+    <option timestep="0.002" integrator="ipc"/>
+    <worldbody>
+      <geom name="floor" type="plane" size="0 0 1"/>
+      <body name="box" pos="0 0 0.12">
+        <freejoint/>
+        <geom type="box" size="0.1 0.1 0.1" density="1000"/>
+      </body>
+    </worldbody>
+  </mujoco>)";
+  mjModel* m = Load(xml);
+  mjData* d = mj_makeData(m);
+  int g = m->body_geomadr[mj_name2id(m, mjOBJ_BODY, "box")];
+  d->qvel[2] = -50;                          // 0.1 m of travel per step, far past the plane
+  mj_step(m, d);
+  mj_kinematics(m, d);
+  mjtNum minz = LowestCorner(m, d, g, 0.1);
+  EXPECT_GT(minz, 0) << "affine box tunneled through the plane";
+  EXPECT_FALSE(std::isnan(minz));
+  mj_deleteData(d);
+  mj_deleteModel(m);
+}
+
+// a box dropped flat on a floor stays penetration-free throughout and settles to rest near the surface
+// (the normal dashpot dissipates the impact energy; frictionless, so only normal motion is damped).
+TEST_F(IpcTest, AffineBodySettles) {
+  constexpr char xml[] = R"(
+  <mujoco>
+    <option timestep="0.002" integrator="ipc"/>
+    <worldbody>
+      <geom name="floor" type="plane" size="0 0 1"/>
+      <body name="box" pos="0 0 0.2">
+        <freejoint/>
+        <geom type="box" size="0.08 0.08 0.08" density="500"/>
+      </body>
+    </worldbody>
+  </mujoco>)";
+  mjModel* m = Load(xml);
+  mjData* d = mj_makeData(m);
+  int g = m->body_geomadr[mj_name2id(m, mjOBJ_BODY, "box")];
+  for (int s = 0; s < 800; s++) {
+    mj_step(m, d);
+    mj_kinematics(m, d);
+    ASSERT_FALSE(std::isnan(d->qpos[2])) << "NaN at step " << s;
+    EXPECT_GT(LowestCorner(m, d, g, 0.08), -1e-3) << "box penetrated the floor at step " << s;
+    EXPECT_LT(d->qpos[2], 0.25) << "box gained energy / flew off at step " << s;
+  }
+  // settled near the resting height (half-size 0.08 + a small barrier gap) with negligible velocity
+  EXPECT_NEAR(d->qpos[2], 0.085, 0.01) << "box did not settle at the expected rest height";
+  mjtNum speed = 0;
+  for (int i = 0; i < m->nv; i++) speed += d->qvel[i]*d->qvel[i];
+  EXPECT_LT(std::sqrt(speed), 0.05) << "box did not come to rest";
+  mj_deleteData(d);
+  mj_deleteModel(m);
+}
+
 }  // namespace
 }  // namespace mujoco
