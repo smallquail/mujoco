@@ -842,8 +842,9 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
     // Types that couple nodes NOT sharing an element add new pattern entries and MUST be included: flex
     // self-contact (0,1), sphere-vs-flex (0, sphere node <-> triangle), and sphere-vs-sphere (5).
     if (cand[c].type >= 2 && cand[c].type != 5) continue;
-    mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);   // couple ONLY active contacts (gap within their ghat):
-    if (cgap[c] >= ghc) continue;                     // inactive inter-flex pairs (~99%) add no pattern block
+    mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);   // couple active + near-active contacts (within 2x their
+    if (cgap[c] >= 2.0*ghc) continue;                 // activation gap) so the IC0 precond keeps the coupling
+                                                       // for contacts that activate mid-Newton; far pairs skipped
     int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
     for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
   }
