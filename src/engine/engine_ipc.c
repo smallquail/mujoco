@@ -915,34 +915,8 @@ typedef struct {
 } ipcSparse;
 static void ipc_icApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r);   // defined below
 
-// matrix-free preconditioned CG: solve H dx = -grad. The matvec H*p stays matrix-free (ipc_applyH);
-// the preconditioner is the IC(0) factor of the assembled sparse H (sp), applied via ipc_icApply.
-// Returns the iteration count (for diagnostics).
-static int ipc_pcg(mjtNum* dx, const mjtNum* grad, int N, const ipcSparse* sp, const mjtNum* mdiag,
-                   int nelem, const ipcElem* elems, const mjtNum* estr,
-                   const ipcCC* ccache, int nacon, int naff, const ipcAffine* aff, const mjtNum* affH,
-                   mjtNum* rcg, mjtNum* zcg, mjtNum* pcg, mjtNum* Hp) {
-  mjtNum rz = 0, r0 = 0;
-  for (int i=0; i < N; i++) { dx[i] = 0; rcg[i] = -grad[i]; r0 += rcg[i]*rcg[i]; }
-  ipc_icApply(sp, zcg, rcg);                                      // preconditioned residual
-  for (int i=0; i < N; i++) { pcg[i] = zcg[i]; rz += rcg[i]*zcg[i]; }
-  if (r0 < 1e-30) return 0;
-  int it = 0;
-  for (; it < 200; it++) {
-    ipc_applyH(pcg, Hp, N, mdiag, nelem, elems, estr, ccache, nacon, naff, aff, affH);
-    mjtNum pHp = 0; for (int i=0; i < N; i++) pHp += pcg[i]*Hp[i];
-    if (pHp <= 1e-30) break;
-    mjtNum alpha = rz/pHp;
-    mjtNum rr = 0;
-    for (int i=0; i < N; i++) { dx[i] += alpha*pcg[i]; rcg[i] -= alpha*Hp[i]; rr += rcg[i]*rcg[i]; }
-    if (rr < 1e-8*r0) break;
-    ipc_icApply(sp, zcg, rcg);
-    mjtNum rznew = 0; for (int i=0; i < N; i++) rznew += rcg[i]*zcg[i];
-    mjtNum beta = rznew/rz; rz = rznew;
-    for (int i=0; i < N; i++) pcg[i] = zcg[i] + beta*pcg[i];
-  }
-  return it;
-}
+// (the matrix-free PCG is now ipc_solveU below -- one unified solver for flex + affine; ipc_pcg was its
+// naff==0 special case and has been folded in.)
 
 // ===== genuine reduced-coordinate affine solve ("don't add the DOFs") =================================
 // Each affine body has 12 control-point DOFs but they are NOT solver unknowns. A joint to the parent pins
@@ -1030,68 +1004,158 @@ static mjtNum ipc_reduceGrad(const ipcAffine* aff, int naff, const mjtNum* g, mj
   return sqrt(gn);
 }
 
-// genuine reduced Newton solve in z. Inputs: per-body 12-vec gradients g[a] and 12x12 Hessians H[a] (inertia
-// + orthogonality + per-body contact, all in cp space). Outputs dx = cp increment satisfying the joint.
-// CRB: composite Hb_bar = Hb + sum_children Mc^T Hb_bar_c Mc; H_z diag = Nb^T Hb_bar Nb; off-diag (b, ancestor
-// a) = (Nb^T Hb_bar * prod Mc) Na. grad_z by the adjoint adj_b = g_b + sum_children Mc^T adj_c.
-static void ipc_crbSolve(mjtNum* dx, const ipcAffine* aff, int naff, int Nz,
-                         const mjtNum* g /*12*naff*/, const mjtNum* H /*144*naff*/,
-                         mjtNum* Hz /*Nz*Nz*/, mjtNum* gz /*Nz*/, mjtNum* dz /*Nz*/,
-                         mjtNum* Hbar /*144*naff*/, mjtNum* adj /*12*naff*/) {
-  for (int i=0; i < Nz*Nz; i++) Hz[i] = 0;
-  for (int a=0; a < naff; a++) { for (int i=0; i < 144; i++) Hbar[144*a+i] = H[144*a+i];
-                                 for (int i=0; i < 12; i++) adj[12*a+i] = g[12*a+i]; }
-  // backward: accumulate composites into parents (children have higher index than parents)
-  for (int a=naff-1; a >= 0; a--) {
-    const ipcAffine* af = &aff[a]; int p = af->jparent;
-    if (p < 0) continue;
-    mjtNum t[144], MtH[144];
-    ipc_mtm12(MtH, af->Mb, Hbar+144*a);          // Mb^T Hbar_a
-    ipc_mm12(t, MtH, af->Mb);                     // Mb^T Hbar_a Mb -> add to parent composite
-    for (int i=0; i < 144; i++) Hbar[144*p+i] += t[i];
-    mjtNum Mta[12];                               // Mb^T adj_a -> add to parent adjoint
-    for (int i=0; i < 12; i++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Mb[12*k+i]*adj[12*a+k]; Mta[i] = s; }
-    for (int i=0; i < 12; i++) adj[12*p+i] += Mta[i];
+// per-TREE preconditioner apply: zz = (tree block of H_z)^-1 r, one block per connected articulated tree
+// (a root with jparent<0 plus its descendants -- a contiguous z range). Per-body blocks miss the joint
+// coupling; the whole-tree block captures it, so for a single tree this is the exact factor (CG ~1 iter).
+// The factors are packed in bjf (sum of ntz^2 <= Nz^2); roots are visited in the same order when factoring.
+static void ipc_treeJacobi(const ipcAffine* aff, int naff, int Nz, const mjtNum* bjf, const mjtNum* r, mjtNum* zz) {
+  int off = 0;
+  for (int a=0; a < naff; a++) if (aff[a].jparent < 0) {
+    int za = aff[a].zadr, zb = Nz;
+    for (int b=a+1; b < naff; b++) if (aff[b].jparent < 0) { zb = aff[b].zadr; break; }
+    int ntz = zb - za;
+    mju_cholSolve(zz+za, bjf+off, r+za, ntz);
+    off += ntz*ntz;
   }
-  // reduced gradient + reduced Hessian (diagonal and ancestor off-diagonal blocks)
+}
+
+
+// ===== UNIFIED solver: one preconditioned CG over reduced coords u = [u_na ; u_z] ======================
+// u_na = the non-affine (flex + free-point) maximal DOF [0,Nna), mapped 1:1. u_z = the affine reduced DOF
+// (Nz, joints eliminated). The map T: maximal dx[N] = T u is identity on [0,Nna) and the Nb/Mb tree map on
+// the affine block [Nna,N). The Newton operator in u is Hu = T^T H T applied matrix-free: expand u->maximal
+// via T, apply the existing maximal Hessian ipc_applyH, reduce via T^T. Preconditioner is block-diagonal:
+// IC(0) of the non-affine Hessian (sp, dim Nna) on u_na, and the per-tree factor of the reduced affine
+// Hessian on u_z. naff==0 => exactly ipc_pcg; no flex => equivalent to the old ipc_crbSolve.
+
+// forward tree map T (parents before children): cp increment dcp_a = Nb_a u_z_a + Mb_a dcp_parent.
+static void ipc_crbForward(const ipcAffine* aff, int naff, const mjtNum* uz, mjtNum* dcp /*12*naff*/) {
   for (int a=0; a < naff; a++) {
+    const ipcAffine* af = &aff[a]; int pa = af->jparent; mjtNum* dca = dcp + 12*a;
+    for (int i=0; i < 12; i++) { mjtNum s = 0;
+      for (int j=0; j < af->nfree; j++) s += af->Nb[12*i+j]*uz[af->zadr+j];
+      if (pa >= 0) for (int k=0; k < 12; k++) s += af->Mb[12*i+k]*dcp[12*pa+k];
+      dca[i] = s; }
+  }
+}
+
+// adjoint tree map T^T (children before parents): adj_a = f_a + sum_children Mb_c^T adj_c, outz_a = Nb_a^T adj_a.
+// (Same recursion as ipc_reduceGrad but WITHOUT the negation -- this is the operator adjoint, not the RHS.)
+static void ipc_crbAdjoint(const ipcAffine* aff, int naff, const mjtNum* f /*12*naff*/,
+                           mjtNum* outz /*Nz*/, mjtNum* adj /*12*naff scratch*/) {
+  for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) adj[12*a+i] = f[12*a+i];
+  for (int a=naff-1; a >= 0; a--) { const ipcAffine* af = &aff[a]; int pa = af->jparent; if (pa < 0) continue;
+    for (int i=0; i < 12; i++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Mb[12*k+i]*adj[12*a+k];
+      adj[12*pa+i] += s; } }
+  for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr;
+    for (int j=0; j < nf; j++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Nb[12*k+j]*adj[12*a+k];
+      outz[z0+j] = s; } }
+}
+
+// assemble the reduced affine Hessian H_z (CRB composite tree pass) from per-body 12x12 H, then factor it
+// per connected tree into bjf (for the per-tree preconditioner). Hbar is 144*naff scratch.
+static void ipc_crbHessian(const ipcAffine* aff, int naff, int Nz, const mjtNum* H /*144*naff*/,
+                           mjtNum* Hz /*Nz*Nz*/, mjtNum* Hbar /*144*naff*/, mjtNum* bjf) {
+  for (size_t i=0; i < (size_t)Nz*Nz; i++) Hz[i] = 0;
+  for (int a=0; a < naff; a++) for (int i=0; i < 144; i++) Hbar[144*a+i] = H[144*a+i];
+  for (int a=naff-1; a >= 0; a--) {                       // backward composite into parents
+    const ipcAffine* af = &aff[a]; int pa = af->jparent; if (pa < 0) continue;
+    mjtNum t[144], MtH[144];
+    ipc_mtm12(MtH, af->Mb, Hbar+144*a); ipc_mm12(t, MtH, af->Mb);
+    for (int i=0; i < 144; i++) Hbar[144*pa+i] += t[i];
+  }
+  for (int a=0; a < naff; a++) {                          // diag + ancestor off-diag blocks
     const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr;
-    for (int j=0; j < nf; j++) { mjtNum s = 0;                               // gz = Nb^T adj_a
-      for (int k=0; k < 12; k++) s += af->Nb[12*k+j]*adj[12*a+k]; gz[z0+j] = -s; }
-    mjtNum HN[144];                                                          // HN = Hbar_a Nb (12 x nf)
+    mjtNum HN[144];
     for (int i=0; i < 12; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
       for (int k=0; k < 12; k++) s += Hbar[144*a+12*i+k]*af->Nb[12*k+j]; HN[12*i+j] = s; }
-    for (int i=0; i < nf; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;    // diag = Nb^T Hbar Nb
+    for (int i=0; i < nf; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
       for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*HN[12*k+j]; Hz[(size_t)(z0+i)*Nz+(z0+j)] = s; }
-    // off-diagonal: acc = Nb^T Hbar (nf x 12); walk ancestors c, acc *= Mc, block = acc * Nc
     mjtNum acc[144];
     for (int i=0; i < nf; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
       for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*Hbar[144*a+12*k+j]; acc[12*i+j] = s; }
     int cur = a;
     while (aff[cur].jparent >= 0) {
       const ipcAffine* afc = &aff[cur]; int anc = afc->jparent;
-      mjtNum acc2[144];                                                      // acc *= Mb_cur (transmit up one level)
+      mjtNum acc2[144];
       for (int i=0; i < nf; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
         for (int k=0; k < 12; k++) s += acc[12*i+k]*afc->Mb[12*k+j]; acc2[12*i+j] = s; }
       for (int i=0; i < 144; i++) acc[i] = acc2[i];
       const ipcAffine* afa = &aff[anc]; int naf = afa->nfree, za = afa->zadr;
-      for (int i=0; i < nf; i++) for (int j=0; j < naf; j++) { mjtNum s = 0; // block(a,anc) = acc * Na
+      for (int i=0; i < nf; i++) for (int j=0; j < naf; j++) { mjtNum s = 0;
         for (int k=0; k < 12; k++) s += acc[12*i+k]*afa->Nb[12*k+j];
         Hz[(size_t)(z0+i)*Nz+(za+j)] = s; Hz[(size_t)(za+j)*Nz+(z0+i)] = s; }
       cur = anc;
     }
   }
-  mju_cholFactor(Hz, Nz, 1e-9);
-  mju_cholSolve(dz, Hz, gz, Nz);
-  // forward map: cp increment dcp_a = Mb_a dcp_parent + Nb_a dz_a (parents before children)
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a]; int p = af->jparent;
-    mjtNum* dca = dx + 12*a;
-    for (int i=0; i < 12; i++) { mjtNum s = 0;
-      for (int j=0; j < af->nfree; j++) s += af->Nb[12*i+j]*dz[af->zadr+j];
-      if (p >= 0) for (int k=0; k < 12; k++) s += af->Mb[12*i+k]*dx[12*p+k];
-      dca[i] = s; }
+  { int off = 0;                                          // per-tree Cholesky factors
+    for (int a=0; a < naff; a++) if (aff[a].jparent < 0) {
+      int za = aff[a].zadr, zb = Nz;
+      for (int b=a+1; b < naff; b++) if (aff[b].jparent < 0) { zb = aff[b].zadr; break; }
+      int ntz = zb - za;
+      for (int i=0; i < ntz; i++) for (int j=0; j < ntz; j++) bjf[off + i*ntz+j] = Hz[(size_t)(za+i)*Nz + (za+j)];
+      mju_cholFactor(bjf+off, ntz, 1e-9);
+      off += ntz*ntz; } }
+}
+
+// block-diagonal preconditioner apply: z = M^-1 r.  na block = IC(0) (sp), affine block = per-tree factor.
+static void ipc_uPrecond(const ipcSparse* sp, int Nna, const ipcAffine* aff, int naff, int Nz,
+                         const mjtNum* bjf, const mjtNum* r, mjtNum* z) {
+  if (Nna > 0) ipc_icApply(sp, z, r);
+  if (Nz > 0)  ipc_treeJacobi(aff, naff, Nz, bjf, r + Nna, z + Nna);
+}
+
+// reduced matvec Hp = (T^T H T) p:  expand p->dxm via T, apply maximal H (ipc_applyH), reduce via T^T.
+static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
+                        const ipcAffine* aff, int naff, const mjtNum* mdiag, int ne, const ipcElem* elems,
+                        const mjtNum* estr, const ipcCC* ccache, int nacon, const mjtNum* affH,
+                        mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
+  if (naff == 0) {   // pure flex: no reduction, apply the maximal matrix-free Hessian directly (== old ipc_pcg)
+    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, ccache, nacon, 0, aff, affH); return;
   }
+  for (int i=0; i < Nna; i++) dxm[i] = p[i];                    // expand: na identity
+  if (naff > 0) {                                               // affine: forward tree map (dcp in Hpm scratch)
+    ipc_crbForward(aff, naff, p + Nna, Hpm);
+    for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dxm[Nna+12*a+i] = Hpm[12*a+i];
+  }
+  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, ccache, nacon, naff, aff, affH);
+  for (int i=0; i < Nna; i++) Hp[i] = Hpm[i];                   // reduce: na identity
+  if (naff > 0) ipc_crbAdjoint(aff, naff, Hpm + Nna, Hp + Nna, adj);   // affine: adjoint tree map
+}
+
+// unified preconditioned CG. RHS r_u = [-grad_na ; gz] (gz = the affine reduced gradient RHS from
+// ipc_reduceGrad). bjf = prebuilt per-tree factors. Writes the maximal Newton direction dx[N].
+static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
+                      const ipcAffine* aff, int naff, const ipcSparse* sp, const mjtNum* mdiag,
+                      int ne, const ipcElem* elems, const mjtNum* estr, const ipcCC* ccache, int nacon,
+                      const mjtNum* affH, const mjtNum* bjf, const mjtNum* gz,
+                      mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol,
+                      mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
+  int Nu = Nna + Nz;
+  for (int i=0; i < Nna; i++) r[i] = -grad[i];
+  for (int j=0; j < Nz; j++) r[Nna+j] = gz[j];
+  for (int i=0; i < Nu; i++) usol[i] = 0;
+  mjtNum r0 = 0; for (int i=0; i < Nu; i++) r0 += r[i]*r[i];
+  if (r0 < 1e-30) { for (int i=0; i < N; i++) dx[i] = 0; return 0; }
+  ipc_uPrecond(sp, Nna, aff, naff, Nz, bjf, r, z);
+  mjtNum rz = 0; for (int i=0; i < Nu; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
+  int it = 0;
+  for (; it < 200; it++) {   // matches the old ipc_pcg cap -> naff==0 is bit-identical to the flex PCG
+    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, estr, ccache, nacon, affH, dxm, Hpm, adj);
+    mjtNum pHp = 0; for (int i=0; i < Nu; i++) pHp += p[i]*Hp[i];
+    if (pHp <= 1e-30) break;
+    mjtNum alpha = rz/pHp, rr = 0;
+    for (int i=0; i < Nu; i++) { usol[i] += alpha*p[i]; r[i] -= alpha*Hp[i]; rr += r[i]*r[i]; }
+    if (rr < 1e-8*r0) break;
+    ipc_uPrecond(sp, Nna, aff, naff, Nz, bjf, r, z);
+    mjtNum rznew = 0; for (int i=0; i < Nu; i++) rznew += r[i]*z[i];
+    mjtNum beta = rznew/rz; rz = rznew;
+    for (int i=0; i < Nu; i++) p[i] = z[i] + beta*p[i];
+  }
+  for (int i=0; i < Nna; i++) dx[i] = usol[i];                  // expand solution u -> maximal dx
+  if (naff > 0) { ipc_crbForward(aff, naff, usol + Nna, dxm);
+    for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dx[Nna+12*a+i] = dxm[12*a+i]; }
+  return it;
 }
 
 // IPC incremental-potential energy: inertia + edge-stretch penalty + contact barriers over the
@@ -1351,8 +1415,9 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
   for (int i=0; i < N; i++) mk[nmk++] = (long long)i*N + i;          // diagonal
   for (int t=0; t < ne; t++) for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
     ipc_addBlock(mk, &nmk, elems[t].fv[i], elems[t].fv[j], N);       // membrane: element verts
-  for (int a=0; a < naff; a++) for (int i=0; i < 4; i++) for (int j=0; j < 4; j++)   // affine 4-cp clique
-    if (aff[a].sdof[i] >= 0 && aff[a].sdof[j] >= 0) ipc_addBlock(mk, &nmk, aff[a].sdof[i]/3, aff[a].sdof[j]/3, N);
+  for (int a=0; a < naff; a++) for (int i=0; i < 4; i++) for (int j=0; j < 4; j++)   // affine 4-cp clique:
+    if (aff[a].sdof[i] >= 0 && aff[a].sdof[i] < N && aff[a].sdof[j] >= 0 && aff[a].sdof[j] < N)  // skipped here
+      ipc_addBlock(mk, &nmk, aff[a].sdof[i]/3, aff[a].sdof[j]/3, N);   // (N==Nna; affine DOF >= Nna own a per-tree factor)
   qsort(mk, nmk, sizeof(long long), ipc_cmpll);
   int spNmk = 0; for (int i=0; i < nmk; i++) if (i==0 || mk[i] != mk[i-1]) mk[spNmk++] = mk[i];  // dedup in place
   // contact keys (variable per step): collect + sort, then merge with the cached mesh keys
@@ -1368,8 +1433,11 @@ static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ip
     mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);   // couple active + near-active contacts (within 2x their
     if (cgap[c] >= 2.0*ghc) continue;                 // activation gap) so the IC0 precond keeps the coupling
                                                        // for contacts that activate mid-Newton; far pairs skipped
-    int v[4], nv; ipc_conVerts(&cand[c], v, &nv);
-    for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) ipc_addBlock(ck, &nck, fidx[v[i]], fidx[v[j]], N);
+    int v[4], nv; ipc_conVerts(&cand[c], v, &nv);   // skip couplings touching an affine DOF (fidx >= N/3==Nna/3):
+    for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) {   // they are off the IC0 block (per-tree factor owns them)
+      int bi = fidx[v[i]], bj = fidx[v[j]];
+      if (bi >= 0 && bi < N/3 && bj >= 0 && bj < N/3) ipc_addBlock(ck, &nck, bi, bj, N);
+    }
   }
   qsort(ck, nck, sizeof(long long), ipc_cmpll);
   // merge the two sorted lists into a sorted-unique key list (avoids re-sorting the big mesh list)
@@ -1909,6 +1977,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum* zcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* pcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* Hpv  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
+  mjtNum* usol = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // unified solver: u-space solution + matvec scratch
+  mjtNum* dxm  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
+  mjtNum* Hpm  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* affH = (mjtNum*) mju_malloc((naff > 0 ? 144*naff : 1)*sizeof(mjtNum)); // per-affine 12x12 Hessian
   mjtNum* estr = (mjtNum*) mju_malloc((ne > 0 ? 12*ne : 1)*sizeof(mjtNum)); // per-element g_a (9) + Me_a (3)
                                                                            // (full, PSD-projected, this Newton iter)
@@ -1998,7 +2069,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // loop, so cache e_prev once per step. Only needed when damping is on.
   if (nfd > 0 && m->flex_damping[f] > 0)
     for (int t=0; t < ne; t++) { mjtNum dtmp[3][3]; ipc_elemEval(&elems[t], xold, dtmp, elems[t].ep); }
-  ipcSparse sp;
+  ipcSparse sp = {0};   // IC(0) preconditioner Hessian -- only built/used on the PCG path (!useCRB)
   // mark active inter-flex/sphere candidates (gap already within their per-contact ghat) so the IC0 pattern
   // couples only those (~hundreds) instead of all ~15k candidates (~99% inactive). gap here == iter-0 gap
   // (x is unchanged until the Newton loop); geom contacts (types 2/3/4) add no coupling so they're skipped.
@@ -2007,12 +2078,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mjtNum nn[3], cw[4]; int iv[4], nidx;
     cgap[c] = ipc_conGap(&cand[c], m, d, x, gv, ge, r, rad, nn, iv, cw, &nidx, thresh);
   }
-  if (N > 0) ipc_spBuild(m, &sp, N, ne, elems, ncand, cand, cgap, rad, ghat, fidx, naff, aff);
+  // UNIFIED solve: one PCG in reduced coords u = [non-affine maximal DOF [0,Nna) ; affine reduced DOF (Nz)].
+  // The affine control points are the last 12*naff DOF of N (contiguous, see setup), so Nna = N - 12*naff is
+  // exactly the flex+free-point block. The IC(0) sparse Hessian sp covers ONLY that non-affine block; the
+  // affine block is preconditioned by its per-tree reduced-Hessian factor. (Both old paths -- the jointed
+  // CRB direct solve and the flex PCG -- are special cases of ipc_solveU below.)
+  int Nna = N - 12*naff;
+  if (Nna > 0) ipc_spBuild(m, &sp, Nna, ne, elems, ncand, cand, cgap, rad, ghat, fidx, naff, aff);
   // precompute element -> CSR scatter indices once per step (the pattern is fixed over the Newton loop), so
   // the per-Newton assembly avoids a binary-search ipc_spIdx per matrix entry. -1 marks skipped entries
   // (upper-tri or pinned vertex). Order matches the assembly loop: idx = (i*3+j)*9 + a*3+b.
-  int* escat = (N > 0) ? (int*) mju_malloc(ne*81*sizeof(int)) : NULL;
-  if (N > 0) for (int t=0; t < ne; t++) {
+  int* escat = (Nna > 0) ? (int*) mju_malloc(ne*81*sizeof(int)) : NULL;
+  if (Nna > 0) for (int t=0; t < ne; t++) {
     const ipcElem* elem = &elems[t]; int k = 0;
     for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
       int fi = elem->fv[i], fj = elem->fv[j];
@@ -2029,30 +2106,28 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // when a candidate enters the set. So the lower bound crosses ghat no later than the true gap (no active
   // contact is ever missed in the barrier), and the CCD's cgap-based step cap stays conservative (safe).
   // GENUINE reduced-coordinate solve for jointed-affine, no-flex scenes (humanoid, pendulums): the free DOFs
-  // z are the only unknowns. Per-body Mb/Nb derived once; the reduced Hessian is assembled per-body by a
-  // composite (CRB) tree pass and factored directly. flex / free-affine / mixed -> the matrix-free PCG below.
-  int jointed = 0; for (int a=0; a < naff; a++) if (aff[a].isHinge) jointed = 1;
-  int useCRB = (jointed && nfd == 0 && N > 0);
-  int Nz = 0; mjtNum *crbHz = NULL, *crbGz = NULL, *crbDz = NULL, *crbHbar = NULL, *crbAdj = NULL,
-                     *crbGp = NULL, *crbHp = NULL, *crbDx = NULL, *crbHc = NULL;
-  if (useCRB) {
+  // z are the only unknowns (useCRB computed above). Per-body Mb/Nb derived once; the reduced Hessian is
+  // assembled per-body by a composite (CRB) tree pass and factored directly. flex/free-affine -> PCG below.
+  int Nz = 0; mjtNum *crbHz = NULL, *crbGz = NULL, *crbHbar = NULL, *crbAdj = NULL,
+                     *crbHp = NULL, *crbHc = NULL, *crbBJ = NULL;
+  if (naff > 0) {
     Nz = ipc_buildReduction(aff, naff);
-    crbHz  = (mjtNum*) mju_malloc((size_t)Nz*Nz*sizeof(mjtNum));
-    crbGz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));
-    crbDz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));
-    crbHbar= (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));
-    crbAdj = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum));
-    crbGp  = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum));
-    crbHp  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));
-    crbDx  = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum));
-    crbHc  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));
+    crbHz  = (mjtNum*) mju_malloc((size_t)Nz*Nz*sizeof(mjtNum));   // reduced affine Hessian (precond assembly)
+    crbGz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));      // affine reduced gradient RHS (gz)
+    crbHbar= (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// CRB composite scratch
+    crbAdj = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // tree adjoint scratch
+    crbHp  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body H = affH + contact
+    crbHc  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body contact Hessian
+    crbBJ  = (mjtNum*) mju_malloc((size_t)Nz*Nz*sizeof(mjtNum));   // per-tree preconditioner factors (sum ntz^2 <= Nz^2)
   }
   int nact0 = 0, nlt02 = 0, nlt06 = 0;   // active contacts at iter 0: total, ratio<0.2, ratio<0.6 (kappa adapt)
   for (int it=0; it < 40 && N > 0; it++) {
     for (int i=0; i < N; i++) grad[i] = 0;
-    for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;              // sparse Hessian (for the IC(0) precond)
-    for (int fi=0; fi < N/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
-      sp.val[ipc_spIdx(&sp, 3*fi+c, 3*fi+c)] += mdiag[3*fi+c];
+    if (Nna > 0) {                                            // IC0 sparse Hessian over the non-affine block
+      for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;
+      for (int fi=0; fi < Nna/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
+        sp.val[ipc_spIdx(&sp, 3*fi+c, 3*fi+c)] += mdiag[3*fi+c];
+    }
     for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
       int fi = fidx[v]; mjtNum mh = mass[v]*ih2;
       for (int c=0; c < 3; c++) grad[3*fi+c] += mh*(x[3*v+c]-xtil[3*v+c]);
@@ -2092,27 +2167,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int id = escat[base + a*3+b]; if (id >= 0) sp.val[id] += He[3*i+a][3*j+b]; } }
     }
-    // affine bodies: inertia (M_cp star) + orthogonality GN Hessian -> grad, affH (matrix-free apply),
-    // and the lower-tri 4-cp clique scattered into the IC0 sparse Hessian
+    // affine bodies: inertia (M_cp star) + orthogonality GN Hessian -> grad and affH (matrix-free apply).
+    // The 12x12 block goes into the matvec (ipc_applyH) and, reduced, into the per-tree preconditioner -- it
+    // is NOT scattered into the IC0 sparse Hessian (the affine block lives in the per-tree factor, not sp).
     for (int a=0; a < naff; a++) {
       mjtNum g12[12], H12[12][12];
       ipc_affineGH(&aff[a], x, xtil, ih2, g12, H12);
       mjtNum* Hb = affH + 144*a;
-      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) Hb[12*i+j] = H12[i][j];  // apply skips pinned cols
-      for (int i=0; i < 12; i++) {
-        if (aff[a].sdof[i/3] < 0) continue;                    // pinned control point: no solver DOF
-        grad[aff[a].sdof[i/3] + (i%3)] += g12[i];
-        for (int j=0; j < 12; j++) {
-          if (aff[a].sdof[j/3] < 0) continue;
-          int R = aff[a].sdof[i/3] + (i%3), C = aff[a].sdof[j/3] + (j%3);
-          if (C > R) continue;
-          int id = ipc_spIdx(&sp, R, C);
-          if (id >= 0) sp.val[id] += H12[i][j];
-        }
-      }
+      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) Hb[12*i+j] = H12[i][j];
+      for (int i=0; i < 12; i++) grad[aff[a].sdof[i/3] + (i%3)] += g12[i];
     }
     // (hinge joints are eliminated exactly by the reduced coordinates -- the per-body cp gradient/Hessian
-    // above are reduced into the free DOFs z by ipc_crbSolve; nothing joint-related is added here.)
+    // above are reduced into the free DOFs z inside ipc_solveU; nothing joint-related is added here.)
     // assemble active contacts. First Newton iter: scan all candidates (initializes cgap exactly). Later
     // iters: only re-test the active set {cgap < ghat} (cgap is a maintained lower bound, so this set
     // contains every candidate that is or could be active). grad/acon/ccache get the active barrier blocks.
@@ -2124,13 +2190,14 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < ncand; c++) if (cgap[c] < ghat)
         ipc_try(cand[c], m, d, x, gv, ge, r, rad, ghat, kappa, fidx, grad, acon, ccache, &nacon, amax, &cgap[c]);
     }
-    if (useCRB) for (int i=0; i < 144*naff; i++) crbHc[i] = 0;   // per-body contact Hessian for the reduced solve
-    ipc_affineContact(m, d, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, useCRB ? crbHc : NULL);
-    ipc_affineAffineContact(m, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, useCRB ? crbHc : NULL);  // self-collision
-    for (int c=0; c < nacon; c++) {                          // contact GN: bdd * (cw n)(cw n)^T
+    if (naff > 0) for (int i=0; i < 144*naff; i++) crbHc[i] = 0;   // per-body contact Hessian (affine precond)
+    ipc_affineContact(m, d, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, naff > 0 ? crbHc : NULL);
+    ipc_affineAffineContact(m, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, naff > 0 ? crbHc : NULL);  // self-collision
+    if (Nna > 0) for (int c=0; c < nacon; c++) {             // contact GN -> IC0 sparse Hessian (non-affine block)
       const ipcCC* cc = &ccache[c];
       for (int p=0; p < cc->nidx; p++) for (int q=0; q < cc->nidx; q++) {
         int fp = cc->f[p], fq = cc->f[q]; if (fp < 0 || fq < 0) continue;
+        if (3*fp >= Nna || 3*fq >= Nna) continue;   // affine DOF: not in sp (handled by the per-tree factor)
         mjtNum w2 = cc->bdd*cc->cw[p]*cc->cw[q];
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int R = 3*fp+a, C = 3*fq+b; if (C > R) continue;
@@ -2164,29 +2231,26 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // depends on mass/h^2, kappa, mesh, so a fixed 1e-8 sat at/below the achievable gradient floor for
     // stiff-contact steps -> Newton ground out useless iterations after it had already converged.
     // residual norm: reduced (||grad_z||, the genuine reduced gradient) for the CRB solve, else projected ||grad||
-    mjtNum gnorm;
-    if (useCRB) {
-      for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a];   // gather per-body cp gradient + Hessian
-        for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) crbGp[12*a+3*k+c] = (af->sdof[k] >= 0) ? grad[af->sdof[k]+c] : 0;
-        for (int i=0; i < 144; i++) crbHp[144*a+i] = affH[144*a+i] + crbHc[144*a+i]; }   // inertia+ortho + contact
-      gnorm = ipc_reduceGrad(aff, naff, crbGp, crbGz, crbAdj);
-    } else {
-      mjtNum gn = 0; for (int i=0; i < N; i++) gn += grad[i]*grad[i]; gnorm = sqrt(gn);
+    // unified reduced residual norm: ||[grad_na ; gz]|| spanning the non-affine block and the affine reduced
+    // gradient gz = -Nb^T adj (ipc_reduceGrad, on the affine block grad[Nna..N)). crbGz holds gz for the solve.
+    mjtNum gnorm, gna2 = 0;
+    for (int i=0; i < Nna; i++) gna2 += grad[i]*grad[i];
+    mjtNum gaff = 0;
+    if (naff > 0) {
+      for (int a=0; a < naff; a++) for (int i=0; i < 144; i++) crbHp[144*a+i] = affH[144*a+i] + crbHc[144*a+i];
+      gaff = ipc_reduceGrad(aff, naff, grad + Nna, crbGz, crbAdj);   // crbGz = gz (affine RHS), gaff = ||gz||
     }
+    gnorm = sqrt(gna2 + gaff*gaff);
     if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
     // the affine GN orthogonality converges only LINEARLY near the floor, so chasing 1e-7*g0 wastes ~25 iters
-    // for no physical change. Stop the reduced solve at 1e-6*g0 (meaningful accuracy). Flex keeps tight 1e-7.
-    mjtNum ctol = useCRB ? 1e-6 : 1e-7;
+    // for no physical change. With affine present, stop at 1e-6*g0 (meaningful); pure flex keeps tight 1e-7.
+    mjtNum ctol = (naff > 0) ? 1e-6 : 1e-7;
     if (gnorm < ctol*g0 + 1e-9) break;
-    if (useCRB) {                                            // genuine reduced Newton: solve in z, dcp = forward(dz)
-      ipc_crbSolve(crbDx, aff, naff, Nz, crbGp, crbHp, crbHz, crbGz, crbDz, crbHbar, crbAdj);
-      for (int i=0; i < N; i++) dx[i] = 0;
-      for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a];
-        for (int k=0; k < 4; k++) if (af->sdof[k] >= 0) for (int c=0; c < 3; c++) dx[af->sdof[k]+c] = crbDx[12*a+3*k+c]; }
-    } else {
-      ipc_ic0(&sp, 1e-9);                                     // incomplete-LDL^T factor (signed pivots)
-      ipc_pcg(dx, grad, N, &sp, mdiag, ne, elems, estr, ccache, nacon, naff, aff, affH, rcg, zcg, pcg, Hpv);
-    }
+    // ONE solver: per-tree affine preconditioner factors (from inertia+ortho+contact), then the unified PCG.
+    if (naff > 0) ipc_crbHessian(aff, naff, Nz, crbHp, crbHz, crbHbar, crbBJ);
+    if (Nna > 0) ipc_ic0(&sp, 1e-9);                          // incomplete-LDL^T factor (signed pivots)
+    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, estr, ccache, nacon,
+               affH, crbBJ, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
     for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
                                   if (n2 > maxdx) maxdx = n2; }
@@ -2309,9 +2373,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   mju_free(qoA); mju_free(qnA);
   d->time += h;
-  if (useCRB) { mju_free(crbHz); mju_free(crbGz); mju_free(crbDz); mju_free(crbHbar);
-                mju_free(crbAdj); mju_free(crbGp); mju_free(crbHp); mju_free(crbDx); mju_free(crbHc); }
-  if (N > 0) ipc_spFree(&sp);
+  if (naff > 0) { mju_free(crbHz); mju_free(crbGz); mju_free(crbHbar);
+                mju_free(crbAdj); mju_free(crbHp); mju_free(crbHc); mju_free(crbBJ); }
+  if (Nna > 0) ipc_spFree(&sp);
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
   mju_free(rad); mju_free(pbody); mju_free(pgeom); mju_free(pcp); mju_free(aff);
@@ -2321,7 +2385,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(gv); mju_free(ge); mju_free(estr); mju_free(affH);
   mju_free(x); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(grad); mju_free(dx); mju_free(mdiag);
-  mju_free(rcg); mju_free(zcg); mju_free(pcg); mju_free(Hpv);
+  mju_free(rcg); mju_free(zcg); mju_free(pcg); mju_free(Hpv); mju_free(usol); mju_free(dxm); mju_free(Hpm);
 }
 
 
