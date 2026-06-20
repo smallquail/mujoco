@@ -925,14 +925,6 @@ static void ipc_icApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r);   // d
 // tree-structured H_z by a composite-rigid-body (CRB) pass, factored directly. No 156-D system, no N^T H N
 // over the full space, no projection -> no gradient floor.
 
-// 12x12 helpers (row-major).
-static void ipc_mm12(mjtNum* C, const mjtNum* A, const mjtNum* B) {       // C = A*B
-  for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-    for (int k=0; k < 12; k++) s += A[12*i+k]*B[12*k+j]; C[12*i+j] = s; } }
-static void ipc_mtm12(mjtNum* C, const mjtNum* A, const mjtNum* B) {      // C = A^T*B
-  for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-    for (int k=0; k < 12; k++) s += A[12*k+i]*B[12*k+j]; C[12*i+j] = s; } }
-
 // build per-body Mb (12x12), Nb (12 x nfree, stored 12x12), nfree, zadr from the joint constraint. Returns Nz.
 // hinge child: constraint Cb*cp_b = Cp*cp_parent -> Mb = Cb^+ Cp, Nb = null(Cb). static hinge: Cp=0 -> Mb=0.
 // free body (no joint): Nb = I, nfree=12, Mb=0.
@@ -1004,22 +996,6 @@ static mjtNum ipc_reduceGrad(const ipcAffine* aff, int naff, const mjtNum* g, mj
   return sqrt(gn);
 }
 
-// per-TREE preconditioner apply: zz = (tree block of H_z)^-1 r, one block per connected articulated tree
-// (a root with jparent<0 plus its descendants -- a contiguous z range). Per-body blocks miss the joint
-// coupling; the whole-tree block captures it, so for a single tree this is the exact factor (CG ~1 iter).
-// The factors are packed in bjf (sum of ntz^2 <= Nz^2); roots are visited in the same order when factoring.
-static void ipc_treeJacobi(const ipcAffine* aff, int naff, int Nz, const mjtNum* bjf, const mjtNum* r, mjtNum* zz) {
-  int off = 0;
-  for (int a=0; a < naff; a++) if (aff[a].jparent < 0) {
-    int za = aff[a].zadr, zb = Nz;
-    for (int b=a+1; b < naff; b++) if (aff[b].jparent < 0) { zb = aff[b].zadr; break; }
-    int ntz = zb - za;
-    mju_cholSolve(zz+za, bjf+off, r+za, ntz);
-    off += ntz*ntz;
-  }
-}
-
-
 // ===== UNIFIED solver: one preconditioned CG over reduced coords u = [u_na ; u_z] ======================
 // u_na = the non-affine (flex + free-point) maximal DOF [0,Nna), mapped 1:1. u_z = the affine reduced DOF
 // (Nz, joints eliminated). The map T: maximal dx[N] = T u is identity on [0,Nna) and the Nb/Mb tree map on
@@ -1052,57 +1028,80 @@ static void ipc_crbAdjoint(const ipcAffine* aff, int naff, const mjtNum* f /*12*
       outz[z0+j] = s; } }
 }
 
-// assemble the reduced affine Hessian H_z (CRB composite tree pass) from per-body 12x12 H, then factor it
-// per connected tree into bjf (for the per-tree preconditioner). Hbar is 144*naff scratch.
-static void ipc_crbHessian(const ipcAffine* aff, int naff, int Nz, const mjtNum* H /*144*naff*/,
-                           mjtNum* Hz /*Nz*Nz*/, mjtNum* Hbar /*144*naff*/, mjtNum* bjf) {
-  for (size_t i=0; i < (size_t)Nz*Nz; i++) Hz[i] = 0;
-  for (int a=0; a < naff; a++) for (int i=0; i < 144; i++) Hbar[144*a+i] = H[144*a+i];
-  for (int a=naff-1; a >= 0; a--) {                       // backward composite into parents
-    const ipcAffine* af = &aff[a]; int pa = af->jparent; if (pa < 0) continue;
-    mjtNum t[144], MtH[144];
-    ipc_mtm12(MtH, af->Mb, Hbar+144*a); ipc_mm12(t, MtH, af->Mb);
-    for (int i=0; i < 144; i++) Hbar[144*pa+i] += t[i];
-  }
-  for (int a=0; a < naff; a++) {                          // diag + ancestor off-diag blocks
-    const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr;
-    mjtNum HN[144];
+// ABA/Featherstone two-sweep FACTORIZATION of the reduced affine Hessian (tree-structured): O(naff*12^3)
+// rather than the dense O(Nz^3) Cholesky -- and it never forms the off-diagonal ancestor blocks. The per-body
+// H is block diagonal, so eliminating a body's free DOF folds a Schur complement into its parent's composite.
+// Bottom-up (children first). Per body: P (composite 12x12, scratch), D = N^T P N (factored pivot, nf x nf),
+// A = N^T P M (nf x 12), K = D^-1 A (nf x 12). D/A/K feed ipc_crbApply.
+static void ipc_crbFactor(const ipcAffine* aff, int naff, const mjtNum* H,
+                          mjtNum* P /*144*naff*/, mjtNum* D /*144*naff*/,
+                          mjtNum* A /*144*naff*/, mjtNum* K /*144*naff*/) {
+  for (int a=0; a < naff; a++) for (int i=0; i < 144; i++) P[144*a+i] = H[144*a+i];   // P init = H_a
+  for (int a=naff-1; a >= 0; a--) {
+    const ipcAffine* af = &aff[a]; int nf = af->nfree, pa = af->jparent;
+    const mjtNum* Pa = P + 144*a;
+    mjtNum PN[144];                                          // PN = P N  (12 x nf)
     for (int i=0; i < 12; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
-      for (int k=0; k < 12; k++) s += Hbar[144*a+12*i+k]*af->Nb[12*k+j]; HN[12*i+j] = s; }
+      for (int k=0; k < 12; k++) s += Pa[12*i+k]*af->Nb[12*k+j]; PN[12*i+j] = s; }
+    mjtNum* Da = D + 144*a;                                  // D = N^T (P N)  (nf x nf), factored
     for (int i=0; i < nf; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
-      for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*HN[12*k+j]; Hz[(size_t)(z0+i)*Nz+(z0+j)] = s; }
-    mjtNum acc[144];
-    for (int i=0; i < nf; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-      for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*Hbar[144*a+12*k+j]; acc[12*i+j] = s; }
-    int cur = a;
-    while (aff[cur].jparent >= 0) {
-      const ipcAffine* afc = &aff[cur]; int anc = afc->jparent;
-      mjtNum acc2[144];
+      for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*PN[12*k+j]; Da[nf*i+j] = s; }
+    mju_cholFactor(Da, nf, 1e-9);
+    if (pa >= 0) {
+      mjtNum PM[144];                                        // PM = P M  (12 x 12)
+      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
+        for (int k=0; k < 12; k++) s += Pa[12*i+k]*af->Mb[12*k+j]; PM[12*i+j] = s; }
+      mjtNum* Aa = A + 144*a;                                // A = N^T (P M)  (nf x 12)
       for (int i=0; i < nf; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-        for (int k=0; k < 12; k++) s += acc[12*i+k]*afc->Mb[12*k+j]; acc2[12*i+j] = s; }
-      for (int i=0; i < 144; i++) acc[i] = acc2[i];
-      const ipcAffine* afa = &aff[anc]; int naf = afa->nfree, za = afa->zadr;
-      for (int i=0; i < nf; i++) for (int j=0; j < naf; j++) { mjtNum s = 0;
-        for (int k=0; k < 12; k++) s += acc[12*i+k]*afa->Nb[12*k+j];
-        Hz[(size_t)(z0+i)*Nz+(za+j)] = s; Hz[(size_t)(za+j)*Nz+(z0+i)] = s; }
-      cur = anc;
+        for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*PM[12*k+j]; Aa[12*i+j] = s; }
+      mjtNum* Ka = K + 144*a;                                // K = D^-1 A  (nf x 12), solved column-wise
+      for (int j=0; j < 12; j++) { mjtNum col[12], sol[12];
+        for (int i=0; i < nf; i++) col[i] = Aa[12*i+j]; mju_cholSolve(sol, Da, col, nf);
+        for (int i=0; i < nf; i++) Ka[12*i+j] = sol[i]; }
+      mjtNum* Pp = P + 144*pa;                               // parent composite: Pp += M^T P M - A^T K
+      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) {
+        mjtNum mtpm = 0; for (int k=0; k < 12; k++) mtpm += af->Mb[12*k+i]*PM[12*k+j];
+        mjtNum atk = 0;  for (int k=0; k < nf; k++) atk  += Aa[12*k+i]*Ka[12*k+j];
+        Pp[12*i+j] += mtpm - atk;
+      }
     }
   }
-  { int off = 0;                                          // per-tree Cholesky factors
-    for (int a=0; a < naff; a++) if (aff[a].jparent < 0) {
-      int za = aff[a].zadr, zb = Nz;
-      for (int b=a+1; b < naff; b++) if (aff[b].jparent < 0) { zb = aff[b].zadr; break; }
-      int ntz = zb - za;
-      for (int i=0; i < ntz; i++) for (int j=0; j < ntz; j++) bjf[off + i*ntz+j] = Hz[(size_t)(za+i)*Nz + (za+j)];
-      mju_cholFactor(bjf+off, ntz, 1e-9);
-      off += ntz*ntz; } }
 }
 
-// block-diagonal preconditioner apply: z = M^-1 r.  na block = IC(0) (sp), affine block = per-tree factor.
+// apply z = H_z^-1 r via the tree factorization (two sweeps). Backward (children first): G_a = N^T s_a + r_a,
+// e_a = D_a^-1 G_a, fold s_p += M^T s_a - A^T e_a. Forward (parents first): z_a = e_a - K_a dcp_p,
+// dcp_a = M dcp_p + N z_a. e_a is stashed in z[zadr..] between the sweeps; s and dcp are 12*naff scratch.
+static void ipc_crbApply(const ipcAffine* aff, int naff, const mjtNum* D, const mjtNum* A, const mjtNum* K,
+                         const mjtNum* r, mjtNum* z, mjtNum* s, mjtNum* dcp) {
+  for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) s[12*a+i] = 0;
+  for (int a=naff-1; a >= 0; a--) {
+    const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr, pa = af->jparent;
+    const mjtNum* sa = s + 12*a; mjtNum* ea = z + z0;
+    mjtNum G[12];
+    for (int i=0; i < nf; i++) { mjtNum t = 0; for (int k=0; k < 12; k++) t += af->Nb[12*k+i]*sa[k]; G[i] = t + r[z0+i]; }
+    mju_cholSolve(ea, D + 144*a, G, nf);
+    if (pa >= 0) { mjtNum* sp = s + 12*pa; const mjtNum* Aa = A + 144*a;
+      for (int i=0; i < 12; i++) { mjtNum mts = 0; for (int k=0; k < 12; k++) mts += af->Mb[12*k+i]*sa[k];
+        mjtNum ate = 0; for (int k=0; k < nf; k++) ate += Aa[12*k+i]*ea[k];
+        sp[i] += mts - ate; } }
+  }
+  for (int a=0; a < naff; a++) {
+    const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr, pa = af->jparent;
+    mjtNum* za = z + z0;
+    if (pa >= 0) { const mjtNum* Ka = K + 144*a; const mjtNum* dp = dcp + 12*pa;
+      for (int i=0; i < nf; i++) { mjtNum t = 0; for (int k=0; k < 12; k++) t += Ka[12*i+k]*dp[k]; za[i] -= t; } }
+    mjtNum* dca = dcp + 12*a;
+    for (int i=0; i < 12; i++) { mjtNum t = 0; for (int j=0; j < nf; j++) t += af->Nb[12*i+j]*za[j];
+      if (pa >= 0) for (int k=0; k < 12; k++) t += af->Mb[12*i+k]*dcp[12*pa+k]; dca[i] = t; }
+  }
+}
+
+// block-diagonal preconditioner apply: z = M^-1 r.  na block = IC(0) (sp), affine block = tree factor (D/A/K).
 static void ipc_uPrecond(const ipcSparse* sp, int Nna, const ipcAffine* aff, int naff, int Nz,
-                         const mjtNum* bjf, const mjtNum* r, mjtNum* z) {
+                         const mjtNum* D, const mjtNum* A, const mjtNum* K, mjtNum* s, mjtNum* dcp,
+                         const mjtNum* r, mjtNum* z) {
   if (Nna > 0) ipc_icApply(sp, z, r);
-  if (Nz > 0)  ipc_treeJacobi(aff, naff, Nz, bjf, r + Nna, z + Nna);
+  if (Nz > 0)  ipc_crbApply(aff, naff, D, A, K, r + Nna, z + Nna, s, dcp);
 }
 
 // reduced matvec Hp = (T^T H T) p:  expand p->dxm via T, apply maximal H (ipc_applyH), reduce via T^T.
@@ -1128,7 +1127,8 @@ static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
 static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
                       const ipcAffine* aff, int naff, const ipcSparse* sp, const mjtNum* mdiag,
                       int ne, const ipcElem* elems, const mjtNum* estr, const ipcCC* ccache, int nacon,
-                      const mjtNum* affH, const mjtNum* bjf, const mjtNum* gz,
+                      const mjtNum* affH, const mjtNum* D, const mjtNum* A, const mjtNum* K,
+                      mjtNum* sfac, mjtNum* dcp, const mjtNum* gz,
                       mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol,
                       mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
   int Nu = Nna + Nz;
@@ -1137,7 +1137,7 @@ static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
   for (int i=0; i < Nu; i++) usol[i] = 0;
   mjtNum r0 = 0; for (int i=0; i < Nu; i++) r0 += r[i]*r[i];
   if (r0 < 1e-30) { for (int i=0; i < N; i++) dx[i] = 0; return 0; }
-  ipc_uPrecond(sp, Nna, aff, naff, Nz, bjf, r, z);
+  ipc_uPrecond(sp, Nna, aff, naff, Nz, D, A, K, sfac, dcp, r, z);
   mjtNum rz = 0; for (int i=0; i < Nu; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
   int it = 0;
   for (; it < 200; it++) {   // matches the old ipc_pcg cap -> naff==0 is bit-identical to the flex PCG
@@ -1147,7 +1147,7 @@ static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
     mjtNum alpha = rz/pHp, rr = 0;
     for (int i=0; i < Nu; i++) { usol[i] += alpha*p[i]; r[i] -= alpha*Hp[i]; rr += r[i]*r[i]; }
     if (rr < 1e-8*r0) break;
-    ipc_uPrecond(sp, Nna, aff, naff, Nz, bjf, r, z);
+    ipc_uPrecond(sp, Nna, aff, naff, Nz, D, A, K, sfac, dcp, r, z);
     mjtNum rznew = 0; for (int i=0; i < Nu; i++) rznew += r[i]*z[i];
     mjtNum beta = rznew/rz; rz = rznew;
     for (int i=0; i < Nu; i++) p[i] = z[i] + beta*p[i];
@@ -2108,17 +2108,20 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // GENUINE reduced-coordinate solve for jointed-affine, no-flex scenes (humanoid, pendulums): the free DOFs
   // z are the only unknowns (useCRB computed above). Per-body Mb/Nb derived once; the reduced Hessian is
   // assembled per-body by a composite (CRB) tree pass and factored directly. flex/free-affine -> PCG below.
-  int Nz = 0; mjtNum *crbHz = NULL, *crbGz = NULL, *crbHbar = NULL, *crbAdj = NULL,
-                     *crbHp = NULL, *crbHc = NULL, *crbBJ = NULL;
+  int Nz = 0; mjtNum *crbGz = NULL, *crbAdj = NULL, *crbHp = NULL, *crbHc = NULL,
+                     *crbP = NULL, *crbD = NULL, *crbA = NULL, *crbK = NULL, *crbS = NULL, *crbDcp = NULL;
   if (naff > 0) {
     Nz = ipc_buildReduction(aff, naff);
-    crbHz  = (mjtNum*) mju_malloc((size_t)Nz*Nz*sizeof(mjtNum));   // reduced affine Hessian (precond assembly)
     crbGz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));      // affine reduced gradient RHS (gz)
-    crbHbar= (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// CRB composite scratch
-    crbAdj = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // tree adjoint scratch
+    crbAdj = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // matvec tree adjoint scratch
     crbHp  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body H = affH + contact
     crbHc  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body contact Hessian
-    crbBJ  = (mjtNum*) mju_malloc((size_t)Nz*Nz*sizeof(mjtNum));   // per-tree preconditioner factors (sum ntz^2 <= Nz^2)
+    crbP   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// ABA composite (factor scratch)
+    crbD   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body pivot factors D
+    crbA   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body A = N^T P M
+    crbK   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body K = D^-1 A
+    crbS   = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp-space accumulator)
+    crbDcp = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp increments)
   }
   int nact0 = 0, nlt02 = 0, nlt06 = 0;   // active contacts at iter 0: total, ratio<0.2, ratio<0.6 (kappa adapt)
   for (int it=0; it < 40 && N > 0; it++) {
@@ -2247,10 +2250,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mjtNum ctol = (naff > 0) ? 1e-6 : 1e-7;
     if (gnorm < ctol*g0 + 1e-9) break;
     // ONE solver: per-tree affine preconditioner factors (from inertia+ortho+contact), then the unified PCG.
-    if (naff > 0) ipc_crbHessian(aff, naff, Nz, crbHp, crbHz, crbHbar, crbBJ);
+    if (naff > 0) ipc_crbFactor(aff, naff, crbHp, crbP, crbD, crbA, crbK);
     if (Nna > 0) ipc_ic0(&sp, 1e-9);                          // incomplete-LDL^T factor (signed pivots)
     ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, estr, ccache, nacon,
-               affH, crbBJ, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj);
+               affH, crbD, crbA, crbK, crbS, crbDcp, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
     for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
                                   if (n2 > maxdx) maxdx = n2; }
@@ -2373,8 +2376,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   mju_free(qoA); mju_free(qnA);
   d->time += h;
-  if (naff > 0) { mju_free(crbHz); mju_free(crbGz); mju_free(crbHbar);
-                mju_free(crbAdj); mju_free(crbHp); mju_free(crbHc); mju_free(crbBJ); }
+  if (naff > 0) { mju_free(crbGz); mju_free(crbAdj); mju_free(crbHp); mju_free(crbHc);
+                mju_free(crbP); mju_free(crbD); mju_free(crbA); mju_free(crbK); mju_free(crbS); mju_free(crbDcp); }
   if (Nna > 0) ipc_spFree(&sp);
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
