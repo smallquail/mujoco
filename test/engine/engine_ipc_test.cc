@@ -44,40 +44,6 @@ static mjModel* Load(const char* xml) {
 // id of the first geom in the model
 static int FirstGeom(const mjModel* m) { return 0; }
 
-//---------------------------------- barrier ------------------------------------------------------
-
-// C-IPC offset barrier: zero outside the band, positive and increasing toward the surface
-TEST_F(IpcTest, BarrierShape) {
-  mjtNum ghat = 0.01;
-
-  // inactive at and beyond the support
-  EXPECT_EQ(mj_ipcBarrier(ghat, ghat, nullptr, nullptr), 0);
-  EXPECT_EQ(mj_ipcBarrier(2*ghat, ghat, nullptr, nullptr), 0);
-  EXPECT_EQ(mj_ipcBarrier(-0.001, ghat, nullptr, nullptr), 0);
-
-  // positive inside, larger closer to contact (g -> 0)
-  mjtNum b_far  = mj_ipcBarrier(0.8*ghat, ghat, nullptr, nullptr);
-  mjtNum b_mid  = mj_ipcBarrier(0.3*ghat, ghat, nullptr, nullptr);
-  mjtNum b_near = mj_ipcBarrier(0.01*ghat, ghat, nullptr, nullptr);
-  EXPECT_GT(b_far, 0);
-  EXPECT_GT(b_mid, b_far);
-  EXPECT_GT(b_near, b_mid);
-}
-
-// barrier 1st/2nd derivatives match finite differences
-TEST_F(IpcTest, BarrierDerivatives) {
-  mjtNum ghat = 0.01, eps = 1e-7;
-  for (mjtNum frac : {0.2, 0.5, 0.8, 0.95}) {
-    mjtNum g = frac*ghat, d1, d2;
-    mj_ipcBarrier(g, ghat, &d1, &d2);
-    mjtNum bp = mj_ipcBarrier(g + eps, ghat, nullptr, nullptr);
-    mjtNum bm = mj_ipcBarrier(g - eps, ghat, nullptr, nullptr);
-    mjtNum b0 = mj_ipcBarrier(g, ghat, nullptr, nullptr);
-    EXPECT_NEAR(d1, (bp - bm)/(2*eps), 1e-4*mju_max(1.0, std::fabs(d1))) << "frac " << frac;
-    EXPECT_NEAR(d2, (bp - 2*b0 + bm)/(eps*eps), 1e-2*mju_max(1.0, std::fabs(d2))) << "frac " << frac;
-  }
-}
-
 //---------------------------------- element distances --------------------------------------------
 
 // point-triangle distance: interior (perpendicular), edge region, vertex region

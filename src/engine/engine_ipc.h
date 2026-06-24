@@ -23,14 +23,13 @@
 extern "C" {
 #endif
 
-// IPC variational integrator (prototype, mjINT_IPC): owns the full step. Minimizes the per-step
-// incremental potential (inertia + flex elastic penalty + C-IPC contact barriers) by projected
-// Newton with a step-capped line search. Currently supports a single 2D flex with self-contact
-// (vertex-triangle + edge-edge) and flex-vs-static-geom contact; falls back to Euler otherwise.
+// IPC variational integrator (mjINT_IPC): owns the full step. Minimizes the per-step incremental potential
+// (inertia + flex elastic energy + affine-body dynamics) with penetration-free contact by a barrier-free
+// augmented-Lagrangian method (no log barrier). Supports flex self-contact (vertex-triangle + edge-edge),
+// flex-vs-geom, affine-vs-geom, and affine-affine; falls back to Euler otherwise.
 MJAPI void mj_IPC(const mjModel* m, mjData* d);
 
 // Internal IPC kernels exposed for unit tests only (engine_ipc_test.cc); not a supported API.
-MJAPI mjtNum mj_ipcBarrier(mjtNum g, mjtNum ghat, mjtNum* d1, mjtNum* d2);
 MJAPI mjtNum mj_ipcPtTri(const mjtNum* p, const mjtNum* a, const mjtNum* b, const mjtNum* c);
 MJAPI mjtNum mj_ipcSegSeg(const mjtNum* p1, const mjtNum* p2, const mjtNum* q1, const mjtNum* q2);
 MJAPI mjtNum mj_ipcGeomDist(const mjModel* m, const mjData* d, int gi, const mjtNum* x, mjtNum* n);

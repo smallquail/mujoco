@@ -1989,7 +1989,10 @@ void mj_step(const mjModel* m, mjData* d) {
   // for the light flex vertices and double-count the elasticity the IPC solve adds implicitly.
   if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
     int saved = m->opt.disableflags;
-    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING;
+    // also disable DAMPER: with BOTH spring+damper off, mj_passive early-returns (engine_passive.c:981) so the flex
+    // elastic+damper do NOT leak into qacc_smooth -> x~. (Disabling only SPRING did not work: mj_flexPassiveStretch
+    // ignores its enbl_spring/enbl_damper flags, so the early-return is the reliable way to keep x~ = inertia+gravity.)
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING | mjDSBL_DAMPER;
     mj_forward(m, d);
     ((mjModel*) m)->opt.disableflags = saved;
   } else {
