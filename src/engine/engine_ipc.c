@@ -529,6 +529,12 @@ typedef struct { int vg[3], fv[3]; mjtNum M[6]; mjtNum Lr2[3];
                  mjtNum kD;        // Rayleigh damping coefficient = flex_damping/h (constant)
                  mjtNum ep[3];     // elongations e_a at the previous step (xold), refreshed each step
                } ipcElem;
+// One bending "flap" (an interior edge + the two opposite triangle apexes): the 4 flex vertices (global vg,
+// free-dof fv, -1 if pinned) and the constant 4x4 quadratic-bending operator Q (MuJoCo's precomputed
+// flex_bending; Wardetzky/Garg "Discrete Quadratic Curvature"/"Cubic Shells"). Flat-rest assumption -> the
+// curved-reference term b[17e+16] is dropped. Energy 1/2 x^T (Q (x) I3) x, force/Hessian = Q (x) I3 -- constant,
+// PSD by construction (rank-1 Q = cos*stiffness*c c^T; concave-rest edges with trace(Q)<0 are skipped at setup).
+typedef struct { int vg[4], fv[4]; mjtNum Q[16]; mjtNum b16; } ipcBend;
 static const int ipc_eedge[3][2] = {{1, 2}, {2, 0}, {0, 1}};   // local edges (== engine_passive's)
 static inline mjtNum ipc_Mab(const mjtNum* M6, int a, int b) {
   static const int id[3][3] = {{0,1,2},{1,3,4},{2,4,5}};   // 3x3 symmetric from 6 upper-tri entries
@@ -1216,6 +1222,7 @@ static mjtNum ipc_affineContactCCD(const mjModel* m, const mjData* d, const ipcA
 
 static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
                        int nelem, const ipcElem* elems, const mjtNum* estr,
+                       int nbe, const ipcBend* bends,
                        const ipcCC* ccache, int nacon,
                        int naff, const ipcAffine* aff, const mjtNum* affH) {
   for (int i=0; i < N; i++) Hp[i] = mdiag[i]*p[i];
@@ -1238,10 +1245,19 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
     }
     for (int a=0; a < 3; a++) {
       mjtNum ca = 2.0*(1.0+el->kD)*(ipc_Mab(el->M,a,0)*s[0] + ipc_Mab(el->M,a,1)*s[1] + ipc_Mab(el->M,a,2)*s[2]);
-      mjtNum me = es[9+a];                                 // geometric tension (Me_eff, damped)
+      mjtNum me = es[9+a] > 0.0 ? es[9+a] : 0.0;           // (b) clamp compressive geom -> SPD operator
+                                                           // (match the assembled max(Me,0) clamp; was full Me)
       int p0 = el->fv[ipc_eedge[a][0]], p1 = el->fv[ipc_eedge[a][1]];
       if (p0 >= 0) for (int k=0; k < 3; k++) Hp[3*p0+k] += ca*es[3*a+k] + me*rel[a][k];
       if (p1 >= 0) for (int k=0; k < 3; k++) Hp[3*p1+k] -= ca*es[3*a+k] + me*rel[a][k];
+    }
+  }
+  for (int bt=0; bt < nbe; bt++) {                         // bending: constant 4x4 Q (x) I3 per flap (matrix-free)
+    const ipcBend* bn = &bends[bt]; const mjtNum* Q = bn->Q;
+    for (int i=0; i < 4; i++) { int fi = bn->fv[i]; if (fi < 0) continue;
+      for (int k=0; k < 3; k++) { mjtNum s = 0;
+        for (int j=0; j < 4; j++) { int fj = bn->fv[j]; if (fj < 0) continue; s += Q[4*i+j]*p[3*fj+k]; }
+        Hp[3*fi+k] += s; }
     }
   }
   for (int c=0; c < nacon; c++) {
@@ -1255,10 +1271,9 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
   }
 }
 
-// sparse symmetric Hessian for the block-Jacobi preconditioner: lower-tri CSR pattern + values. Built by
-// ipc_spBuild below mj_IPC; ipc_jacobiApply reads the per-vertex 3x3 diagonal blocks. The off-diagonal
-// entries are still assembled but no longer read (the matvec is matrix-free and IC0 is gone) -- a candidate
-// for reduction to diagonal-only blocks, which would also drop the pattern qsort in ipc_spBuild.
+// sparse Hessian for the block-Jacobi preconditioner: per-vertex 3x3 diagonal blocks only (lower-tri CSR,
+// 6 entries/vertex). Built by ipc_spBuild below mj_IPC; ipc_jacobiApply reads these blocks. Inter-vertex
+// couplings are applied matrix-free in ipc_applyH, so they are not stored (IC0, their only consumer, is gone).
 typedef struct {
   int N, nnz;
   int *rownnz, *rowadr, *colind;          // lower-tri CSR pattern
@@ -1458,17 +1473,18 @@ static void ipc_uPrecond(const ipcSparse* sp, int Nna, const ipcAffine* aff, int
 // reduced matvec Hp = (T^T H T) p:  expand p->dxm via T, apply maximal H (ipc_applyH), reduce via T^T.
 static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
                         const ipcAffine* aff, int naff, const mjtNum* mdiag, int ne, const ipcElem* elems,
+                        int nbe, const ipcBend* bends,
                         const mjtNum* estr, const ipcCC* ccache, int nacon, const mjtNum* affH,
                         mjtNum* dxm, mjtNum* Hpm, mjtNum* adj, const mjtNum* jntDiag) {
   if (naff == 0) {   // pure flex: no reduction, apply the maximal matrix-free Hessian directly (== old ipc_pcg)
-    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, ccache, nacon, 0, aff, affH); return;
+    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon, 0, aff, affH); return;
   }
   for (int i=0; i < Nna; i++) dxm[i] = p[i];                    // expand: na identity
   if (naff > 0) {                                               // affine: forward tree map (dcp in Hpm scratch)
     ipc_crbForward(aff, naff, p + Nna, Hpm);
     for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dxm[Nna+12*a+i] = Hpm[12*a+i];
   }
-  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, ccache, nacon, naff, aff, affH);
+  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon, naff, aff, affH);
   for (int i=0; i < Nna; i++) Hp[i] = Hpm[i];                   // reduce: na identity
   if (naff > 0) ipc_crbAdjoint(aff, naff, Hpm + Nna, Hp + Nna, adj);   // affine: adjoint tree map
   if (jntDiag) for (int i=0; i < Nz; i++) Hp[Nna+i] += jntDiag[i]*p[Nna+i];   // implicit joint passive: reduced-Hessian diagonal
@@ -1478,7 +1494,7 @@ static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
 // ipc_reduceGrad). bjf = prebuilt per-tree factors. Writes the maximal Newton direction dx[N].
 static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
                       const ipcAffine* aff, int naff, const ipcSparse* sp, const mjtNum* mdiag,
-                      int ne, const ipcElem* elems, const mjtNum* estr, const ipcCC* ccache, int nacon,
+                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends, const mjtNum* estr, const ipcCC* ccache, int nacon,
                       const mjtNum* affH, const mjtNum* D, const mjtNum* A, const mjtNum* K,
                       mjtNum* sfac, mjtNum* dcp, const mjtNum* gz,
                       mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol,
@@ -1493,7 +1509,7 @@ static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
   mjtNum rz = 0; for (int i=0; i < Nu; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
   int it = 0;
   for (; it < 200; it++) {   // matches the old ipc_pcg cap -> naff==0 is bit-identical to the flex PCG
-    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, estr, ccache, nacon, affH, dxm, Hpm, adj, jntDiag);
+    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, nbe, bends, estr, ccache, nacon, affH, dxm, Hpm, adj, jntDiag);
     mjtNum pHp = 0; for (int i=0; i < Nu; i++) pHp += p[i]*Hp[i];
     if (pHp <= 1e-30) break;
     mjtNum alpha = rz/pHp, rr = 0;
@@ -1527,9 +1543,28 @@ static mjtNum ipc_stretchEnergy(int nelem, const ipcElem* elems, const mjtNum* x
   return E;
 }
 
+// quadratic bending energy: sum over flaps of 1/2 x^T (Q (x) I3) x (Q the constant per-edge bending operator).
+static mjtNum ipc_bendEnergy(int nbe, const ipcBend* bends, const mjtNum* x) {
+  mjtNum E = 0;
+  for (int t=0; t < nbe; t++) {
+    const ipcBend* bn = &bends[t]; const mjtNum* Q = bn->Q;
+    for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) { mjtNum q = Q[4*i+j]; if (q == 0) continue;
+      for (int k=0; k < 3; k++) E += 0.5*q*x[3*bn->vg[i]+k]*x[3*bn->vg[j]+k]; }
+    if (bn->b16 != 0) {   // curved-reference: E += b16 * det[ed0,ed1,ed2], ed_a = x[v_{a+1}] - x[v0] (gradient = b16*frc)
+      const mjtNum* x0 = x + 3*bn->vg[0]; mjtNum ed[3][3];
+      for (int a=0; a < 3; a++) { const mjtNum* xa = x + 3*bn->vg[a+1];
+        for (int k=0; k < 3; k++) ed[a][k] = xa[k] - x0[k]; }
+      mjtNum cr[3]; mju_cross(cr, ed[1], ed[2]);   // ed1 x ed2
+      E += bn->b16 * (ed[0][0]*cr[0] + ed[0][1]*cr[1] + ed[0][2]*cr[2]);
+    }
+  }
+  return E;
+}
+
 static void ipc_hingeTheta(const ipcAffine* aff, int naff, const mjtNum* bquat,
                            const mjtNum* xold, const mjtNum* x, mjtNum* qoA, mjtNum* qnA, mjtNum* thOut);
 static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, const ipcElem* elems,
+                         int nbe, const ipcBend* bends,
                          const mjtNum* x, const mjtNum* xtil, const int* fidx, const mjtNum* mass,
                          mjtNum h, mjtNum r, const mjtNum* rad, mjtNum ghat, mjtNum kappa,
                          const mjtNum* gv, const mjtNum* ge, const ipcCon* acon, int nacon,
@@ -1560,6 +1595,7 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
     }
   }
   E += ipc_stretchEnergy(nelem, elems, x);
+  E += ipc_bendEnergy(nbe, bends, x);
   for (int c=0; c < nacon; c++) {
     // AL penalty energy E = 0.5*scale*d^2 over the slack-baked d: exact parity with
     // ipc_try's gradient. d = c_raw - s - lam/mu, scale = pow(IPC_DECAY, cnt-exp)*mu_pair. Keep mj's dashpot energy.
@@ -1767,89 +1803,24 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
 }
 
 // ---------------------------------------------------------------------------------------------------
-// Sparse symmetric Hessian helpers (struct ipcSparse declared above ipc_pcg). Lower-triangular CSR,
-// colind sorted ascending per row, diagonal last. ipc_jacobiApply reads the per-vertex 3x3 diagonal blocks.
-static int ipc_cmpll(const void* a, const void* b) {
-  long long x = *(const long long*)a, y = *(const long long*)b;
-  return x < y ? -1 : (x > y ? 1 : 0);
-}
-
-// add coupling between free-dof nodes fi, fj (a full 3x3 block) to the lower-triangular key list
-static void ipc_addBlock(long long* key, int* nk, int fi, int fj, int N) {
-  if (fi < 0 || fj < 0) return;
-  for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
-    int I = 3*fi+a, J = 3*fj+b;
-    if (J <= I) key[(*nk)++] = (long long)I*N + J;
-  }
-}
-
-// build the lower-tri CSR pattern + column structure from mesh elements + candidate contacts
-static void ipc_spBuild(const mjModel* m, ipcSparse* sp, int N, int ne, const ipcElem* elems,
-                        int ncand, const ipcCon* cand, const mjtNum* cgap, const mjtNum* rad,
-                        mjtNum ghat, const int* fidx, int naff, const ipcAffine* aff, const mjtNum* gam) {
+// Sparse Hessian for the block-Jacobi preconditioner: per-vertex 3x3 diagonal blocks ONLY (lower-tri CSR,
+// 6 entries/vertex). ipc_jacobiApply reads exactly these blocks; the inter-vertex (membrane/contact)
+// couplings are applied matrix-free in ipc_applyH, so they need no storage now that IC0 (their only
+// consumer) is gone. Building just the block-diagonal pattern is O(N) -- no key list, no qsort, no merge.
+static void ipc_spBuild(ipcSparse* sp, int N) {
   sp->N = N;
-  // mesh+diagonal sorted-unique keys: a pure function of the model, rebuilt each step so the integrator
-  // stays stateless (no cross-call globals -> reset/thread/multi-model safe). The active-only contact
-  // pattern keeps the per-step cost small; a model-keyed cache is the fallback only if this ever shows up.
-  int mcap = N + 81*ne + 144*naff + 1;   // affine clique: 16 blocks/body * up to 9 lower-tri keys each
-  long long* mk = (long long*) mju_malloc(mcap*sizeof(long long));
-  int nmk = 0;
-  for (int i=0; i < N; i++) mk[nmk++] = (long long)i*N + i;          // diagonal
-  for (int t=0; t < ne; t++) for (int i=0; i < 3; i++) for (int j=0; j < 3; j++)
-    ipc_addBlock(mk, &nmk, elems[t].fv[i], elems[t].fv[j], N);       // membrane: element verts
-  for (int a=0; a < naff; a++) for (int i=0; i < 4; i++) for (int j=0; j < 4; j++)   // affine 4-cp clique:
-    if (aff[a].sdof[i] >= 0 && aff[a].sdof[i] < N && aff[a].sdof[j] >= 0 && aff[a].sdof[j] < N)  // skipped here
-      ipc_addBlock(mk, &nmk, aff[a].sdof[i]/3, aff[a].sdof[j]/3, N);   // (N==Nna; affine DOF >= Nna own a per-tree factor)
-  qsort(mk, nmk, sizeof(long long), ipc_cmpll);
-  int spNmk = 0; for (int i=0; i < nmk; i++) if (i==0 || mk[i] != mk[i-1]) mk[spNmk++] = mk[i];  // dedup in place
-  // contact keys (variable per step): collect + sort, then merge with the cached mesh keys
-  int ccap = 1; for (int c=0; c < ncand; c++) ccap += 144;
-  long long* ck = (long long*) mju_malloc(ccap*sizeof(long long));
-  int nck = 0;
-  for (int c=0; c < ncand; c++) {
-    // flex-vs-geom contacts (types 3,4) and point-vs-geom (type 2) couple only flex verts that already
-    // share a mesh element (or a single point), so their couplings are already in the mesh pattern -- skip.
-    // Types that couple nodes NOT sharing an element add new pattern entries and MUST be included: flex
-    // self-contact (0,1), sphere-vs-flex (0, sphere node <-> triangle), and sphere-vs-sphere (5).
-    if (cand[c].type >= 2 && cand[c].type != 5) continue;
-    mjtNum ghc = ipc_conGhat(&cand[c], rad, ghat);   // couple active + near-active contacts (within 2x their
-    if (cgap[c] >= 2.0*ghc) continue;                 // activation gap); far pairs skipped
-    (void)gam;   // NOTE: these off-diagonal couplings now feed only the sparse off-diagonals, which the
-                 // block-Jacobi preconditioner does not read (it uses the per-vertex 3x3 diagonal blocks).
-                 // Kept for now; sp is a candidate for reduction to diagonal-only blocks.
-    int v[4], nv; ipc_conVerts(&cand[c], v, &nv);   // skip couplings touching an affine DOF (fidx >= N/3==Nna/3):
-    for (int i=0; i < nv; i++) for (int j=0; j < nv; j++) {   // they are off the IC0 block (per-tree factor owns them)
-      int bi = fidx[v[i]], bj = fidx[v[j]];
-      if (bi >= 0 && bi < N/3 && bj >= 0 && bj < N/3) ipc_addBlock(ck, &nck, bi, bj, N);
-    }
-  }
-  qsort(ck, nck, sizeof(long long), ipc_cmpll);
-  // merge the two sorted lists into a sorted-unique key list (avoids re-sorting the big mesh list)
-  long long* key = (long long*) mju_malloc((spNmk + nck + 1)*sizeof(long long));
-  int nk = 0, ia = 0, ib = 0; long long prev = -1;
-  while (ia < spNmk || ib < nck) {
-    long long v = (ib >= nck || (ia < spNmk && mk[ia] <= ck[ib])) ? mk[ia++] : ck[ib++];
-    if (v != prev) { key[nk++] = v; prev = v; }
-  }
-  mju_free(ck); mju_free(mk);
-  // dedup -> nnz
-  int nnz = 0;
-  for (int i=0; i < nk; i++) if (i == 0 || key[i] != key[i-1]) nnz++;
+  int nv = N/3, nnz = 6*nv;   // N == Nna == 3*nfree; 6 lower-tri entries per 3x3 vertex block
   sp->nnz = nnz;
   sp->rownnz = (int*) mju_malloc(N*sizeof(int));
   sp->rowadr = (int*) mju_malloc(N*sizeof(int));
-  sp->colind = (int*) mju_malloc(nnz*sizeof(int));
-  sp->val    = (mjtNum*) mju_malloc(nnz*sizeof(mjtNum));
-  for (int i=0; i < N; i++) sp->rownnz[i] = 0;
+  sp->colind = (int*) mju_malloc((nnz > 0 ? nnz : 1)*sizeof(int));
+  sp->val    = (mjtNum*) mju_malloc((nnz > 0 ? nnz : 1)*sizeof(mjtNum));
   int e = 0;
-  for (int i=0; i < nk; i++) {
-    if (i > 0 && key[i] == key[i-1]) continue;
-    int row = (int)(key[i] / N), col = (int)(key[i] % N);
-    sp->colind[e] = col; sp->rownnz[row]++; e++;
+  for (int v=0; v < nv; v++) for (int c=0; c < 3; c++) {   // row 3v+c: lower-tri cols 3v..3v+c (diagonal last)
+    int r = 3*v + c;
+    sp->rowadr[r] = e; sp->rownnz[r] = c + 1;
+    for (int cc=0; cc <= c; cc++) sp->colind[e++] = 3*v + cc;
   }
-  sp->rowadr[0] = 0;
-  for (int i=1; i < N; i++) sp->rowadr[i] = sp->rowadr[i-1] + sp->rownnz[i-1];
-  mju_free(key);
 }
 
 static void ipc_spFree(ipcSparse* sp) {
@@ -2292,6 +2263,32 @@ void mj_IPC(const mjModel* m, mjData* d) {
       elems[et].kD = kD_k;
     }
   }
+  // bending flaps: read MuJoCo's precomputed quadratic operator Q from flex_bending (b[17e+4i+j]); flat-rest
+  // assumption -> drop the curved-reference b[17e+16]. Stencil v[4]={edge0,edge1,flap0,flap1}; skip boundary
+  // (v[3]==-1) and concave-rest (trace(Q)<0, rank-1 negative -> keeps each block PSD without a clamp).
+  int nbeMax = 0;
+  for (int k=0; k < nfd; k++) { int fi = flist[k];
+    if (m->flex_dim[fi] == 2 && m->flex_bendingadr[fi] >= 0) nbeMax += m->flex_edgenum[fi]; }
+  ipcBend* bends = (ipcBend*) mju_malloc((nbeMax > 0 ? nbeMax : 1)*sizeof(ipcBend));
+  int nbe = 0;
+  for (int k=0; k < nfd; k++) {
+    int fi = flist[k], badr = m->flex_bendingadr[fi];
+    if (m->flex_dim[fi] != 2 || badr < 0) continue;
+    int eadr = m->flex_edgeadr[fi], enum_k = m->flex_edgenum[fi];
+    const mjtNum* b = m->flex_bending + badr;
+    for (int e=0; e < enum_k; e++) {
+      const int* edge = m->flex_edge + 2*(eadr + e);
+      const int* flap = m->flex_edgeflap + 2*(eadr + e);
+      int v[4] = { edge[0], edge[1], flap[0], flap[1] };
+      if (v[3] == -1) continue;                                  // boundary edge: only one adjacent triangle
+      const mjtNum* Qe = b + 17*e;
+      if (Qe[0] + Qe[5] + Qe[10] + Qe[15] < 0) continue;         // trace(Q)<0: concave rest -> skip (PSD safe)
+      ipcBend* bn = &bends[nbe++];
+      for (int i=0; i < 4; i++) { int gp = fxadr[k] + v[i]; bn->vg[i] = gp; bn->fv[i] = fidx[gp]; }
+      for (int i=0; i < 16; i++) bn->Q[i] = Qe[i];
+      bn->b16 = Qe[16];   // curved-reference (Garg "Cubic Shells"): makes the curved rest the equilibrium
+    }
+  }
   int amax = npt*64 + 1024;                   // capacity of the active-contact list
   ipcCon* acon = (ipcCon*) mju_malloc(amax*sizeof(ipcCon));
   ipcCC* ccache = (ipcCC*) mju_malloc(amax*sizeof(ipcCC));
@@ -2529,7 +2526,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // affine block is preconditioned by its per-tree reduced-Hessian factor. (Both old paths -- the jointed
   // CRB direct solve and the flex PCG -- are special cases of ipc_solveU below.)
   int Nna = N - 12*naff;
-  if (Nna > 0) ipc_spBuild(m, &sp, Nna, ne, elems, ncand, cand, cgap, rad, ghat, fidx, naff, aff, gam);
+  if (Nna > 0) ipc_spBuild(&sp, Nna);   // per-vertex 3x3 block-diagonal pattern (block-Jacobi precond)
   // precompute element -> CSR scatter indices once per step (the pattern is fixed over the Newton loop), so
   // the per-Newton assembly avoids a binary-search ipc_spIdx per matrix entry. -1 marks skipped entries
   // (upper-tri or pinned vertex). Order matches the assembly loop: idx = (i*3+j)*9 + a*3+b.
@@ -2606,15 +2603,12 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // |x-xfree| grows, the re-query margin 4*maxstep (~line 2667) explodes the broad-phase (ncand 238k) and beta
   // collapses -> the contact-set-explosion NaN. We COMMIT xfree (line ~2724), keeping a single CCD-advanced
   // position, so tying x to the feasible base each iter costs nothing in committed motion and kills the divergence.
-  // Env MJ_IPC_FREEX=1 restores the old accumulating free-x for comparison.
-  if (getenv("MJ_IPC_FREEX") == NULL)   // restart the optimizer from the feasible base each Newton iter (both paths)
-    for (int i=0; i < 3*npt; i++) x[i] = xfree[i];
+  for (int i=0; i < 3*npt; i++) x[i] = xfree[i];   // restart the optimizer from the feasible base each Newton iter
   (void)minc; (void)appr; (void)gam; (void)actc;
-  // AFFINE held mask (UNCHANGED): hold distance-active candidates (ld0<ghat). FLEX: aheld is all-1 (the whole
-  // persistent set is assembled; the merge/aging is the active-set manager). Env MJ_IPC_HOLDALL restores affine-style.
+  // AFFINE held mask: hold distance-active candidates (ld0<ghat). FLEX: aheld is all-1 (the whole persistent set
+  // is assembled; the merge/aging is the active-set manager).
   if (naff > 0) {
-    int holdall = getenv("MJ_IPC_HOLDALL") != NULL;
-    for (int c=0; c < wn; c++) wheld[c] = (holdall || wcon[c].ld0 < ghat) ? 1 : 0;
+    for (int c=0; c < wn; c++) wheld[c] = (wcon[c].ld0 < ghat) ? 1 : 0;
   }
   // N2 update_slack (at x): materialize s[c] and the slack-baked d the assemble (ipc_try) / lambda use. Runs for
   // both paths so the shared flex/sphere contact bookkeeping is consistent (affine-specific contacts are separate).
@@ -2673,6 +2667,25 @@ void mj_IPC(const mjModel* m, mjData* d) {
         int base = t*81 + (i*3+j)*9;
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int id = escat[base + a*3+b]; if (id >= 0) sp.val[id] += He[3*i+a][3*j+b]; } }
+    }
+    // bending: grad += (Q (x) I3) x + b16*frc (curved-reference); add Q's diagonal to sp (block-Jacobi).
+    for (int bt=0; bt < nbe; bt++) {
+      const ipcBend* bn = &bends[bt]; const mjtNum* Q = bn->Q;
+      mjtNum frc[4][3] = {{0}};                              // b16 curved-reference force = grad of b16*det[ed]
+      if (bn->b16 != 0) {
+        const mjtNum* x0 = x + 3*bn->vg[0]; mjtNum ed[3][3];
+        for (int a=0; a < 3; a++) { const mjtNum* xa = x + 3*bn->vg[a+1];
+          for (int kc=0; kc < 3; kc++) ed[a][kc] = xa[kc] - x0[kc]; }
+        mju_cross(frc[1], ed[1], ed[2]); mju_cross(frc[2], ed[2], ed[0]); mju_cross(frc[3], ed[0], ed[1]);
+        for (int kc=0; kc < 3; kc++) frc[0][kc] = -(frc[1][kc] + frc[2][kc] + frc[3][kc]);
+      }
+      for (int i=0; i < 4; i++) { int fi = bn->fv[i]; if (fi < 0) continue;
+        for (int kc=0; kc < 3; kc++) { mjtNum g = bn->b16*frc[i][kc];
+          for (int j=0; j < 4; j++) g += Q[4*i+j]*x[3*bn->vg[j]+kc];
+          grad[3*fi+kc] += g; }
+        mjtNum qii = Q[4*i+i];
+        for (int kc=0; kc < 3; kc++) { int id = ipc_spIdx(&sp, 3*fi+kc, 3*fi+kc); if (id >= 0) sp.val[id] += qii; }
+      }
     }
     // affine bodies: inertia + FULL orthogonality Hessian (GN + geometric) -> affH (the matrix-free matvec =
     // true Newton operator). The geometric part is also saved (affHgeo) so the PRECONDITIONER can use the PD
@@ -2776,7 +2789,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
     // ONE solver: per-tree affine preconditioner factors (from inertia+ortho+contact), then the unified PCG.
     if (naff > 0) ipc_crbFactor(aff, naff, crbHp, crbP, crbD, crbA, crbK);
-    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, estr, ccache, nacon,
+    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, nbe, bends, estr, ccache, nacon,
                affH, crbD, crbA, crbK, crbS, crbDcp, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj,
                naff > 0 ? jntDiag : NULL);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
@@ -2812,7 +2825,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       if (wheld[c] && wgap[c] < ghat + lub) candLS[nls++] = wcon[c];   // assembled-set parity with the Newton Hessian
     }
     // N7 line search. E0 baseline over the same candidate subset (candLS) as the trials.
-    mjtNum E0 = ipc_energy(m, d, npt, ne, elems, x, xtil, fidx, mass, h, r, rad, ghat, kappa,
+    mjtNum E0 = ipc_energy(m, d, npt, ne, elems, nbe, bends, x, xtil, fidx, mass, h, r, rad, ghat, kappa,
                            gv, ge, candLS, nls, aff, naff, xold, xfree, qoA_ro, qnA_ro, thRO);
     mjtNum alpha = 1.0;
     int lsok = 0;
@@ -2824,7 +2837,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int i=0; i < 3*npt; i++) xn[i] = x[i];
       for (int v=0; v < npt; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      mjtNum Etr = ipc_energy(m, d, npt, ne, elems, xn, xtil, fidx, mass, h, r, rad, ghat, kappa,
+      mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat, kappa,
                               gv, ge, candLS, nls, aff, naff, xold, xfree, qoA_ro, qnA_ro, thRO);
       if (Etr <= E0 + 1e-12 || newton_converged) { lsok = 1; break; }
       alpha *= 0.5;
@@ -2912,8 +2925,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }   // OUTER loop close
   if (getenv("MJ_IPC_PROF")) {
     static long pstep = 0;
-    fprintf(stderr, "IPCPROF step=%ld outer=%d inner=%d pcg=%ld candbuilds=%d ncand=%d naff=%d nacon=%d beta=%.2e\n",
-            pstep++, prof_outer, prof_inner, g_pcgN, prof_cb, ncand, naff, prof_nacon, beta);
+    fprintf(stderr, "IPCPROF step=%ld outer=%d inner=%d pcg=%ld candbuilds=%d ncand=%d naff=%d nacon=%d nbe=%d beta=%.2e\n",
+            pstep++, prof_outer, prof_inner, g_pcgN, prof_cb, ncand, naff, prof_nacon, nbe, beta);
     fprintf(stderr, "        active(fc>0)=%ld of held=%d\n", g_nact, prof_nacon);
     int th[6] = {0,0,0,0,0,0}; for (int c=0; c < ncand; c++) if (cand[c].type>=0 && cand[c].type<6) th[cand[c].type]++;
     fprintf(stderr, "        cand-by-type: t0(sph-flex)=%d t1(EE)=%d t2(pt-geom)=%d t3(flex-geom)=%d t4=%d t5(sph-sph)=%d  sp.nnz=%d\n",
@@ -3011,7 +3024,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
                 mju_free(jntDiag); mju_free(thRO); mju_free(qoA_ro); mju_free(qnA_ro); }
   if (Nna > 0) ipc_spFree(&sp);
   mju_free(escat);
-  mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems);
+  mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems); mju_free(bends);
   mju_free(rad); mju_free(pbody); mju_free(pgeom); mju_free(pcp); mju_free(aff);
   mju_free(xpos_pred); mju_free(xquat_pred); mju_free(isAff); mju_free(bidx);
   mju_free(flist); mju_free(fxadr); mju_free(pt2vg); mju_free(pt2flex);
