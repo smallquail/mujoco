@@ -15,7 +15,7 @@
 // This integrator implements barrier-free augmented-Lagrangian (AL) penetration-free contact
 // (Li et al., arXiv:2512.12151): the log-barrier is replaced by an augmented Lagrangian
 // with a per-pair multiplier + active-set, and intersection-freedom is maintained by advancing
-// a CCD-bounded committed position. The rigid/articulated path uses affine-body dynamics.
+// a CCD-bounded committed position. Flex-only: 2D flex nodal IPC (the rigid/affine path was removed).
 
 #include "engine/engine_ipc.h"
 
@@ -27,12 +27,9 @@
 #include <mujoco/mjmodel.h>
 #include <mujoco/mjtype.h>
 #include "engine/engine_forward.h"      // mj_Euler (fallback)
-#include "engine/engine_util_blas.h"    // mju_dot3
-#include "engine/engine_util_solve.h"   // mju_cholFactor, mju_cholSolve (joint null-space projector)
+#include "engine/engine_util_blas.h"    // mju_dot3, mju_mulMatVec3
+#include "engine/engine_util_spatial.h" // mju_cross (flex bending)
 #include "engine/engine_util_errmem.h"  // mju_malloc, mju_free
-#include "engine/engine_util_spatial.h" // mju_mulQuat, mju_mat2Rot, mju_rotVecQuat (affine bodies)
-#include "engine/engine_core_smooth.h"  // mj_kinematics (affine predicted poses)
-#include "engine/engine_support.h"      // mj_integratePos (affine predicted poses)
 
 // point-triangle: distance, closest point cp, barycentric weights w of cp (for the barrier gradient)
 static mjtNum ipc_ptTri(const mjtNum* p, const mjtNum* a, const mjtNum* b, const mjtNum* c,
@@ -291,18 +288,10 @@ static int ipc_geomEdges(const mjModel* m, int gi, const mjtNum* gpos, const mjt
 // Contact STANDOFF: every active contact rests at a small positive gap delta = min(ghc, IPC_DELTACAP). The AL
 // multiplier holds the constraint there, so the MaxStepSize CCD always sees a positive gap (nonzero TOI, no lock)
 // and the committed trajectory stays STRICTLY intersection-free (no penetration). delta is a small geometric skin:
-// it shrinks for thin participants (ghc small -> thin cloth keeps its no-penetration guarantee) and is capped so
-// big affine bodies don't carry a fat layer. Same rule for flex and affine contacts.
+// it shrinks for thin participants (ghc small -> thin cloth keeps its no-penetration guarantee) and is capped
+// so thick participants don't carry a fat layer.
 #define IPC_DELTACAP 0.001   // 1 mm standoff cap
-#define IPC_JNTLIMIT_KAPPA 1.0e-4   // AL joint-limit stiffness kj = this*kappaO (kappaO = 1e4*I_rot/h^2). ~10x the
-                                     // per-body nominal 0.1*I_rot/h^2: a limit resists the descendant chain's torque
-                                     // (effective inertia >> body's own I_rot), so this converges it to ~0 in 1-2
-                                     // steps; the AL multiplier adapts, so kj only sets the transient ramp (1e-5 lags ~6deg).
-#define IPC_CDAMP_FLEX 0.1   // flex-contact normal dashpot coeff (cde = IPC_CDAMP_FLEX*m/h^2); affine uses 0.1
-#define IPC_DUAL_OMEGA 1.0   // AL dual-ascent over-relaxation (lam -= OMEGA*kappa*c): faster ramp -> fewer outer iters
-#define IPC_AFFINE_GEOM 1   // 1: full Newton (GN+geometric) affine Hessian; 0: Gauss-Newton only (test)
-                            // (GN-only ablation did NOT fix the ball-scene grind/NaN -> the affine geometric term is
-                            //  NOT the crucial difference. Reverted.)
+#define IPC_CDAMP_FLEX 0.1   // flex-contact normal dashpot coeff (cde = IPC_CDAMP_FLEX*m/h^2)
 // ---- augmented-Lagrangian (AL) solve (pure-flex path) parameters ----
 #define IPC_MU_SCALE_FEM 5e7   // per-vertex AL stiffness: mu_v = mass*IPC_MU_SCALE_FEM*h^2
 #define IPC_DECAY 0.3          // cnt-aging stiffness decay: scale = pow(IPC_DECAY,c)*mu
@@ -521,7 +510,7 @@ static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const 
 
 // cached per-contact data for the matrix-free Hessian apply: GN block = bdd * (cw[p]*n)(cw[q]*n)^T
 // over the involved free-dof indices f[0..nidx) (f<0 = pinned, skipped).
-typedef struct { mjtNum n[3], cw[8], bdd; int f[8], nidx; } ipcCC;   // up to 8 cps (affine-affine: 4 per body)
+typedef struct { mjtNum n[3], cw[8], bdd; int f[8], nidx; } ipcCC;   // up to 8 involved free dofs
 
 // One membrane element (2D triangle): the 3 flex vertices (global vg, free-dof fv, -1 if pinned),
 // the FEM stiffness metric M (symmetric 3x3 over the element's 3 edges, read from flex_stiffness),
@@ -631,72 +620,10 @@ static void ipc_mat3inv(mjtNum* inv, const mjtNum* m) {
   inv[6]=(m[3]*m[7]-m[4]*m[6])*id; inv[7]=(m[1]*m[6]-m[0]*m[7])*id; inv[8]=(m[0]*m[4]-m[1]*m[3])*id;
 }
 
-// 4x4 inverse (row-major) by Gauss-Jordan with partial pivoting
-static void ipc_mat4inv(mjtNum* inv, const mjtNum* min) {
-  mjtNum a[4][8];
-  for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) { a[i][j] = min[4*i+j]; a[i][4+j] = (i==j) ? 1.0 : 0.0; }
-  for (int col=0; col < 4; col++) {
-    int piv = col;
-    for (int r=col+1; r < 4; r++) if (mju_abs(a[r][col]) > mju_abs(a[piv][col])) piv = r;
-    if (piv != col) for (int j=0; j < 8; j++) { mjtNum t = a[col][j]; a[col][j] = a[piv][j]; a[piv][j] = t; }
-    mjtNum dv = a[col][col]; if (mju_abs(dv) < mjMINVAL) dv = (dv < 0 ? -mjMINVAL : mjMINVAL);
-    for (int j=0; j < 8; j++) a[col][j] /= dv;
-    for (int r=0; r < 4; r++) if (r != col) { mjtNum f = a[r][col]; for (int j=0; j < 8; j++) a[r][j] -= f*a[col][j]; }
-  }
-  for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) inv[4*i+j] = a[i][4+j];
-}
-
-// ----------------------------------- affine (ABD) rigid bodies ------------------------------------
-// A rigid body is stepped via 4 control points forming a (general) tetra fixed in the body frame (rest
-// positions Xr). The control points are free points in the solver; the rigid pose maps to them by FK
-// (cp = pos + R*Xr) and is recovered by fitting the affine frame F = D_curr*Dinv and extracting its
-// rotation (ipc_affineCP/ipc_affineReadback). Rigidity = orthogonality energy + the affine inertia block
-// M_cp4 (= B^-T M_aff B^-1, tiled as M_cp4[i][j]*I3); free motion is carried exactly by the rigid predictor.
-// A free body uses a radii-of-gyration tetra (well-scaled); jointed bodies place control points at the
-// joint anchors (Stage 1).
-typedef struct {
-  int body, qadr, vadr, ja;  // mjModel body id; qpos/dof/joint addresses (free: pos+quat/lin+ang; hinge: angle/dof)
-  int isHinge;              // 0 = free-joint body; 1 = hinge joint (1-3 hinges sharing an anchor)
-  int jstatic;              // hinge to a STATIC parent (axis points pinned to world); else coupled to jparent
-  int jparent;              // affine index of the parent hinge body (-1 if static-hinge or free)
-  int njnt, njpt;           // # hinges on this body (1-3); # joint-constraint points (<=2)
-  mjtNum jaxis[3][3], hpt[3]; // the njnt hinge world axes (readback projection); shared anchor (world, setup)
-  int cp[4];                // the 4 control points' indices into the free-point array (this body owns all 4)
-  int sdof[4];              // solver-dof base (3*fidx) of each control point
-  mjtNum Xr[4][3];          // rest positions of the 4 control points in the body frame (radii-of-gyration tetra)
-  mjtNum Dinv[9];           // ([Xr1-Xr0, Xr2-Xr0, Xr3-Xr0])^-1 -- maps current edges to F (orthogonality)
-  mjtNum Binv[16];          // inverse of [1, Xr_i^T] rows: world point -> affine weights in this body's tetra
-  mjtNum Mcp4[4][4];        // affine inertia in control-point coords (each entry scales an I3 block)
-  mjtNum kappaO;            // orthogonality (rigidity) stiffness
-  mjtNum jw[2][4];          // joint: njpt constraint points as affine combos of THIS body's control points
-  mjtNum jwp[2][4];         // hinge child: same njpt points as affine combos of the PARENT's control points
-  mjtNum janch[2][3];       // hinge-to-static: the njpt points' fixed world target positions
-  int pfull[2];             // per point: 1 = full coincidence (3 axis-aligned rows); 0 = single row along pn
-  mjtNum pn[2][3];          // per point: the single-row normal (the locked 3rd-axis direction, k=2)
-  mjtNum ghatC, cdampH;     // contact barrier support distance; normal-dashpot Hessian coefficient (c/h)
-  int nfeat;                // number of collision features (box corners / capsule ends / sphere centers)
-  mjtNum cfeat[24][4];      // each feature's affine weights in the control-point tetra (constant)
-  mjtNum cfrad[24];         // each feature's radius offset (0 for a box corner, geom radius for capsule/sphere)
-  int ncap, caps[12][2], capgeom[12];   // capsules (for affine-affine self-collision): the 2 end-feature indices; geom id
-  // ---- reduced coordinates (genuine "don't add the DOFs"): the body's 12 control-point DOFs are NOT solver
-  // unknowns; the solver works in the nfree FREE DOFs z. cp-increment = Mb*(parent cp-increment) + Nb*dz.
-  int nfree, zadr;          // # free DOFs after this body's joint; offset into the reduced vector z
-  mjtNum Mb[144], Nb[144];  // Mb: parent cp-DOFs -> this body's constrained part (12x12); Nb: free basis (12 x nfree)
-} ipcAffine;
-
-// AL contact multipliers, per affine FEATURE (key = body*g_calStride + feature), persisted across Newton iters
-// AND steps (warm start: contact force ~constant frame-to-frame). Read in the contact gradient/energy; updated
-// once per accepted Newton step (lam <- max(0, lam - mu*c)). Pure-affine-vs-geom for now.
-static mjtNum* g_cal = NULL; static int g_calN = 0, g_calStride = 0;
-// AL contact multipliers for affine-AFFINE capsule pairs (key = ((a*naff+b)*g_caalCap+ca)*g_caalCap+cb), persisted
-static mjtNum* g_caal = NULL; static int g_caalN = 0, g_caalCap = 0;
 // AL contact multiplier per FREE POINT (flex vertex / rigid sphere): the cross-step warm-start store for the
 // ipc_try contacts, whose LIVE multiplier rides in ipcCon.lam. Seeded into cand[].lam at step start, sunk back
 // after the step (binding = max over a contact's free-point participants). npt-sized.
 static mjtNum* g_pal = NULL; static int g_palN = 0;
-// AL joint-LIMIT multipliers, per (model joint, side): 2*jid+0 = lower limit, 2*jid+1 = upper. Persisted across
-// Newton iters AND steps (warm start). Updated once per accepted step (lam <- max(0, lam - mu*c)). Size 2*njnt.
-static mjtNum* g_jal = NULL; static int g_jalN = 0;
 static long g_pcgN = 0;   // [PROF] PCG iterations (accumulated per step, printed + reset in MJ_IPC_PROF)
 
 // per-pair cnt state machine (active-set aging + 0.3^c stiffness decay) persisted across the per-iter
@@ -743,218 +670,6 @@ static void ipc_cntSet(unsigned long key, int val) {   // sink updated cnt into 
     }
     if (g_cntKeyN[h] == key) { g_cntValN[h] = val; return; }
     h = (h + 1) & mask;
-  }
-}
-
-// PSD projection (per-element symmetric EVD, clamp negative eigenvalues to 0, reconstruct).
-// Small 4x4 symmetric block via cyclic Jacobi rotations (the geometric affine-ortho block is a 4x4 in the 4
-// control points, replicated block-diagonally over the 3 coords). In/out: A is overwritten by its PSD projection.
-static void ipc_makeSPD4(mjtNum A[4][4]) {
-  mjtNum V[4][4];
-  for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) V[i][j] = (i == j) ? 1.0 : 0.0;
-  for (int sweep=0; sweep < 24; sweep++) {
-    mjtNum off = 0;
-    for (int p=0; p < 4; p++) for (int q=p+1; q < 4; q++) off += A[p][q]*A[p][q];
-    if (off < 1e-30) break;
-    for (int p=0; p < 4; p++) for (int q=p+1; q < 4; q++) {
-      if (A[p][q]*A[p][q] < 1e-30*(A[p][p]*A[p][p] + A[q][q]*A[q][q]) + 1e-300) continue;
-      mjtNum theta = (A[q][q] - A[p][p]) / (2.0*A[p][q]);
-      mjtNum t = (theta >= 0 ? 1.0 : -1.0) / (mju_abs(theta) + sqrt(theta*theta + 1.0));
-      mjtNum cc = 1.0/sqrt(t*t + 1.0), s = t*cc;
-      for (int k=0; k < 4; k++) {                            // A <- J^T A J (rotate rows/cols p,q)
-        mjtNum akp = A[k][p], akq = A[k][q];
-        A[k][p] = cc*akp - s*akq; A[k][q] = s*akp + cc*akq;
-      }
-      for (int k=0; k < 4; k++) {
-        mjtNum apk = A[p][k], aqk = A[q][k];
-        A[p][k] = cc*apk - s*aqk; A[q][k] = s*apk + cc*aqk;
-      }
-      for (int k=0; k < 4; k++) {                            // accumulate eigenvectors V <- V J
-        mjtNum vkp = V[k][p], vkq = V[k][q];
-        V[k][p] = cc*vkp - s*vkq; V[k][q] = s*vkp + cc*vkq;
-      }
-    }
-  }
-  mjtNum lam[4]; for (int i=0; i < 4; i++) { lam[i] = A[i][i]; if (lam[i] < 0) lam[i] = 0; }   // clamp to PSD
-  for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) {     // reconstruct A = V diag(max(lam,0)) V^T
-    mjtNum s = 0; for (int k=0; k < 4; k++) s += V[i][k]*lam[k]*V[j][k];
-    A[i][j] = s;
-  }
-}
-
-// affine body inertia (M_cp star block) + orthogonality (rigidity) energy over the 4 control points.
-// Returns the energy and, optionally (g/H non-NULL), the 12-gradient and 12x12 Gauss-Newton (PSD) Hessian
-// in control-point-local order (point k, coord c -> 3k+c). F is linear in the control points so the energy
-// is polynomial -- no polar decomposition in the solve. M_cp is the "star" form (cp0 = com): translation
-// mode mass = body mass; off-diagonals couple cp0 to each axis point.
-// H is the FULL Hessian (inertia + GN orthogonality + geometric); Hgeo (optional) gets just the geometric
-// orthogonality part, so the caller can use H for the matvec (true Newton) but H-Hgeo (PD) for the preconditioner.
-static mjtNum ipc_affineGH(const ipcAffine* af, const mjtNum* x, const mjtNum* xtil, mjtNum ih2,
-                           mjtNum g[12], mjtNum H[12][12], mjtNum Hgeo[12][12]) {
-  mjtNum y[4][3], yt[4][3];
-  for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-    y[k][c] = x[3*af->cp[k]+c]; yt[k][c] = xtil[3*af->cp[k]+c];
-  }
-  if (g) for (int i=0; i < 12; i++) { g[i] = 0; if (H) for (int j=0; j < 12; j++) H[i][j] = 0; }
-  if (Hgeo) for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) Hgeo[i][j] = 0;
-  mjtNum E = 0;
-  for (int a=0; a < 4; a++) for (int b=0; b < 4; b++) {
-    mjtNum s = af->Mcp4[a][b]*ih2;
-    for (int c=0; c < 3; c++) {
-      E += 0.5*s*(y[a][c]-yt[a][c])*(y[b][c]-yt[b][c]);
-      if (g) g[3*a+c] += s*(y[b][c]-yt[b][c]);
-      if (H) H[3*a+c][3*b+c] += s;
-    }
-  }
-  // orthogonality: F[c][col] = sum_m (y_{m+1}[c]-y0[c]) * Dinv[m][col]; C = F^T F - I (6 indep);
-  // V = kappaO * sum_comp w_comp C^2. dF[c][col]/dy_{m+1}[c] = Dinv[m][col], dF[c][col]/dy0[c] = -sum_m Dinv[m][col]
-  mjtNum F[3][3];
-  for (int c=0; c < 3; c++) for (int col=0; col < 3; col++) {
-    mjtNum s = 0; for (int mm=0; mm < 3; mm++) s += (y[mm+1][c]-y[0][c])*af->Dinv[3*mm+col];
-    F[c][col] = s;
-  }
-  const int ca[6] = {0,1,2,0,0,1}, cb[6] = {0,1,2,1,2,2}; const mjtNum w[6] = {1,1,1,2,2,2};
-  mjtNum C[6], Jc[6][12];
-  for (int q=0; q < 6; q++) {
-    int a = ca[q], b = cb[q];
-    mjtNum dot = 0; for (int c=0; c < 3; c++) dot += F[c][a]*F[c][b];
-    C[q] = dot - (a == b ? 1.0 : 0.0);
-    mjtNum csa = af->Dinv[a] + af->Dinv[3+a] + af->Dinv[6+a];     // sum_m Dinv[m][a]
-    mjtNum csb = af->Dinv[b] + af->Dinv[3+b] + af->Dinv[6+b];     // sum_m Dinv[m][b]
-    for (int i=0; i < 12; i++) Jc[q][i] = 0;
-    for (int c=0; c < 3; c++) {                                   // dC_ab/dcp
-      for (int mm=0; mm < 3; mm++)
-        Jc[q][3*(mm+1)+c] += af->Dinv[3*mm+a]*F[c][b] + af->Dinv[3*mm+b]*F[c][a];
-      Jc[q][3*0+c] -= csa*F[c][b] + csb*F[c][a];
-    }
-  }
-  // dF/dcp coefficients G[k][col]: cp_{m+1} contributes Dinv[m][col]; cp0 contributes -sum_m Dinv[m][col].
-  mjtNum G[4][3];
-  for (int col=0; col < 3; col++) { G[0][col] = -(af->Dinv[col]+af->Dinv[3+col]+af->Dinv[6+col]);
-    for (int k=1; k < 4; k++) G[k][col] = af->Dinv[3*(k-1)+col]; }
-  mjtNum Mgeo[4][4]; for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) Mgeo[i][j] = 0;   // 4x4 geometric block
-  for (int q=0; q < 6; q++) {
-    int a = ca[q], b = cb[q];
-    E += af->kappaO*w[q]*C[q]*C[q];
-    if (g) {
-      mjtNum gc = 2.0*af->kappaO*w[q]*C[q], hc = 2.0*af->kappaO*w[q];
-      for (int i=0; i < 12; i++) {
-        g[i] += gc*Jc[q][i];
-        if (H) for (int j=0; j < 12; j++) H[i][j] += hc*Jc[q][i]*Jc[q][j];   // Gauss-Newton part (rank-1 PSD)
-      }
-      // geometric (curvature) part: gc * d2C_q, with d2C_q[3ki+d][3kj+d] = G[ki][a]G[kj][b]+G[kj][a]G[ki][b]
-      // (block-diagonal in the coordinate d). C[q] can be <0 and the a!=b shear blocks are structurally
-      // INDEFINITE, so accumulate the full 4x4 Mgeo over all 6 components first, then PSD-project it once
-      // (PSD projection of the orthogonality-potential geometric block) before it enters the operator -> SPD Newton direction.
-#if IPC_AFFINE_GEOM
-      if (H) for (int ki=0; ki < 4; ki++) for (int kj=0; kj < 4; kj++)
-        Mgeo[ki][kj] += gc*(G[ki][a]*G[kj][b] + G[kj][a]*G[ki][b]);
-#endif
-    }
-  }
-#if IPC_AFFINE_GEOM
-  if (g && H) {
-    if (!getenv("MJ_IPC_NOSPD")) ipc_makeSPD4(Mgeo);         // clamp neg eigvals to 0 (per-element PSD projection); MJ_IPC_NOSPD=1 ablates
-    for (int ki=0; ki < 4; ki++) for (int kj=0; kj < 4; kj++)
-      for (int d=0; d < 3; d++) { H[3*ki+d][3*kj+d] += Mgeo[ki][kj]; if (Hgeo) Hgeo[3*ki+d][3*kj+d] += Mgeo[ki][kj]; }
-  }
-#endif
-  return E;
-}
-
-// a geom is a STATIC collision obstacle only if its body is rigidly ANCHORED to the world: 0-dof AND no
-// moving ancestor. A 0-dof body welded to a moving/affine body (the humanoid's hands, head) moves WITH
-// that body and is lumped into its inertia -- treating it as a static geom makes the affine body collide
-// with its own welded part (the forearm vs its attached hand -> a huge spurious barrier force, off-target).
-static int ipc_bodyAnchored(const mjModel* m, int b) {
-  while (b > 0) { if (m->body_dofnum[b] > 0) return 0; b = m->body_parentid[b]; }
-  return 1;
-}
-
-// affine rigid-body contacts vs static geoms (anchored to world): each collision feature (box corner, capsule
-// end, sphere center) is an affine combination of the 4 control points (world pos = sum_k cw_k * cp_k), so
-// the barrier gradient distributes to the control points via cw and the Hessian reuses the existing ipcCC
-// machinery. gap = signed-distance-to-geom - feature radius. Appends each active contact to ccache.
-static void ipc_affineContact(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
-                              const mjtNum* x, const mjtNum* xold, mjtNum kappa, mjtNum* grad,
-                              ipcCC* ccache, int* nacon, int amax, mjtNum* affHc) {
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a];
-    mjtNum ghc = af->ghatC, cdH = af->cdampH;
-    for (int ft=0; ft < af->nfeat; ft++) {
-      mjtNum pw[3] = {0,0,0}, dpw[3] = {0,0,0};   // feature world pos and its displacement this step
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-        pw[c] += af->cfeat[ft][k]*x[3*af->cp[k]+c];
-        dpw[c] += af->cfeat[ft][k]*(x[3*af->cp[k]+c] - xold[3*af->cp[k]+c]);
-      }
-      for (int gi=0; gi < m->ngeom; gi++) {
-        if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-        if (!ipc_bodyAnchored(m, m->geom_bodyid[gi])) continue;            // static geoms only
-        mjtNum n[3], g = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, pw, n, ghc+af->cfrad[ft])
-                         - af->cfrad[ft];
-        if (g >= ghc || *nacon >= amax) continue;             // (g<=0 is NOT skipped: clamp recovers it)
-        mjtNum dn = dpw[0]*n[0] + dpw[1]*n[1] + dpw[2]*n[2];
-        mjtNum cde = (dn < 0) ? cdH : 0;                       // ONE-SIDED dashpot: damp approach (compression)
-        // augmented Lagrangian: force = lambda - mu*(g-delta), c = g - delta (rest at the standoff delta)
-        mjtNum lam = g_cal[a*g_calStride + ft];               // (read; updated once per accepted Newton step)
-        mjtNum fc = lam - kappa*(g - ipc_off(ghc));           // fc = lambda - mu*c
-        if (fc <= 0) continue;                                // inactive: no force (lambda decays in the update)
-        mjtNum bd = -fc, bdd = kappa + cde;                   // bd = mu*g - lambda; Hessian = mu (+ dashpot)
-        for (int k=0; k < 4; k++) {
-          if (af->sdof[k] < 0) continue;                       // pinned control point: no solver DOF
-          for (int c=0; c < 3; c++) grad[af->sdof[k]+c] += (bd + cde*dn)*af->cfeat[ft][k]*n[c];
-        }
-        if (affHc) {                                           // per-body GN contact Hessian for the reduced solve
-          mjtNum u[12]; for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) u[3*k+c] = af->cfeat[ft][k]*n[c];
-          mjtNum* Hc = affHc + 144*a;
-          for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) Hc[12*i+j] += bdd*u[i]*u[j];
-        }
-        ipcCC* cc = &ccache[(*nacon)++];
-        for (int c=0; c < 3; c++) cc->n[c] = n[c];
-        for (int k=0; k < 4; k++) { cc->cw[k] = af->cfeat[ft][k]; cc->f[k] = (af->sdof[k] >= 0) ? af->sdof[k]/3 : -1; }
-        cc->nidx = 4; cc->bdd = bdd;
-      }
-    }
-  }
-}
-
-// AL multiplier update, once per accepted Newton step, at the new x: lambda <- max(0, lambda - mu*c), c = the
-// binding (min over geoms) gap of each affine feature. Far features (no geom in range) decay to 0.
-static void ipc_affineLamUpdate(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
-                                const mjtNum* x, mjtNum kappa) {
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a]; mjtNum ghc = af->ghatC;
-    for (int ft=0; ft < af->nfeat; ft++) {
-      mjtNum pw[3] = {0,0,0};
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) pw[c] += af->cfeat[ft][k]*x[3*af->cp[k]+c];
-      mjtNum mn = 1e30;
-      for (int gi=0; gi < m->ngeom; gi++) {
-        if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-        if (!ipc_bodyAnchored(m, m->geom_bodyid[gi])) continue;
-        mjtNum nn[3], g = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, pw, nn, ghc+af->cfrad[ft])
-                         - af->cfrad[ft];
-        if (g < mn) mn = g;
-      }
-      mjtNum* lam = &g_cal[a*g_calStride + ft];
-      if (mn < ghc) { mjtNum nl = *lam - IPC_DUAL_OMEGA*kappa*(mn - ipc_off(ghc)); *lam = nl > 0 ? nl : 0; }   // binding gap, rest at delta
-      else *lam = 0;                                                            // out of range -> decay
-    }
-  }
-}
-
-// AL joint-LIMIT multiplier update, once per accepted Newton step at the converged angle theta = qpos + thRO:
-// lam_side <- max(0, lam_side - OMEGA*kj*c_side); c_hi = hi-theta, c_lo = theta-lo (both >= 0 within range).
-static void ipc_jntLimitLamUpdate(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
-                                  const mjtNum* thRO) {
-  for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; if (!af->isHinge) continue;
-    mjtNum kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
-    for (int jl=0; jl < af->njnt; jl++) { int jid = af->ja + jl;
-      if (!m->jnt_limited[jid]) continue;
-      mjtNum theta = d->qpos[af->qadr+jl] + thRO[3*a+jl];
-      mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1];
-      mjtNum* lhi = &g_jal[2*jid+1]; mjtNum nhi = *lhi - IPC_DUAL_OMEGA*kj*(hi - theta); *lhi = nhi > 0 ? nhi : 0;
-      mjtNum* llo = &g_jal[2*jid+0]; mjtNum nlo = *llo - IPC_DUAL_OMEGA*kj*(theta - lo); *llo = nlo > 0 ? nlo : 0;
-    }
   }
 }
 
@@ -1038,230 +753,13 @@ static void ipc_mergeActiveSet(ipcCon* aset, int* naset, const ipcCon* cand, int
   *naset = nm;
 }
 
-static inline mjtNum ipc_fmin(mjtNum a, mjtNum b);   // defined below; used by the affine-affine helpers
-
-// ===== affine-AFFINE self-collision (capsule-capsule): two MOVING affine bodies =======================
-// each capsule is a segment whose two ends are affine combos of a body's control points; ipc_segSeg gives
-// the closest-point params (s,t). The barrier gradient/Hessian distribute to BOTH bodies' control points.
-
-// MuJoCo's collision filter for an affine-affine geom pair: geom bitmask + weld self/parent + <exclude>.
-static int ipc_affineAACanCollide(const mjModel* m, int bA, int gA, int bB, int gB) {
-  if (!((m->geom_contype[gA] & m->geom_conaffinity[gB]) || (m->geom_contype[gB] & m->geom_conaffinity[gA]))) return 0;
-  int w1 = m->body_weldid[bA], w2 = m->body_weldid[bB];
-  if (w1 == w2) return 0;                                          // same weld
-  if (!(m->opt.disableflags & mjDSBL_FILTERPARENT)) {             // weld-parent filter (default ON)
-    if (w1 == m->body_weldid[m->body_parentid[w2]] || w2 == m->body_weldid[m->body_parentid[w1]]) return 0;
-  }
-  for (int i=0; i < m->nexclude; i++)                             // <contact><exclude>
-    if (m->exclude_signature[i] == ((bA<<16)+bB) || m->exclude_signature[i] == ((bB<<16)+bA)) return 0;
-  return 1;
-}
-
-// gap + closest-point data for one capsule pair (capA of body a, capB of body b). Fills the per-cp weights
-// cwA/cwB (dg/d cp = cw*n), the normal n, the two cp world positions, and the segment params. Returns gap.
-static mjtNum ipc_affineAAGap(const ipcAffine* afA, int capA, const ipcAffine* afB, int capB,
-                              const mjtNum* x, mjtNum* n, mjtNum* cwA, mjtNum* cwB) {
-  const mjtNum *wA0 = afA->cfeat[afA->caps[capA][0]], *wA1 = afA->cfeat[afA->caps[capA][1]];
-  const mjtNum *wB0 = afB->cfeat[afB->caps[capB][0]], *wB1 = afB->cfeat[afB->caps[capB][1]];
-  mjtNum PA0[3]={0,0,0}, PA1[3]={0,0,0}, PB0[3]={0,0,0}, PB1[3]={0,0,0};
-  for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-    PA0[c] += wA0[k]*x[3*afA->cp[k]+c]; PA1[c] += wA1[k]*x[3*afA->cp[k]+c];
-    PB0[c] += wB0[k]*x[3*afB->cp[k]+c]; PB1[c] += wB1[k]*x[3*afB->cp[k]+c]; }
-  mjtNum cp1[3], cp2[3], st[2], dd = ipc_segSeg(PA0, PA1, PB0, PB1, cp1, cp2, st);
-  mjtNum radsum = afA->cfrad[afA->caps[capA][0]] + afB->cfrad[afB->caps[capB][0]];
-  if (dd < 1e-9) dd = 1e-9;
-  for (int c=0; c < 3; c++) n[c] = (cp1[c]-cp2[c])/dd;            // outward for A
-  mjtNum s = st[0], t = st[1];
-  for (int k=0; k < 4; k++) { cwA[k] = (1-s)*wA0[k] + s*wA1[k]; cwB[k] = -((1-t)*wB0[k] + t*wB1[k]); }
-  return dd - radsum;
-}
-
-// flat warm-start index for the affine-affine capsule-pair AL multiplier g_caal (pairs enumerated a<b)
-static inline int ipc_aaIdx(int a, int b, int ca, int cb, int naff) {
-  return ((a*naff + b)*g_caalCap + ca)*g_caalCap + cb;
-}
-
-// affine-affine contact: gradient -> grad (both bodies), GN block -> ccache (8 cps), per-body diagonal -> affHc.
-static void ipc_affineAffineContact(const mjModel* m, const ipcAffine* aff, int naff, const mjtNum* x,
-                                    const mjtNum* xold, mjtNum kappa, mjtNum* grad, ipcCC* ccache, int* nacon,
-                                    int amax, mjtNum* affHc) {
-  for (int a=0; a < naff; a++) for (int b=a+1; b < naff; b++) {
-    const ipcAffine *afA = &aff[a], *afB = &aff[b];
-    for (int ca=0; ca < afA->ncap; ca++) for (int cb=0; cb < afB->ncap; cb++) {
-      if (!ipc_affineAACanCollide(m, afA->body, afA->capgeom[ca], afB->body, afB->capgeom[cb])) continue;
-      mjtNum n[3], cwA[4], cwB[4];
-      mjtNum ghc = ipc_fmin(afA->ghatC, afB->ghatC), g = ipc_affineAAGap(afA, ca, afB, cb, x, n, cwA, cwB);
-      if (g >= ghc || *nacon >= amax) continue;
-      mjtNum dn = 0;                                              // relative approach speed along n
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++)
-        dn += (cwA[k]*(x[3*afA->cp[k]+c]-xold[3*afA->cp[k]+c]) + cwB[k]*(x[3*afB->cp[k]+c]-xold[3*afB->cp[k]+c]))*n[c];
-      mjtNum cde = (dn < 0) ? ipc_fmin(afA->cdampH, afB->cdampH) : 0;
-      // AL: force = lambda - mu*(g-delta), c = g - delta (rest at the standoff delta)
-      mjtNum lam = g_caal[ipc_aaIdx(a, b, ca, cb, naff)];
-      mjtNum fc = lam - kappa*(g - ipc_off(ghc)); if (fc <= 0) continue;   // inactive: no force (multiplier decays)
-      mjtNum bd = -fc, bdd = kappa + cde;                        // bd = mu*g - lambda; Hessian = mu (+ dashpot)
-      for (int k=0; k < 4; k++) {                                 // gradient to both bodies
-        if (afA->sdof[k] >= 0) for (int c=0; c < 3; c++) grad[afA->sdof[k]+c] += (bd + cde*dn)*cwA[k]*n[c];
-        if (afB->sdof[k] >= 0) for (int c=0; c < 3; c++) grad[afB->sdof[k]+c] += (bd + cde*dn)*cwB[k]*n[c];
-      }
-      if (affHc) {                                               // per-body GN diagonal blocks (CRB)
-        mjtNum uA[12], uB[12];
-        for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { uA[3*k+c]=cwA[k]*n[c]; uB[3*k+c]=cwB[k]*n[c]; }
-        mjtNum* HA = affHc + 144*a; mjtNum* HB = affHc + 144*b;
-        for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { HA[12*i+j] += bdd*uA[i]*uA[j]; HB[12*i+j] += bdd*uB[i]*uB[j]; }
-      }
-      ipcCC* cc = &ccache[(*nacon)++];                           // full 8-cp block for the matrix-free PCG path
-      for (int c=0; c < 3; c++) cc->n[c] = n[c];
-      for (int k=0; k < 4; k++) { cc->cw[k]=cwA[k]; cc->f[k]=(afA->sdof[k]>=0)?afA->sdof[k]/3:-1;
-                                  cc->cw[4+k]=cwB[k]; cc->f[4+k]=(afB->sdof[k]>=0)?afB->sdof[k]/3:-1; }
-      cc->nidx = 8; cc->bdd = bdd;
-    }
-  }
-}
-
-// affine-affine contact energy (line search): barrier + one-sided dashpot.
-static mjtNum ipc_affineAffineEnergy(const mjModel* m, const ipcAffine* aff, int naff,
-                                     const mjtNum* x, const mjtNum* xold, mjtNum kappa) {
-  mjtNum E = 0;
-  for (int a=0; a < naff; a++) for (int b=a+1; b < naff; b++) {
-    const ipcAffine *afA = &aff[a], *afB = &aff[b];
-    for (int ca=0; ca < afA->ncap; ca++) for (int cb=0; cb < afB->ncap; cb++) {
-      if (!ipc_affineAACanCollide(m, afA->body, afA->capgeom[ca], afB->body, afB->capgeom[cb])) continue;
-      mjtNum n[3], cwA[4], cwB[4];
-      mjtNum ghc = ipc_fmin(afA->ghatC, afB->ghatC), g = ipc_affineAAGap(afA, ca, afB, cb, x, n, cwA, cwB);
-      if (g >= ghc) continue;
-      mjtNum dn = 0;
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++)
-        dn += (cwA[k]*(x[3*afA->cp[k]+c]-xold[3*afA->cp[k]+c]) + cwB[k]*(x[3*afB->cp[k]+c]-xold[3*afB->cp[k]+c]))*n[c];
-      mjtNum cde = (dn < 0) ? ipc_fmin(afA->cdampH, afB->cdampH) : 0;
-      // AL merit (1/2mu)(max(0,lam-mu*g)^2 - lam^2): C1
-      mjtNum lam = g_caal[ipc_aaIdx(a, b, ca, cb, naff)];
-      mjtNum fc = lam - kappa*(g - ipc_off(ghc)); if (fc < 0) fc = 0;
-      E += (fc*fc - lam*lam)/(2*kappa) + (fc > 0 && dn < 0 ? 0.5*cde*dn*dn : 0);
-    }
-  }
-  return E;
-}
-
-// AL multiplier update for affine-affine capsule pairs, once per accepted Newton step at the new x:
-// g_caal[pair] <- max(0, lambda - mu*g). Pairs out of range (or filtered) decay to 0. Mirrors ipc_affineLamUpdate.
-static void ipc_affineAffineLamUpdate(const mjModel* m, const ipcAffine* aff, int naff, const mjtNum* x, mjtNum kappa) {
-  for (int a=0; a < naff; a++) for (int b=a+1; b < naff; b++) {
-    const ipcAffine *afA = &aff[a], *afB = &aff[b];
-    for (int ca=0; ca < afA->ncap; ca++) for (int cb=0; cb < afB->ncap; cb++) {
-      mjtNum* lam = &g_caal[ipc_aaIdx(a, b, ca, cb, naff)];
-      if (!ipc_affineAACanCollide(m, afA->body, afA->capgeom[ca], afB->body, afB->capgeom[cb])) { *lam = 0; continue; }
-      mjtNum n[3], cwA[4], cwB[4];
-      mjtNum ghc = ipc_fmin(afA->ghatC, afB->ghatC), g = ipc_affineAAGap(afA, ca, afB, cb, x, n, cwA, cwB);
-      if (g < ghc) { mjtNum nl = *lam - IPC_DUAL_OMEGA*kappa*(g - ipc_off(ghc)); *lam = nl > 0 ? nl : 0; }
-      else *lam = 0;
-    }
-  }
-}
-
-// conservative additive CCD for affine-affine pairs: cap alpha so no pair closes more than ~90% of its gap.
-static mjtNum ipc_affineAffineCCD(const mjModel* m, const ipcAffine* aff, int naff, const mjtNum* x, const mjtNum* dx) {
-  mjtNum cap = 1.0;
-  for (int a=0; a < naff; a++) for (int b=a+1; b < naff; b++) {
-    const ipcAffine *afA = &aff[a], *afB = &aff[b];
-    for (int ca=0; ca < afA->ncap; ca++) for (int cb=0; cb < afB->ncap; cb++) {
-      if (!ipc_affineAACanCollide(m, afA->body, afA->capgeom[ca], afB->body, afB->capgeom[cb])) continue;
-      mjtNum n[3], cwA[4], cwB[4];
-      mjtNum g = ipc_affineAAGap(afA, ca, afB, cb, x, n, cwA, cwB);   // true gap; rest at standoff -> CCD has room
-      if (g <= 0) continue;                                       // true gap past -delta: the AL recovers it
-      // gap shrink rate <= max endpoint speed of A + of B (per-contact, affine-mapped -- NOT the flat dgap)
-      mjtNum vmax = 0;
-      for (int e=0; e < 2; e++) { const mjtNum* w = afA->cfeat[afA->caps[ca][e]]; mjtNum v[3]={0,0,0};
-        for (int k=0; k < 4; k++) if (afA->sdof[k]>=0) for (int c=0; c<3; c++) v[c]+=w[k]*dx[afA->sdof[k]+c];
-        mjtNum L=sqrt(mju_dot3(v,v)); if (L>vmax) vmax=L; }
-      mjtNum vb = 0;
-      for (int e=0; e < 2; e++) { const mjtNum* w = afB->cfeat[afB->caps[cb][e]]; mjtNum v[3]={0,0,0};
-        for (int k=0; k < 4; k++) if (afB->sdof[k]>=0) for (int c=0; c<3; c++) v[c]+=w[k]*dx[afB->sdof[k]+c];
-        mjtNum L=sqrt(mju_dot3(v,v)); if (L>vb) vb=L; }
-      mjtNum l = vmax + vb;
-      if (l > 1e-12) { mjtNum amx = 0.9*g/l; if (amx < cap) cap = amx; }
-    }
-  }
-  return cap;
-}
-
-// total affine contact energy at x: barrier + normal-dashpot dissipation (line search / E0)
-static mjtNum ipc_affineContactEnergy(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
-                                      const mjtNum* x, const mjtNum* xold, mjtNum kappa) {
-  mjtNum E = 0;
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a];
-    mjtNum ghc = af->ghatC, cdH = af->cdampH;
-    for (int ft=0; ft < af->nfeat; ft++) {
-      mjtNum pw[3] = {0,0,0}, dpw[3] = {0,0,0};
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-        pw[c] += af->cfeat[ft][k]*x[3*af->cp[k]+c];
-        dpw[c] += af->cfeat[ft][k]*(x[3*af->cp[k]+c] - xold[3*af->cp[k]+c]);
-      }
-      for (int gi=0; gi < m->ngeom; gi++) {
-        if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-        if (!ipc_bodyAnchored(m, m->geom_bodyid[gi])) continue;
-        mjtNum n[3], g = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, pw, n, ghc+af->cfrad[ft])
-                         - af->cfrad[ft];
-        if (g < ghc) {
-          mjtNum dn = dpw[0]*n[0] + dpw[1]*n[1] + dpw[2]*n[2];
-          // AL merit (1/2mu)(max(0,lam-mu*g)^2-lam^2): C1, inactive value = -lam^2/2mu
-          mjtNum lam = g_cal[a*g_calStride + ft];
-          mjtNum fc = lam - kappa*(g - ipc_off(ghc)); if (fc < 0) fc = 0;
-          E += (fc*fc - lam*lam)/(2*kappa) + (fc > 0 && dn < 0 ? 0.5*cdH*dn*dn : 0);
-        }
-      }
-    }
-  }
-  return E;
-}
-
-// CCD step cap for affine contact features (linear: exact for planes, conservative via the current normal)
-static mjtNum ipc_affineContactCCD(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
-                                   const mjtNum* x, const mjtNum* dx) {
-  mjtNum cap = 1.0;
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a];
-    for (int ft=0; ft < af->nfeat; ft++) {
-      mjtNum pw[3] = {0,0,0}, dw[3] = {0,0,0};
-      for (int k=0; k < 4; k++) {
-        for (int c=0; c < 3; c++) pw[c] += af->cfeat[ft][k]*x[3*af->cp[k]+c];
-        if (af->sdof[k] >= 0) for (int c=0; c < 3; c++) dw[c] += af->cfeat[ft][k]*dx[af->sdof[k]+c];  // pinned: dx=0
-      }
-      for (int gi=0; gi < m->ngeom; gi++) {
-        if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-        if (!ipc_bodyAnchored(m, m->geom_bodyid[gi])) continue;
-        mjtNum n[3], g = ipc_geomDist(m, gi, d->geom_xpos+3*gi, d->geom_xmat+9*gi, pw, n, 1e30)
-                         - af->cfrad[ft];   // true gap; rest sits at standoff delta so the CCD has room (no lock)
-        if (g <= 0) continue;     // true gap past -delta: the AL recovers it (CCD can't)
-        mjtNum rate = dw[0]*n[0] + dw[1]*n[1] + dw[2]*n[2];       // d(gap)/d(alpha)
-        if (rate < 0) { mjtNum amx = 0.9*g/(-rate); if (amx < cap) cap = amx; }
-      }
-    }
-  }
-  return cap;
-}
-
-// joint-passive (spring/damper/limit) x-space Hessian: rank-1 h*(c.x)^2 per hinge angle, c = dtheta/dx over the
-// body's (and parent's) control-point DOFs. Applied matrix-free in ipc_applyH; the Nb reduction then projects it.
-typedef struct { int ndof; int dof[24]; mjtNum c[24], h; } ipcJpH;
+static inline mjtNum ipc_fmin(mjtNum a, mjtNum b) { return a < b ? a : b; }
 
 static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
                        int nelem, const ipcElem* elems, const mjtNum* estr,
                        int nbe, const ipcBend* bends,
-                       int njp, const ipcJpH* jps,
-                       const ipcCC* ccache, int nacon,
-                       int naff, const ipcAffine* aff, const mjtNum* affH) {
+                       const ipcCC* ccache, int nacon) {
   for (int i=0; i < N; i++) Hp[i] = mdiag[i]*p[i];
-  for (int a=0; a < naff; a++) {                  // affine 12x12 block (inertia + orthogonality GN Hessian)
-    const mjtNum* Hb = affH + 144*a;
-    for (int i=0; i < 12; i++) {
-      if (aff[a].sdof[i/3] < 0) continue;         // pinned control point: no solver DOF
-      mjtNum s = 0;
-      for (int j=0; j < 12; j++) { if (aff[a].sdof[j/3] < 0) continue; s += Hb[12*i+j]*p[aff[a].sdof[j/3] + (j%3)]; }
-      Hp[aff[a].sdof[i/3] + (i%3)] += s;
-    }
-  }
   for (int t=0; t < nelem; t++) {
     const ipcElem* el = &elems[t]; const mjtNum* es = estr + 12*t;   // es[3*a+k]=g_a, es[9+a]=Me_a
     mjtNum rel[3][3], s[3];
@@ -1287,12 +785,6 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
         Hp[3*fi+k] += s; }
     }
   }
-  for (int jt=0; jt < njp; jt++) {                        // joint passive: rank-1 h*(c.p) per hinge angle (matrix-free)
-    const ipcJpH* jp = &jps[jt]; mjtNum dp = 0;
-    for (int i=0; i < jp->ndof; i++) dp += jp->c[i]*p[jp->dof[i]];
-    mjtNum hd = jp->h*dp;
-    for (int i=0; i < jp->ndof; i++) Hp[jp->dof[i]] += jp->c[i]*hd;
-  }
   for (int c=0; c < nacon; c++) {
     const ipcCC* cc = &ccache[c];
     mjtNum s = 0;
@@ -1314,250 +806,35 @@ typedef struct {
 } ipcSparse;
 static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r);  // per-vertex 3x3 block-Jacobi (below)
 
-// (the matrix-free PCG is now ipc_solveU below -- one unified solver for flex + affine; ipc_pcg was its
-// naff==0 special case and has been folded in.)
-
-// ===== genuine reduced-coordinate affine solve ("don't add the DOFs") =================================
-// Each affine body has 12 control-point DOFs but they are NOT solver unknowns. A joint to the parent pins
-// some, leaving nfree free DOFs z_b. The cp-INCREMENT obeys  dcp_b = Mb_b * dcp_parent + Nb_b * dz_b. The
-// solver works only in z (sum of nfree); the per-body energy Hessians are reduced and assembled into a small
-// tree-structured H_z by a composite-rigid-body (CRB) pass, factored directly. No 156-D system, no N^T H N
-// over the full space, no projection -> no gradient floor.
-
-// build per-body Mb (12x12), Nb (12 x nfree, stored 12x12), nfree, zadr from the joint constraint. Returns Nz.
-// hinge child: constraint Cb*cp_b = Cp*cp_parent -> Mb = Cb^+ Cp, Nb = null(Cb). static hinge: Cp=0 -> Mb=0.
-// free body (no joint): Nb = I, nfree=12, Mb=0.
-static int ipc_buildReduction(ipcAffine* aff, int naff) {
-  int zadr = 0;
-  for (int a=0; a < naff; a++) {
-    ipcAffine* af = &aff[a];
-    mjtNum Cb[72], Cp[72]; int rows = 0;                          // up to 6 rows x 12
-    if (af->isHinge) for (int i=0; i < af->njpt; i++) {
-      if (af->pfull[i]) for (int c=0; c < 3; c++) {
-        for (int j=0; j < 12; j++) { Cb[12*rows+j] = 0; Cp[12*rows+j] = 0; }
-        for (int k=0; k < 4; k++) { Cb[12*rows+3*k+c] = af->jw[i][k]; Cp[12*rows+3*k+c] = af->jwp[i][k]; }
-        rows++;
-      } else {
-        for (int j=0; j < 12; j++) { Cb[12*rows+j] = 0; Cp[12*rows+j] = 0; }
-        for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-          Cb[12*rows+3*k+c] = af->jw[i][k]*af->pn[i][c]; Cp[12*rows+3*k+c] = af->jwp[i][k]*af->pn[i][c]; }
-        rows++;
-      }
-    }
-    af->nfree = 12 - rows; af->zadr = zadr; zadr += af->nfree;
-    for (int i=0; i < 144; i++) { af->Mb[i] = 0; af->Nb[i] = 0; }
-    // Nb = orthonormal null(Cb): orthonormalize Cb rows, sweep std basis projecting off rows + accepted cols
-    mjtNum q[72]; int nq = 0;
-    for (int r=0; r < rows; r++) {
-      mjtNum v[12]; for (int j=0; j < 12; j++) v[j] = Cb[12*r+j];
-      for (int pass=0; pass < 2; pass++) for (int s=0; s < nq; s++) { mjtNum d = 0;
-        for (int j=0; j < 12; j++) d += v[j]*q[12*s+j]; for (int j=0; j < 12; j++) v[j] -= d*q[12*s+j]; }
-      mjtNum nrm = 0; for (int j=0; j < 12; j++) nrm += v[j]*v[j]; nrm = sqrt(nrm);
-      if (nrm > 1e-9) { for (int j=0; j < 12; j++) q[12*nq+j] = v[j]/nrm; nq++; }
-    }
-    int nf = 0;
-    for (int e=0; e < 12 && nf < af->nfree; e++) {
-      mjtNum v[12]; for (int j=0; j < 12; j++) v[j] = (j == e) ? 1.0 : 0.0;
-      for (int pass=0; pass < 2; pass++) {
-        for (int s=0; s < nq; s++) { mjtNum d = 0; for (int j=0; j < 12; j++) d += v[j]*q[12*s+j];
-          for (int j=0; j < 12; j++) v[j] -= d*q[12*s+j]; }
-        for (int s=0; s < nf; s++) { mjtNum d = 0; for (int j=0; j < 12; j++) d += v[j]*af->Nb[12*j+s];
-          for (int j=0; j < 12; j++) v[j] -= d*af->Nb[12*j+s]; }
-      }
-      mjtNum nrm = 0; for (int j=0; j < 12; j++) nrm += v[j]*v[j]; nrm = sqrt(nrm);
-      if (nrm > 1e-6) { for (int j=0; j < 12; j++) af->Nb[12*j+nf] = v[j]/nrm; nf++; }   // column nf of Nb
-    }
-    // Mb = Cb^+ Cp = Cb^T (Cb Cb^T)^-1 Cp, only for a body-body hinge (parent exists)
-    if (rows > 0 && af->jparent >= 0) {
-      mjtNum G[36]; for (int i=0; i < rows; i++) for (int j=0; j < rows; j++) { mjtNum s = 0;
-        for (int k=0; k < 12; k++) s += Cb[12*i+k]*Cb[12*j+k]; G[rows*i+j] = s; }
-      mju_cholFactor(G, rows, 1e-12);
-      mjtNum Y[72]; for (int col=0; col < 12; col++) { mjtNum rhs[6], sol[6];
-        for (int i=0; i < rows; i++) rhs[i] = Cp[12*i+col];
-        mju_cholSolve(sol, G, rhs, rows);
-        for (int i=0; i < rows; i++) Y[12*i+col] = sol[i]; }                 // Y = (Cb Cb^T)^-1 Cp  (rows x 12)
-      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;  // Mb = Cb^T Y
-        for (int k=0; k < rows; k++) s += Cb[12*k+i]*Y[12*k+j]; af->Mb[12*i+j] = s; }
-    }
-  }
-  return zadr;
-}
-
-// reduced gradient norm (for the Newton convergence test): adjoint up the tree, project to z. Returns ||gz||.
-static mjtNum ipc_reduceGrad(const ipcAffine* aff, int naff, const mjtNum* g, mjtNum* gz, mjtNum* adj) {
-  for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) adj[12*a+i] = g[12*a+i];
-  for (int a=naff-1; a >= 0; a--) { const ipcAffine* af = &aff[a]; int p = af->jparent; if (p < 0) continue;
-    for (int i=0; i < 12; i++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Mb[12*k+i]*adj[12*a+k]; adj[12*p+i] += s; } }
-  mjtNum gn = 0;
-  for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr;
-    for (int j=0; j < nf; j++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Nb[12*k+j]*adj[12*a+k];
-      gz[z0+j] = -s; gn += s*s; } }
-  return sqrt(gn);
-}
-
-// ===== UNIFIED solver: one preconditioned CG over reduced coords u = [u_na ; u_z] ======================
-// u_na = the non-affine (flex + free-point) maximal DOF [0,Nna), mapped 1:1. u_z = the affine reduced DOF
-// (Nz, joints eliminated). The map T: maximal dx[N] = T u is identity on [0,Nna) and the Nb/Mb tree map on
-// the affine block [Nna,N). The Newton operator in u is Hu = T^T H T applied matrix-free: expand u->maximal
-// via T, apply the existing maximal Hessian ipc_applyH, reduce via T^T. Preconditioner is block-diagonal:
-// IC(0) of the non-affine Hessian (sp, dim Nna) on u_na, and the per-tree factor of the reduced affine
-// Hessian on u_z. naff==0 => exactly ipc_pcg; no flex => equivalent to the old ipc_crbSolve.
-
-// forward tree map T (parents before children): cp increment dcp_a = Nb_a u_z_a + Mb_a dcp_parent.
-static void ipc_crbForward(const ipcAffine* aff, int naff, const mjtNum* uz, mjtNum* dcp /*12*naff*/) {
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a]; int pa = af->jparent; mjtNum* dca = dcp + 12*a;
-    for (int i=0; i < 12; i++) { mjtNum s = 0;
-      for (int j=0; j < af->nfree; j++) s += af->Nb[12*i+j]*uz[af->zadr+j];
-      if (pa >= 0) for (int k=0; k < 12; k++) s += af->Mb[12*i+k]*dcp[12*pa+k];
-      dca[i] = s; }
-  }
-}
-
-// adjoint tree map T^T (children before parents): adj_a = f_a + sum_children Mb_c^T adj_c, outz_a = Nb_a^T adj_a.
-// (Same recursion as ipc_reduceGrad but WITHOUT the negation -- this is the operator adjoint, not the RHS.)
-static void ipc_crbAdjoint(const ipcAffine* aff, int naff, const mjtNum* f /*12*naff*/,
-                           mjtNum* outz /*Nz*/, mjtNum* adj /*12*naff scratch*/) {
-  for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) adj[12*a+i] = f[12*a+i];
-  for (int a=naff-1; a >= 0; a--) { const ipcAffine* af = &aff[a]; int pa = af->jparent; if (pa < 0) continue;
-    for (int i=0; i < 12; i++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Mb[12*k+i]*adj[12*a+k];
-      adj[12*pa+i] += s; } }
-  for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr;
-    for (int j=0; j < nf; j++) { mjtNum s = 0; for (int k=0; k < 12; k++) s += af->Nb[12*k+j]*adj[12*a+k];
-      outz[z0+j] = s; } }
-}
-
-// ABA/Featherstone two-sweep FACTORIZATION of the reduced affine Hessian (tree-structured): O(naff*12^3)
-// rather than the dense O(Nz^3) Cholesky -- and it never forms the off-diagonal ancestor blocks. The per-body
-// H is block diagonal, so eliminating a body's free DOF folds a Schur complement into its parent's composite.
-// Bottom-up (children first). Per body: P (composite 12x12, scratch), D = N^T P N (factored pivot, nf x nf),
-// A = N^T P M (nf x 12), K = D^-1 A (nf x 12). D/A/K feed ipc_crbApply.
-static void ipc_crbFactor(const ipcAffine* aff, int naff, const mjtNum* H,
-                          mjtNum* P /*144*naff*/, mjtNum* D /*144*naff*/,
-                          mjtNum* A /*144*naff*/, mjtNum* K /*144*naff*/) {
-  for (int a=0; a < naff; a++) for (int i=0; i < 144; i++) P[144*a+i] = H[144*a+i];   // P init = H_a
-  for (int a=naff-1; a >= 0; a--) {
-    const ipcAffine* af = &aff[a]; int nf = af->nfree, pa = af->jparent;
-    const mjtNum* Pa = P + 144*a;
-    mjtNum PN[144];                                          // PN = P N  (12 x nf)
-    for (int i=0; i < 12; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
-      for (int k=0; k < 12; k++) s += Pa[12*i+k]*af->Nb[12*k+j]; PN[12*i+j] = s; }
-    mjtNum* Da = D + 144*a;                                  // D = N^T (P N)  (nf x nf), factored
-    for (int i=0; i < nf; i++) for (int j=0; j < nf; j++) { mjtNum s = 0;
-      for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*PN[12*k+j]; Da[nf*i+j] = s; }
-    mju_cholFactor(Da, nf, 1e-9);
-    if (pa >= 0) {
-      mjtNum PM[144];                                        // PM = P M  (12 x 12)
-      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-        for (int k=0; k < 12; k++) s += Pa[12*i+k]*af->Mb[12*k+j]; PM[12*i+j] = s; }
-      mjtNum* Aa = A + 144*a;                                // A = N^T (P M)  (nf x 12)
-      for (int i=0; i < nf; i++) for (int j=0; j < 12; j++) { mjtNum s = 0;
-        for (int k=0; k < 12; k++) s += af->Nb[12*k+i]*PM[12*k+j]; Aa[12*i+j] = s; }
-      mjtNum* Ka = K + 144*a;                                // K = D^-1 A  (nf x 12), solved column-wise
-      for (int j=0; j < 12; j++) { mjtNum col[12], sol[12];
-        for (int i=0; i < nf; i++) col[i] = Aa[12*i+j]; mju_cholSolve(sol, Da, col, nf);
-        for (int i=0; i < nf; i++) Ka[12*i+j] = sol[i]; }
-      mjtNum* Pp = P + 144*pa;                               // parent composite: Pp += M^T P M - A^T K
-      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) {
-        mjtNum mtpm = 0; for (int k=0; k < 12; k++) mtpm += af->Mb[12*k+i]*PM[12*k+j];
-        mjtNum atk = 0;  for (int k=0; k < nf; k++) atk  += Aa[12*k+i]*Ka[12*k+j];
-        Pp[12*i+j] += mtpm - atk;
-      }
-    }
-  }
-}
-
-// apply z = H_z^-1 r via the tree factorization (two sweeps). Backward (children first): G_a = N^T s_a + r_a,
-// e_a = D_a^-1 G_a, fold s_p += M^T s_a - A^T e_a. Forward (parents first): z_a = e_a - K_a dcp_p,
-// dcp_a = M dcp_p + N z_a. e_a is stashed in z[zadr..] between the sweeps; s and dcp are 12*naff scratch.
-static void ipc_crbApply(const ipcAffine* aff, int naff, const mjtNum* D, const mjtNum* A, const mjtNum* K,
-                         const mjtNum* r, mjtNum* z, mjtNum* s, mjtNum* dcp) {
-  for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) s[12*a+i] = 0;
-  for (int a=naff-1; a >= 0; a--) {
-    const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr, pa = af->jparent;
-    const mjtNum* sa = s + 12*a; mjtNum* ea = z + z0;
-    mjtNum G[12];
-    for (int i=0; i < nf; i++) { mjtNum t = 0; for (int k=0; k < 12; k++) t += af->Nb[12*k+i]*sa[k]; G[i] = t + r[z0+i]; }
-    mju_cholSolve(ea, D + 144*a, G, nf);
-    if (pa >= 0) { mjtNum* sp = s + 12*pa; const mjtNum* Aa = A + 144*a;
-      for (int i=0; i < 12; i++) { mjtNum mts = 0; for (int k=0; k < 12; k++) mts += af->Mb[12*k+i]*sa[k];
-        mjtNum ate = 0; for (int k=0; k < nf; k++) ate += Aa[12*k+i]*ea[k];
-        sp[i] += mts - ate; } }
-  }
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a]; int nf = af->nfree, z0 = af->zadr, pa = af->jparent;
-    mjtNum* za = z + z0;
-    if (pa >= 0) { const mjtNum* Ka = K + 144*a; const mjtNum* dp = dcp + 12*pa;
-      for (int i=0; i < nf; i++) { mjtNum t = 0; for (int k=0; k < 12; k++) t += Ka[12*i+k]*dp[k]; za[i] -= t; } }
-    mjtNum* dca = dcp + 12*a;
-    for (int i=0; i < 12; i++) { mjtNum t = 0; for (int j=0; j < nf; j++) t += af->Nb[12*i+j]*za[j];
-      if (pa >= 0) for (int k=0; k < 12; k++) t += af->Mb[12*i+k]*dcp[12*pa+k]; dca[i] = t; }
-  }
-}
-
-// block-diagonal preconditioner apply: z = M^-1 r.  na block = IC(0) (sp), affine block = tree factor (D/A/K).
-static void ipc_uPrecond(const ipcSparse* sp, int Nna, const ipcAffine* aff, int naff, int Nz,
-                         const mjtNum* D, const mjtNum* A, const mjtNum* K, mjtNum* s, mjtNum* dcp,
-                         const mjtNum* r, mjtNum* z) {
-  if (Nna > 0) ipc_jacobiApply(sp, z, r);
-  if (Nz > 0)  ipc_crbApply(aff, naff, D, A, K, r + Nna, z + Nna, s, dcp);
-}
-
-// reduced matvec Hp = (T^T H T) p:  expand p->dxm via T, apply maximal H (ipc_applyH), reduce via T^T.
-static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
-                        const ipcAffine* aff, int naff, const mjtNum* mdiag, int ne, const ipcElem* elems,
-                        int nbe, const ipcBend* bends,
-                        int njp, const ipcJpH* jps,
-                        const mjtNum* estr, const ipcCC* ccache, int nacon, const mjtNum* affH,
-                        mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
-  if (naff == 0) {   // pure flex: no reduction, apply the maximal matrix-free Hessian directly (== old ipc_pcg)
-    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, njp, jps, ccache, nacon, 0, aff, affH); return;
-  }
-  for (int i=0; i < Nna; i++) dxm[i] = p[i];                    // expand: na identity
-  if (naff > 0) {                                               // affine: forward tree map (dcp in Hpm scratch)
-    ipc_crbForward(aff, naff, p + Nna, Hpm);
-    for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dxm[Nna+12*a+i] = Hpm[12*a+i];
-  }
-  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, nbe, bends, njp, jps, ccache, nacon, naff, aff, affH);
-  for (int i=0; i < Nna; i++) Hp[i] = Hpm[i];                   // reduce: na identity
-  if (naff > 0) ipc_crbAdjoint(aff, naff, Hpm + Nna, Hp + Nna, adj);   // affine: adjoint tree map
-}
-
-// unified preconditioned CG. RHS r_u = [-grad_na ; gz] (gz = the affine reduced gradient RHS from
-// ipc_reduceGrad). bjf = prebuilt per-tree factors. Writes the maximal Newton direction dx[N].
-static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
-                      const ipcAffine* aff, int naff, const ipcSparse* sp, const mjtNum* mdiag,
-                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends, int njp, const ipcJpH* jps,
+// matrix-free preconditioned CG over the flex maximal DOF (block-Jacobi precond sp). RHS r = -grad.
+// Writes the Newton direction dx[N]. (This is the old pure-flex PCG, the naff==0 special case of the
+// former unified ipc_solveU; the affine reduced-coordinate path was removed.)
+static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N,
+                      const ipcSparse* sp, const mjtNum* mdiag,
+                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends,
                       const mjtNum* estr, const ipcCC* ccache, int nacon,
-                      const mjtNum* affH, const mjtNum* D, const mjtNum* A, const mjtNum* K,
-                      mjtNum* sfac, mjtNum* dcp, const mjtNum* gz,
-                      mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol,
-                      mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
-  int Nu = Nna + Nz;
-  for (int i=0; i < Nna; i++) r[i] = -grad[i];
-  for (int j=0; j < Nz; j++) r[Nna+j] = gz[j];
-  for (int i=0; i < Nu; i++) usol[i] = 0;
-  mjtNum r0 = 0; for (int i=0; i < Nu; i++) r0 += r[i]*r[i];
+                      mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol) {
+  for (int i=0; i < N; i++) r[i] = -grad[i];
+  for (int i=0; i < N; i++) usol[i] = 0;
+  mjtNum r0 = 0; for (int i=0; i < N; i++) r0 += r[i]*r[i];
   if (r0 < 1e-30) { for (int i=0; i < N; i++) dx[i] = 0; return 0; }
-  ipc_uPrecond(sp, Nna, aff, naff, Nz, D, A, K, sfac, dcp, r, z);
-  mjtNum rz = 0; for (int i=0; i < Nu; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
+  ipc_jacobiApply(sp, z, r);
+  mjtNum rz = 0; for (int i=0; i < N; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
   int it = 0;
-  for (; it < 200; it++) {   // matches the old ipc_pcg cap -> naff==0 is bit-identical to the flex PCG
-    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, nbe, bends, njp, jps, estr, ccache, nacon, affH, dxm, Hpm, adj);
-    mjtNum pHp = 0; for (int i=0; i < Nu; i++) pHp += p[i]*Hp[i];
+  for (; it < 200; it++) {
+    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon);
+    mjtNum pHp = 0; for (int i=0; i < N; i++) pHp += p[i]*Hp[i];
     if (pHp <= 1e-30) break;
     mjtNum alpha = rz/pHp, rr = 0;
-    for (int i=0; i < Nu; i++) { usol[i] += alpha*p[i]; r[i] -= alpha*Hp[i]; rr += r[i]*r[i]; }
+    for (int i=0; i < N; i++) { usol[i] += alpha*p[i]; r[i] -= alpha*Hp[i]; rr += r[i]*r[i]; }
     if (rr < 1e-8*r0) break;
     g_pcgN += 1;   // [PROF] total PCG iterations this step
-    ipc_uPrecond(sp, Nna, aff, naff, Nz, D, A, K, sfac, dcp, r, z);
-    mjtNum rznew = 0; for (int i=0; i < Nu; i++) rznew += r[i]*z[i];
+    ipc_jacobiApply(sp, z, r);
+    mjtNum rznew = 0; for (int i=0; i < N; i++) rznew += r[i]*z[i];
     mjtNum beta = rznew/rz; rz = rznew;
-    for (int i=0; i < Nu; i++) p[i] = z[i] + beta*p[i];
+    for (int i=0; i < N; i++) p[i] = z[i] + beta*p[i];
   }
-  for (int i=0; i < Nna; i++) dx[i] = usol[i];                  // expand solution u -> maximal dx
-  if (naff > 0) { ipc_crbForward(aff, naff, usol + Nna, dxm);
-    for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dx[Nna+12*a+i] = dxm[12*a+i]; }
+  for (int i=0; i < N; i++) dx[i] = usol[i];
   return it;
 }
 
@@ -1595,42 +872,16 @@ static mjtNum ipc_bendEnergy(int nbe, const ipcBend* bends, const mjtNum* x) {
   return E;
 }
 
-static void ipc_hingeTheta(const ipcAffine* aff, int naff, const mjtNum* bquat,
-                           const mjtNum* xold, const mjtNum* x, mjtNum* qoA, mjtNum* qnA, mjtNum* thOut);
 static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, const ipcElem* elems,
                          int nbe, const ipcBend* bends,
                          const mjtNum* x, const mjtNum* xtil, const int* fidx, const mjtNum* mass,
-                         mjtNum h, mjtNum r, const mjtNum* rad, mjtNum ghat, mjtNum kappa,
+                         mjtNum h, mjtNum r, const mjtNum* rad, mjtNum ghat,
                          const mjtNum* gv, const mjtNum* ge, const ipcCon* acon, int nacon,
-                         const ipcAffine* aff, int naff, const mjtNum* xold, const mjtNum* xfree,
-                         mjtNum* jqoA, mjtNum* jqnA, mjtNum* jthRO) {
+                         const mjtNum* xold, const mjtNum* xfree) {
   mjtNum E = 0, ih2 = 1.0/(h*h);
   for (int v=0; v < nfv; v++) if (fidx[v] >= 0) {
     mjtNum mh = mass[v]*ih2;
     for (int c=0; c < 3; c++) { mjtNum t = x[3*v+c] - xtil[3*v+c]; E += 0.5*mh*t*t; }
-  }
-  for (int a=0; a < naff; a++) E += ipc_affineGH(&aff[a], x, xtil, ih2, NULL, NULL, NULL);
-  // implicit joint passive energy (spring + damping + range-limit barrier) on the hinge angles at THIS x, so the
-  // line search SEES them and refuses to step a joint past its range. Mirrors the reduced-gradient/Hessian terms.
-  if (naff > 0 && jqoA) {
-    ipc_hingeTheta(aff, naff, d->xquat, xold, x, jqoA, jqnA, jthRO);
-    int nojp = getenv("MJ_IPC_NOJP") != NULL;
-    for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; if (!af->isHinge) continue;
-      for (int jl=0; jl < af->njnt; jl++) {
-        int jid = af->ja + jl;
-        mjtNum dth = jthRO[3*a+jl], theta = d->qpos[af->qadr+jl] + dth;
-        mjtNum k = m->jnt_stiffness[jid], cc = m->dof_damping[af->vadr+jl], ref = m->qpos_spring[af->qadr+jl];
-        if (nojp) { k = 0; cc = 0; }
-        E += 0.5*k*(theta-ref)*(theta-ref) + 0.5*(cc/h)*dth*dth;
-        if (m->jnt_limited[jid] && !nojp) {   // AL limit merit E = 0.5*kj*min(0, c - lam/kj)^2 per side (c >= 0 desired)
-          mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
-          if (kj > 0) {
-            mjtNum chi = (hi - theta) - g_jal[2*jid+1]/kj; if (chi < 0) E += 0.5*kj*chi*chi;   // upper limit
-            mjtNum clo = (theta - lo) - g_jal[2*jid+0]/kj; if (clo < 0) E += 0.5*kj*clo*clo;   // lower limit
-          }
-        }
-      }
-    }
   }
   E += ipc_stretchEnergy(nelem, elems, x);
   E += ipc_bendEnergy(nbe, bends, x);
@@ -1652,13 +903,8 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
       for (int p=0; p < acon[c].lniv; p++) { mjtNum mv = mass[acon[c].liv[p]]; if (mv < mmin) mmin = mv; }
       E += 0.5*(IPC_CDAMP_FLEX*mmin/(h*h))*dn*dn; }
   }
-  E += ipc_affineContactEnergy(m, d, aff, naff, x, xold, kappa);
-  E += ipc_affineAffineEnergy(m, aff, naff, x, xold, kappa);
   return E;
 }
-
-
-static inline mjtNum ipc_fmin(mjtNum a, mjtNum b) { return a < b ? a : b; }
 
 // append a candidate contact if its gap at x is below the (margin-inflated) detection threshold
 static void ipc_addCand(ipcCon con, const mjModel* m, const mjData* d, const mjtNum* x,
@@ -1847,7 +1093,7 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
 // consumer) is gone. Building just the block-diagonal pattern is O(N) -- no key list, no qsort, no merge.
 static void ipc_spBuild(ipcSparse* sp, int N) {
   sp->N = N;
-  int nv = N/3, nnz = 6*nv;   // N == Nna == 3*nfree; 6 lower-tri entries per 3x3 vertex block
+  int nv = N/3, nnz = 6*nv;   // N == 3*nfree; 6 lower-tri entries per 3x3 vertex block
   sp->nnz = nnz;
   sp->rownnz = (int*) mju_malloc(N*sizeof(int));
   sp->rowadr = (int*) mju_malloc(N*sizeof(int));
@@ -1892,148 +1138,14 @@ static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 }
 
 // IPC-style variational integrator (integrator="ipc"): owns the full step, minimizing the per-step incremental
-// potential (inertia + flex edge-stretch energy + affine-body dynamics) with penetration-free contact by a
-// barrier-free AUGMENTED-LAGRANGIAN method (paper arXiv 2512.12151) -- the contact multiplier carries the force at a
+// potential (inertia + flex edge-stretch + bending energy) with penetration-free contact by a barrier-free
+// AUGMENTED-LAGRANGIAN method (paper arXiv 2512.12151) -- the contact multiplier carries the force at a
 // fixed low stiffness (no log barrier, no kappa adaptation, no TOI-lock); the inner optimizer is solved freely and
 // the committed output is a conservative-CCD blend from the last intersection-free state. Covers flex self-contact
-// (vertex-triangle + edge-edge), flex-vs-geom, affine-vs-geom, and affine-affine. Falls back to Euler if no 2D flex.
+// (vertex-triangle + edge-edge) and flex-vs-geom. Flex-only: falls back to Euler if no 2D flex.
 // contact-stiffness floor: the AL's penalty stiffness mu is auto-set to 0.1*max(inertia diag) each step
 // (matched to the system Hessian scale, paper Eq.20); this is only the pre-mdiag init placeholder.
 #define IPC_KAPPA0   1000.0
-
-// radii of gyration r_j = sqrt(S_jj/m), S_jj = (I_kk+I_ll-I_jj)/2 (second moment from principal inertia)
-static void ipc_radiiGyr(const mjModel* m, int b, mjtNum r[3]) {
-  mjtNum mb = m->body_mass[b], Ix = m->body_inertia[3*b], Iy = m->body_inertia[3*b+1], Iz = m->body_inertia[3*b+2];
-  mjtNum S[3] = { 0.5*(Iy+Iz-Ix), 0.5*(Ix+Iz-Iy), 0.5*(Ix+Iy-Iz) };
-  for (int j=0; j < 3; j++) r[j] = sqrt((S[j] > mjMINVAL ? S[j] : mjMINVAL) / (mb > mjMINVAL ? mb : mjMINVAL));
-}
-
-// world positions of an affine body's 4 control points at body pose (pos, quat): cp_k = pos + R(quat)*Xr_k
-static void ipc_affineCP(const ipcAffine* af, const mjtNum* pos, const mjtNum* quat, mjtNum cp[4][3]) {
-  for (int k=0; k < 4; k++) {
-    mjtNum v[3]; mju_rotVecQuat(v, af->Xr[k], quat);
-    for (int c=0; c < 3; c++) cp[k][c] = pos[c] + v[c];
-  }
-}
-
-// recover body pose (-> qpos) and velocity (-> qvel) from the 4 solved control points. F = D_curr*Dinv is
-// the body rotation directly (body-frame tetra); warm-start mju_mat2Rot from quat_old (~1-2 iterations).
-static void ipc_affineReadback(const ipcAffine* af, const mjtNum cp[4][3], mjtNum h,
-                               const mjtNum* pos_old, const mjtNum* quat_old, mjtNum* qpos, mjtNum* qvel) {
-  mjtNum Dc[9], F[9];
-  for (int c=0; c < 3; c++) for (int j=0; j < 3; j++) Dc[3*c+j] = cp[j+1][c] - cp[0][c];   // world edges
-  for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {                                    // F = Dc * Dinv
-    mjtNum s = 0; for (int k=0; k < 3; k++) s += Dc[3*i+k]*af->Dinv[3*k+j]; F[3*i+j] = s;
-  }
-  mjtNum qbody[4]; for (int c=0; c < 4; c++) qbody[c] = quat_old[c];   // warm start
-  mju_mat2Rot(qbody, F);                                              // closest rotation to F = R_body
-  mjtNum v[3], pos[3];
-  mju_rotVecQuat(v, af->Xr[0], qbody);
-  for (int c=0; c < 3; c++) pos[c] = cp[0][c] - v[c];                 // body origin = cp0 - R_body*Xr0
-  for (int c=0; c < 3; c++) qpos[af->qadr+c] = pos[c];
-  for (int c=0; c < 4; c++) qpos[af->qadr+3+c] = qbody[c];
-  for (int c=0; c < 3; c++) qvel[af->vadr+c] = (pos[c]-pos_old[c])/h;
-  mjtNum dang[3];
-  mju_subQuat(dang, qbody, quat_old);                                // local-frame rotational difference
-  for (int c=0; c < 3; c++) qvel[af->vadr+3+c] = dang[c]/h;
-}
-
-// body rotation quaternion from the 4 control points (F = D_curr*Dinv -> closest rotation), warm-started
-static void ipc_affineQuat(const ipcAffine* af, const mjtNum cp[4][3], const mjtNum* qws, mjtNum* qout) {
-  mjtNum Dc[9], F[9];
-  for (int c=0; c < 3; c++) for (int j=0; j < 3; j++) Dc[3*c+j] = cp[j+1][c] - cp[0][c];
-  for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
-    mjtNum s = 0; for (int k=0; k < 3; k++) s += Dc[3*i+k]*af->Dinv[3*k+j]; F[3*i+j] = s; }
-  for (int c=0; c < 4; c++) qout[c] = qws[c];
-  mju_mat2Rot(qout, F);
-}
-// signed rotation angle about a unit axis of the increment from qo to qn (dq = qn * qo^-1, world frame)
-// relative rotation vector (axis*angle) of the increment from qo to qn: dq = qn * qo^-1, then quat->vel
-static void ipc_twistVec(const mjtNum* qn, const mjtNum* qo, mjtNum out[3]) {
-  mjtNum qoi[4] = {qo[0], -qo[1], -qo[2], -qo[3]}, dq[4];
-  mju_mulQuat(dq, qn, qoi);
-  mju_quat2Vel(out, dq, 1.0);
-}
-// Hinge-angle readback: per affine hinge body, the njnt joint-angle increments th[] from the body's rotation
-// (control points xold->x), projected onto its hinge axes by truncated-SVD pseudo-inverse (gimbal-lock-robust).
-// Used both per Newton iter (implicit joint spring/damp/limit needs the CURRENT angle theta = qpos + th) and
-// at the final readback. thOut[3*a + j] = the j-th hinge increment of affine body a (0 for free/non-hinge).
-static void ipc_hingeTheta(const ipcAffine* aff, int naff, const mjtNum* bquat,
-                           const mjtNum* xold, const mjtNum* x, mjtNum* qoA, mjtNum* qnA, mjtNum* thOut) {
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a];
-    mjtNum cpo[4][3], cpn[4][3];
-    for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo[k][c] = xold[3*af->cp[k]+c]; cpn[k][c] = x[3*af->cp[k]+c]; }
-    ipc_affineQuat(af, cpo, bquat+4*af->body, qoA+4*a);
-    ipc_affineQuat(af, cpn, bquat+4*af->body, qnA+4*a);
-  }
-  for (int a=0; a < naff; a++) {
-    const ipcAffine* af = &aff[a];
-    thOut[3*a] = thOut[3*a+1] = thOut[3*a+2] = 0;
-    if (!af->isHinge) continue;
-    int k = af->njnt;
-    mjtNum wrel[3]; ipc_twistVec(qnA+4*a, qoA+4*a, wrel);
-    if (af->jparent >= 0) { mjtNum wp[3]; ipc_twistVec(qnA+4*af->jparent, qoA+4*af->jparent, wp);
-      for (int c=0; c < 3; c++) wrel[c] -= wp[c]; }
-    mjtNum AtA[9] = {0}, Atb[3] = {0}, th[3] = {0};
-    for (int i=0; i < k; i++) {
-      for (int j=0; j < k; j++) { mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*af->jaxis[j][c]; AtA[3*i+j] = s; }
-      mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*wrel[c]; Atb[i] = s;
-    }
-    if (k == 1) { th[0] = Atb[0]/AtA[0]; }
-    else {
-      mjtNum eval[3], evec[9], q4[4];
-      mju_eig3(eval, evec, q4, AtA);
-      mjtNum tol = 1e-2 * (eval[0] > 0 ? eval[0] : 1.0);
-      for (int j=0; j < 3; j++) {
-        if (eval[j] <= tol) continue;
-        mjtNum vAtb = evec[j]*Atb[0] + evec[3+j]*Atb[1] + evec[6+j]*Atb[2];
-        mjtNum cf = vAtb/eval[j];
-        th[0] += cf*evec[j]; th[1] += cf*evec[3+j]; th[2] += cf*evec[6+j];
-      }
-    }
-    thOut[3*a] = th[0]; thOut[3*a+1] = th[1]; thOut[3*a+2] = th[2];
-  }
-}
-
-// single-body hinge angle theta_jl at free-point positions x (relative to xold), for the joint-passive FD Jacobian
-// dtheta/dx. Mirrors ipc_hingeTheta's per-body axis projection but for ONE body (+ its parent), so each FD
-// perturbation is O(1). Returns the jl-th component of the axis-projected relative twist.
-static mjtNum ipc_hingeThetaOne(const ipcAffine* aff, int naff, int a, int jl,
-                                const mjtNum* bquat, const mjtNum* xold, const mjtNum* x) {
-  const ipcAffine* af = &aff[a];
-  mjtNum cpo[4][3], cpn[4][3], qo[4], qn[4], wrel[3];
-  for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo[k][c] = xold[3*af->cp[k]+c]; cpn[k][c] = x[3*af->cp[k]+c]; }
-  ipc_affineQuat(af, cpo, bquat+4*af->body, qo);
-  ipc_affineQuat(af, cpn, bquat+4*af->body, qn);
-  ipc_twistVec(qn, qo, wrel);
-  if (af->jparent >= 0) { const ipcAffine* afp = &aff[af->jparent];
-    mjtNum cpo2[4][3], cpn2[4][3], qo2[4], qn2[4], wp[3];
-    for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo2[k][c] = xold[3*afp->cp[k]+c]; cpn2[k][c] = x[3*afp->cp[k]+c]; }
-    ipc_affineQuat(afp, cpo2, bquat+4*afp->body, qo2);
-    ipc_affineQuat(afp, cpn2, bquat+4*afp->body, qn2);
-    ipc_twistVec(qn2, qo2, wp);
-    for (int c=0; c < 3; c++) wrel[c] -= wp[c];
-  }
-  int k = af->njnt; mjtNum AtA[9] = {0}, Atb[3] = {0}, th[3] = {0};
-  for (int i=0; i < k; i++) {
-    for (int j=0; j < k; j++) { mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*af->jaxis[j][c]; AtA[3*i+j] = s; }
-    mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*wrel[c]; Atb[i] = s;
-  }
-  if (k == 1) { th[0] = Atb[0]/AtA[0]; }
-  else {
-    mjtNum eval[3], evec[9], q4[4];
-    mju_eig3(eval, evec, q4, AtA);
-    mjtNum tol = 1e-2 * (eval[0] > 0 ? eval[0] : 1.0);
-    for (int j=0; j < 3; j++) {
-      if (eval[j] <= tol) continue;
-      mjtNum vAtb = evec[j]*Atb[0] + evec[3+j]*Atb[1] + evec[6+j]*Atb[2];
-      mjtNum cf = vAtb/eval[j];
-      th[0] += cf*evec[j]; th[1] += cf*evec[3+j]; th[2] += cf*evec[6+j];
-    }
-  }
-  return th[jl];
-}
 
 void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum h = m->opt.timestep;
@@ -2042,209 +1154,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // into the free-point array in flex order; fxadr[k] is the free-point offset of dim-2 flex flist[k].
   int nfd = 0;
   for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) nfd++;
-  // affine bodies: free joint, or a single hinge whose parent is static (pendulum) or itself affine (chain).
-  // isAff propagates down the tree (bodies processed parent-before-child, so the parent's flag is set first).
-  char* isAff = (char*) mju_malloc((m->nbody > 0 ? m->nbody : 1)*sizeof(char));
-  for (int b=0; b < m->nbody; b++) {
-    isAff[b] = 0;
-    int nj = m->body_jntnum[b];
-    if (nj == 1 && m->jnt_type[m->body_jntadr[b]] == mjJNT_FREE) { isAff[b] = 1; continue; }
-    if (nj >= 1 && nj <= 3) {                                  // 1-3 hinges sharing an anchor (ball/universal)
-      int allhinge = 1;
-      for (int j=m->body_jntadr[b]; j < m->body_jntadr[b]+nj; j++) if (m->jnt_type[j] != mjJNT_HINGE) allhinge = 0;
-      if (allhinge && (m->body_dofnum[m->body_parentid[b]] == 0 || isAff[m->body_parentid[b]])) isAff[b] = 1;
-    }
-  }
-  int naff = 0, naffpt = 0;   // affine bodies; every body owns its own non-degenerate 4-control-point tetra
-  for (int b=0; b < m->nbody; b++) if (isAff[b]) { naff++; naffpt += 4; }
-  if (nfd == 0 && naff == 0) { mj_Euler(m, d); mju_free(isAff); return; }
-  ipcAffine* aff = (ipcAffine*) mju_malloc((naff > 0 ? naff : 1)*sizeof(ipcAffine));
-  int* bidx = (int*) mju_malloc((m->nbody > 0 ? m->nbody : 1)*sizeof(int));   // body id -> affine index (-1)
-  for (int b=0; b < m->nbody; b++) bidx[b] = -1;
-  for (int b=0, a=0; b < m->nbody; b++) {
-    if (!isAff[b]) continue;
-    bidx[b] = a;
-    ipcAffine* af = &aff[a];
-    int ja = m->body_jntadr[b];
-    af->body = b; af->qadr = m->jnt_qposadr[ja]; af->vadr = m->jnt_dofadr[ja]; af->ja = ja;
-    int isfree = (m->jnt_type[ja] == mjJNT_FREE);
-    int parstatic = (m->body_dofnum[m->body_parentid[b]] == 0);
-    af->isHinge = !isfree; af->njnt = m->body_jntnum[b];
-    af->jstatic = (!isfree && parstatic);
-    af->jparent = (!isfree && !parstatic) ? bidx[m->body_parentid[b]] : -1;
-    for (int c=0; c < 3; c++) af->hpt[c] = 0;
-    mjtNum ipos[3], iquat[4], Rin[9];
-    for (int c=0; c < 3; c++) ipos[c] = m->body_ipos[3*b+c];
-    for (int c=0; c < 4; c++) iquat[c] = m->body_iquat[4*b+c];
-    mju_quat2Mat(Rin, iquat);                                    // inertial (principal) axes in the body frame
-    mjtNum mb = m->body_mass[b], Ix = m->body_inertia[3*b], Iy = m->body_inertia[3*b+1], Iz = m->body_inertia[3*b+2];
-    mjtNum S[3] = { 0.5*(Iy+Iz-Ix), 0.5*(Ix+Iz-Iy), 0.5*(Ix+Iy-Iz) }, r[3];
-    ipc_radiiGyr(m, b, r);
-    // EVERY body (free, hinge-to-static, hinge-child) uses its own radii-of-gyration tetra: COM + principal
-    // axes, always non-degenerate. The inertia is the body's real inertia expressed in this basis; joints are
-    // a separate coincidence penalty, so the tetra is NEVER placed on a joint axis (no coplanar degeneracy).
-    for (int c=0; c < 3; c++) af->Xr[0][c] = ipos[c];
-    for (int j=0; j < 3; j++) for (int c=0; c < 3; c++) af->Xr[j+1][c] = ipos[c] + r[j]*Rin[3*c+j];
-    a++;
-    // Dinv = ([Xr1-Xr0, Xr2-Xr0, Xr3-Xr0])^-1 (rows c, cols m) for the orthogonality frame F = D_curr*Dinv
-    mjtNum Drest[9];
-    for (int c=0; c < 3; c++) for (int mm=0; mm < 3; mm++) Drest[3*c+mm] = af->Xr[mm+1][c] - af->Xr[0][c];
-    ipc_mat3inv(af->Dinv, Drest);
-    // B (rows [1, Xr_i^T]) and its inverse: maps node positions <-> affine coords (feature + joint weights)
-    mjtNum B[16], Binv[16];
-    for (int i=0; i < 4; i++) { B[4*i] = 1; for (int c=0; c < 3; c++) B[4*i+1+c] = af->Xr[i][c]; }
-    ipc_mat4inv(Binv, B);
-    for (int i=0; i < 16; i++) af->Binv[i] = Binv[i];
-    // affine inertia M_cp4 = Binv^T M_aff Binv, M_aff = [[M, fm^T],[fm, S2]] for the RIGID COMPOSITE of this
-    // body PLUS its welded (0-joint) descendants (head, hands): their mass is in qacc_smooth (which the FK
-    // predictor uses), so it must be in the solve inertia too -- otherwise the parent of a welded body has
-    // too-light inertia, the solve under-resolves, and the read-back injects spurious joint energy.
-    // M = total mass, fm = first moment about the body origin, S2 = second moment about the body origin.
-    mjtNum S2[9], Maff[16], tmp[16], Mtot = mb, fm[3];
-    for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
-      mjtNum s = 0; for (int k=0; k < 3; k++) s += Rin[3*i+k]*S[k]*Rin[3*j+k];
-      S2[3*i+j] = s + mb*ipos[i]*ipos[j];
-    }
-    for (int c=0; c < 3; c++) fm[c] = mb*ipos[c];
-    for (int dby=1; dby < m->nbody; dby++) {           // welded descendants whose nearest jointed ancestor is b
-      if (m->body_jntnum[dby] != 0) continue;
-      int pa = m->body_parentid[dby]; while (pa > 0 && m->body_jntnum[pa] == 0) pa = m->body_parentid[pa];
-      if (pa != b) continue;
-      const mjtNum* Rb = d->xmat + 9*b; mjtNum cp[3], rel[3], Rp[9];
-      for (int c=0; c < 3; c++) rel[c] = d->xipos[3*dby+c] - d->xpos[3*b+c];
-      mju_mulMatTVec3(cp, Rb, rel);                            // welded body's COM in b's frame
-      mju_mulMatTMat(Rp, Rb, d->ximat+9*dby, 3, 3, 3);         // its principal axes in b's frame
-      mjtNum md = m->body_mass[dby], Id0 = m->body_inertia[3*dby], Id1 = m->body_inertia[3*dby+1], Id2 = m->body_inertia[3*dby+2];
-      mjtNum Sd[3] = { 0.5*(Id1+Id2-Id0), 0.5*(Id0+Id2-Id1), 0.5*(Id0+Id1-Id2) };
-      Mtot += md; for (int c=0; c < 3; c++) fm[c] += md*cp[c];
-      for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
-        mjtNum s = 0; for (int k=0; k < 3; k++) s += Rp[3*i+k]*Sd[k]*Rp[3*j+k];
-        S2[3*i+j] += s + md*cp[i]*cp[j];
-      }
-    }
-    for (int i=0; i < 16; i++) Maff[i] = 0;
-    Maff[0] = Mtot;
-    for (int c=0; c < 3; c++) { Maff[c+1] = fm[c]; Maff[4*(c+1)] = fm[c]; }
-    for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) Maff[4*(i+1)+(j+1)] = S2[3*i+j];
-    for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) {        // tmp = Maff * Binv
-      mjtNum s = 0; for (int k=0; k < 4; k++) s += Maff[4*i+k]*Binv[4*k+j]; tmp[4*i+j] = s;
-    }
-    for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) {        // Mcp4 = Binv^T * tmp
-      mjtNum s = 0; for (int k=0; k < 4; k++) s += Binv[4*k+i]*tmp[4*k+j]; af->Mcp4[i][j] = s;
-    }
-    // orthogonality (rigidity) stiffness. The residual non-rigidity is O(stress/kappaO) and the lossy qpos
-    // round-trip turns it into a contact error under strong forces; merely cranking kappaO masks that
-    // (and over-conditions). The real fix is exact rigidity (AL multiplier on orthogonality) or substepping.
-    mjtNum rbar2 = (r[0]*r[0] + r[1]*r[1] + r[2]*r[2]) / 3.0;
-    af->kappaO = 1.0e4 * mb / (h*h) * rbar2;
-    af->ghatC = 0.2 * ipc_fmin(r[0], ipc_fmin(r[1], r[2]));
-    // penalty path needs ~3x more normal damping to suppress the spring's parametric/impact resonance (a
-    // narrow stiffness+excitation match that blew up otherwise); auto-set, no per-scene tuning.
-    af->cdampH = 0.1 * mb / (h*h);
-    // collision features as affine combinations of the control points: box -> 8 corners (radius 0),
-    // capsule/cylinder -> 2 segment ends (radius), sphere -> center. weights w = Binv^T [1, P_body].
-    af->nfeat = 0; af->ncap = 0;
-    for (int gi=m->body_geomadr[b]; gi < m->body_geomadr[b]+m->body_geomnum[b] && af->nfeat < 24; gi++) {
-      if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-      int type = m->geom_type[gi], nf = 0, feat0 = af->nfeat; mjtNum cg[8][3], frad = 0;
-      if (type == mjGEOM_BOX) {
-        for (int cr=0; cr < 8; cr++) { cg[cr][0]=(cr&1?1:-1)*m->geom_size[3*gi];
-          cg[cr][1]=(cr&2?1:-1)*m->geom_size[3*gi+1]; cg[cr][2]=(cr&4?1:-1)*m->geom_size[3*gi+2]; }
-        nf = 8;
-      } else if (type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) {
-        cg[0][0]=cg[0][1]=0; cg[0][2]=-m->geom_size[3*gi+1];
-        cg[1][0]=cg[1][1]=0; cg[1][2]= m->geom_size[3*gi+1]; nf = 2; frad = m->geom_size[3*gi];
-      } else if (type == mjGEOM_SPHERE) {
-        cg[0][0]=cg[0][1]=cg[0][2]=0; nf = 1; frad = m->geom_size[3*gi];
-      }
-      for (int f=0; f < nf && af->nfeat < 24; f++) {
-        mjtNum v[3], Pb[3]; mju_rotVecQuat(v, cg[f], m->geom_quat+4*gi);   // P_body = geom_pos + R(geom_quat)*cg
-        for (int c=0; c < 3; c++) Pb[c] = m->geom_pos[3*gi+c] + v[c];
-        for (int i=0; i < 4; i++)
-          af->cfeat[af->nfeat][i] = Binv[i] + Binv[4+i]*Pb[0] + Binv[8+i]*Pb[1] + Binv[12+i]*Pb[2];
-        af->cfrad[af->nfeat++] = frad;
-      }
-      if ((type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) && nf == 2 && af->ncap < 12) {  // pair the 2 ends
-        af->caps[af->ncap][0] = feat0; af->caps[af->ncap][1] = feat0+1; af->capgeom[af->ncap] = gi; af->ncap++;
-      }
-    }
-    // welded (0-joint) descendant geoms (head, hands) become features of this affine ancestor, so they collide
-    // with the floor instead of passing through. Their pose is fixed relative to b, so map the geom's WORLD
-    // pose into b's frame (Pb = R_b^T (geom_world - xpos_b)) and take the affine weights as for an own geom.
-    for (int dby=1; dby < m->nbody && af->nfeat < 24; dby++) {
-      if (m->body_jntnum[dby] != 0) continue;
-      int pa = m->body_parentid[dby]; while (pa > 0 && m->body_jntnum[pa] == 0) pa = m->body_parentid[pa];
-      if (pa != b) continue;
-      for (int gi=m->body_geomadr[dby]; gi < m->body_geomadr[dby]+m->body_geomnum[dby] && af->nfeat < 24; gi++) {
-        if (m->geom_contype[gi]==0 && m->geom_conaffinity[gi]==0) continue;
-        int type = m->geom_type[gi], nf = 0, feat0 = af->nfeat; mjtNum cg[8][3], frad = 0;
-        if (type == mjGEOM_BOX) {
-          for (int cr=0; cr < 8; cr++) { cg[cr][0]=(cr&1?1:-1)*m->geom_size[3*gi];
-            cg[cr][1]=(cr&2?1:-1)*m->geom_size[3*gi+1]; cg[cr][2]=(cr&4?1:-1)*m->geom_size[3*gi+2]; }
-          nf = 8;
-        } else if (type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) {
-          cg[0][0]=cg[0][1]=0; cg[0][2]=-m->geom_size[3*gi+1];
-          cg[1][0]=cg[1][1]=0; cg[1][2]= m->geom_size[3*gi+1]; nf = 2; frad = m->geom_size[3*gi];
-        } else if (type == mjGEOM_SPHERE) { cg[0][0]=cg[0][1]=cg[0][2]=0; nf = 1; frad = m->geom_size[3*gi]; }
-        for (int f=0; f < nf && af->nfeat < 24; f++) {
-          mjtNum world[3], rel[3], Pb[3];
-          mju_mulMatVec3(world, d->geom_xmat+9*gi, cg[f]);              // world = geom_xpos + R(geom)*cg
-          for (int c=0; c < 3; c++) world[c] += d->geom_xpos[3*gi+c];
-          for (int c=0; c < 3; c++) rel[c] = world[c] - d->xpos[3*b+c];
-          mju_mulMatTVec3(Pb, d->xmat+9*b, rel);                        // Pb = R_b^T (world - xpos_b)
-          for (int i=0; i < 4; i++)
-            af->cfeat[af->nfeat][i] = Binv[i] + Binv[4+i]*Pb[0] + Binv[8+i]*Pb[1] + Binv[12+i]*Pb[2];
-          af->cfrad[af->nfeat++] = frad;
-        }
-        if ((type == mjGEOM_CAPSULE || type == mjGEOM_CYLINDER) && nf == 2 && af->ncap < 12) {
-          af->caps[af->ncap][0] = feat0; af->caps[af->ncap][1] = feat0+1; af->capgeom[af->ncap] = gi; af->ncap++;
-        }
-      }
-    }
-    // hinge joints: exact linear equality constraints (axis points coincide), enforced later by null-space
-    // projection. k=1: 2 points on the axis fully coincide (-> 1-DOF hinge). k=3 (ball): the anchor coincides
-    // (3 rotational DOF). k=2 (universal): the anchor coincides + rotation about the 3rd axis a3=a1xa2 is
-    // locked by a single row. Each point is an affine combo of THIS body's control points (jw), and of the
-    // PARENT's (jwp); for a hinge to a static parent it is pinned to a fixed world target (janch).
-    if (af->isHinge) {
-      int k = af->njnt; mjtNum dl = (r[0]+r[1]+r[2]) / 3.0;
-      for (int c=0; c < 3; c++) af->hpt[c] = d->xanchor[3*ja+c];               // shared anchor (world)
-      for (int i=0; i < k; i++) for (int c=0; c < 3; c++) af->jaxis[i][c] = d->xaxis[3*(ja+i)+c];
-      mjtNum P[2][3], nrm[2][3]; int full[2] = {1,1}, np;
-      if (k == 1) { np = 2;
-        for (int c=0; c < 3; c++) { P[0][c] = af->hpt[c] - dl*af->jaxis[0][c]; P[1][c] = af->hpt[c] + dl*af->jaxis[0][c]; }
-      } else { np = 1; for (int c=0; c < 3; c++) P[0][c] = af->hpt[c];          // ball/universal: anchor coincides
-        if (k == 2) { np = 2; full[1] = 0;                                     // + lock the 3rd-axis rotation
-          mjtNum a3[3], lk[3];
-          mju_cross(a3, af->jaxis[0], af->jaxis[1]); mju_normalize3(a3);
-          mju_cross(lk, a3, af->jaxis[0]); mju_normalize3(lk);
-          for (int c=0; c < 3; c++) { P[1][c] = af->hpt[c] + dl*af->jaxis[0][c]; nrm[1][c] = lk[c]; }
-        }
-      }
-      af->njpt = np;
-      const mjtNum* RBb = d->xmat + 9*b;  const mjtNum* pBb = d->xpos + 3*b;
-      int pb = m->body_parentid[b];
-      const mjtNum* RPb = d->xmat + 9*pb; const mjtNum* pPb = d->xpos + 3*pb;
-      for (int i=0; i < np; i++) {
-        af->pfull[i] = full[i];
-        if (!full[i]) for (int c=0; c < 3; c++) af->pn[i][c] = nrm[i][c];
-        mjtNum Ab[3], rel[3];                                                  // point P[i] in THIS body's tetra
-        for (int c=0; c < 3; c++) rel[c] = P[i][c] - pBb[c];
-        mju_mulMatTVec3(Ab, RBb, rel);
-        for (int kk=0; kk < 4; kk++)
-          af->jw[i][kk] = af->Binv[kk] + af->Binv[4+kk]*Ab[0] + af->Binv[8+kk]*Ab[1] + af->Binv[12+kk]*Ab[2];
-        if (af->jstatic) { for (int c=0; c < 3; c++) af->janch[i][c] = P[i][c]; }
-        else {                                                                 // same world point in the parent
-          const ipcAffine* ap = &aff[af->jparent];
-          mjtNum Apb[3], relp[3];
-          for (int c=0; c < 3; c++) relp[c] = P[i][c] - pPb[c];
-          mju_mulMatTVec3(Apb, RPb, relp);
-          for (int kk=0; kk < 4; kk++)
-            af->jwp[i][kk] = ap->Binv[kk] + ap->Binv[4+kk]*Apb[0] + ap->Binv[8+kk]*Apb[1] + ap->Binv[12+kk]*Apb[2];
-        }
-      }
-    }
-  }
+  if (nfd == 0) { mj_Euler(m, d); return; }   // flex-only integrator: no 2D flex -> Euler fallback
   int* flist = (int*) mju_malloc(nfd*sizeof(int));   // the dim-2 flex ids
   int* fxadr = (int*) mju_malloc(nfd*sizeof(int));   // free-point offset of each dim-2 flex
   int nfv = 0, ne = 0;                               // total dim-2 flex verts / elements (all flexes)
@@ -2272,7 +1182,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int g=m->body_geomadr[b]; g < m->body_geomadr[b]+m->body_geomnum[b]; g++)
       if (m->geom_type[g] == mjGEOM_SPHERE) { nsph++; break; }
   }
-  int npt = nfv + nsph + naffpt;
+  int npt = nfv + nsph;
   int* dofadr = (int*) mju_malloc(npt*sizeof(int));
   int* qpadr  = (int*) mju_malloc(npt*sizeof(int));   // qpos address (NOT dof address: differs after
   int* fidx   = (int*) mju_malloc(npt*sizeof(int));   // free/ball joints, which have more qpos than dof)
@@ -2280,8 +1190,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum* rad  = (mjtNum*) mju_malloc(npt*sizeof(mjtNum));   // per-point radius (flex_radius / sphere size)
   int* pbody  = (int*) mju_malloc(npt*sizeof(int));          // body id, for the slide-frame rotation R
   int* pgeom  = (int*) mju_malloc(npt*sizeof(int));          // sphere geom id (>=0); -1 for a flex vertex
-  char* pcp   = (char*) mju_malloc(npt*sizeof(char));        // 1 = affine-body control point (its xold/xtil
-  for (int v=0; v < npt; v++) pcp[v] = 0;                    // and readback are handled by the affine loop)
   int nfree = 0;
   for (int k=0; k < nfd; k++) {                               // flex vertices, per dim-2 flex
     int fi = flist[k]; mjtNum rk = m->flex_radius[fi];
@@ -2308,17 +1216,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mass[p] = d->qM[m->M_rowadr[da] + m->M_rownnz[da] - 1];
     rad[p] = m->geom_size[3*gsph]; pbody[p] = b; pgeom[p] = gsph;
     p++;
-  }
-  for (int a=0; a < naff; a++) {                             // append each affine body's 4 control points
-    ipcAffine* af = &aff[a];                                 // (every body owns all 4; joints are penalties)
-    for (int k=0; k < 4; k++) {
-      af->cp[k] = p;
-      dofadr[p] = af->vadr; qpadr[p] = af->qadr;             // (shared joint addrs; handled by the aff loop)
-      fidx[p] = nfree++; af->sdof[k] = 3*fidx[p];
-      mass[p] = 0;                                           // inertia comes from the affine M_cp block,
-      rad[p] = 0; pbody[p] = af->body; pgeom[p] = -1; pcp[p] = 1;   // not the per-point diagonal
-      p++;
-    }
   }
   mju_free(isflexvert);
   int N = 3*nfree, Na = (N > 0 ? N : 1);
@@ -2428,43 +1325,16 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum* zcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* pcg  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
   mjtNum* Hpv  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
-  mjtNum* usol = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // unified solver: u-space solution + matvec scratch
-  mjtNum* dxm  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
-  mjtNum* Hpm  = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
-  mjtNum* affH = (mjtNum*) mju_malloc((naff > 0 ? 144*naff : 1)*sizeof(mjtNum)); // per-affine 12x12 Hessian (full)
-  mjtNum* affHgeo = (mjtNum*) mju_malloc((naff > 0 ? 144*naff : 1)*sizeof(mjtNum)); // geom part (subtracted for precond)
+  mjtNum* usol = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // PCG u-space solution
   mjtNum* estr = (mjtNum*) mju_malloc((ne > 0 ? 12*ne : 1)*sizeof(mjtNum)); // per-element g_a (9) + Me_a (3)
                                                                            // (full, PSD-projected, this Newton iter)
 
-  // Change A (affine impact fix): gravity-only smooth accel for the AFFINE inertial prediction. The affine-body
-  // predictor is gravity+external only (q~ = q + h*v + h^2*(g+f_ext)); our d->qacc_smooth carries qfrc_bias's
-  // velocity-coupled Coriolis/centrifugal term, which at ground impact feeds a spurious readback velocity back
-  // through C(q,v)v and flings the body (the affine analog of the flex elastic double-count). Recompute the bias
-  // at ZERO velocity (zero qvel AND cvel -- mj_rne reads both) to isolate gravity g(q), then
-  // qacc_pred = M^-1 (qfrc_passive + qfrc_applied + qfrc_actuator - g(q)). naff==0 (flex/balls) is unchanged.
+  // flex/sphere inertial prediction: q~ = q + h*v + h^2*qacc_smooth (point masses have no Coriolis).
   mjtNum* qacc_pred = (mjtNum*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));
-  if (naff > 0) {
-    mjtNum* gfrc  = (mjtNum*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));
-    mjtNum* vsave = (mjtNum*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));
-    mjtNum* cvsav = (mjtNum*) mju_malloc(6*m->nbody*sizeof(mjtNum));
-    mju_copy(vsave, d->qvel, m->nv);
-    mju_copy(cvsav, d->cvel, 6*m->nbody);
-    mju_zero(d->qvel, m->nv);
-    mju_zero(d->cvel, 6*m->nbody);
-    mj_rne(m, d, 0, gfrc);                       // gravity-only generalized force g(q) (no Coriolis)
-    mju_copy(d->qvel, vsave, m->nv);
-    mju_copy(d->cvel, cvsav, 6*m->nbody);
-    for (int i=0; i < m->nv; i++)
-      gfrc[i] = d->qfrc_applied[i] + d->qfrc_actuator[i] - gfrc[i];   // gravity+external only; joint springs/dampers are now IMPLICIT (below)
-    mj_solveM(m, d, qacc_pred, gfrc, 1);         // qacc_pred = M^-1 (qfrc_app - g(q)) = gravity-only accel
-    mju_free(gfrc); mju_free(vsave); mju_free(cvsav);
-  } else {
-    mju_copy(qacc_pred, d->qacc_smooth, m->nv);  // flex/balls path unchanged (point masses have no Coriolis)
-  }
+  mju_copy(qacc_pred, d->qacc_smooth, m->nv);
 
   const mjtNum* vx = d->flexvert_xpos;
   for (int v=0; v < npt; v++) {
-    if (pcp[v]) continue;   // affine control point: xold/xtil set in the affine loop below
     // xold position source: flex vertex from flexvert_xpos, rigid sphere from its geom center
     if (pgeom[v] < 0) for (int c=0; c < 3; c++) xold[3*v+c] = vx[3*pt2vg[v]+c];
     else              for (int c=0; c < 3; c++) xold[3*v+c] = d->geom_xpos[3*pgeom[v]+c];
@@ -2482,38 +1352,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < 3; c++) xtil[3*v+c] = xold[3*v+c];   // pinned: fixed
     }
   }
-  // predicted body poses for the affine inertial target: integrate qpos one unconstrained step
-  // (qvel + h*qacc_smooth), run FK, capture the body poses, restore. Uniform over any joint structure
-  // (free / hinge / articulated tree), and keeps shared anchor nodes consistent between parent and child.
-  mjtNum* xpos_pred = NULL; mjtNum* xquat_pred = NULL;
-  if (naff > 0) {
-    xpos_pred  = (mjtNum*) mju_malloc(3*m->nbody*sizeof(mjtNum));
-    xquat_pred = (mjtNum*) mju_malloc(4*m->nbody*sizeof(mjtNum));
-    mjtNum* qpos0 = (mjtNum*) mju_malloc((m->nq > 0 ? m->nq : 1)*sizeof(mjtNum));
-    mjtNum* qvt   = (mjtNum*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));
-    for (int i=0; i < m->nq; i++) qpos0[i] = d->qpos[i];
-    for (int i=0; i < m->nv; i++) qvt[i] = d->qvel[i] + h*qacc_pred[i];
-    mj_integratePos(m, d->qpos, qvt, h);
-    mj_kinematics(m, d);
-    for (int i=0; i < 3*m->nbody; i++) xpos_pred[i]  = d->xpos[i];
-    for (int i=0; i < 4*m->nbody; i++) xquat_pred[i] = d->xquat[i];
-    for (int i=0; i < m->nq; i++) d->qpos[i] = qpos0[i];
-    mj_kinematics(m, d);                              // restore current poses
-    mju_free(qpos0); mju_free(qvt);
-  }
-  // affine control points: xold = FK(current pose), xtil = FK(predicted pose), via each node's OWNER body
-  // (shared nodes are set once, by the parent that owns them). Pinned axis nodes are on the rotation axis,
-  // so FK leaves them fixed -> xtil == xold automatically.
-  for (int a=0; a < naff; a++) {
-    ipcAffine* af = &aff[a];
-    mjtNum cp0[4][3], cpp[4][3];
-    ipc_affineCP(af, d->xpos+3*af->body, d->xquat+4*af->body, cp0);
-    ipc_affineCP(af, xpos_pred+3*af->body, xquat_pred+4*af->body, cpp);
-    for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) {
-      xold[3*af->cp[k]+c] = cp0[k][c];
-      xtil[3*af->cp[k]+c] = cpp[k][c];
-    }
-  }
   for (int i=0; i < 3*npt; i++) x[i] = xold[i];   // start from last collision-free state (feasibility)
 
   mjtNum ih2 = 1.0/(h*h);
@@ -2521,34 +1359,20 @@ void mj_IPC(const mjModel* m, mjData* d) {
   for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
     int fi = fidx[v]; for (int c=0; c < 3; c++) mdiag[3*fi+c] = mass[v]*ih2;
   }
-  // AL contact stiffness: kappa carries a FIXED, auto-set mu = 0.1 * max(inertia diag) (flex/free mdiag +
-  // affine Mcp4*ih2), matched to the system's Hessian scale (paper Eq.20). No per-step adaptation -> no kappa
+  // AL contact stiffness: kappa carries a FIXED, auto-set mu = 0.1 * max(inertia diag),
+  // matched to the system's Hessian scale (paper Eq.20). No per-step adaptation -> no kappa
   // oscillation; non-penetration is the CCD's job (the AL force is finite).
   {
     mjtNum mmax = 0;
     for (int i=0; i < N; i++) if (mdiag[i] > mmax) mmax = mdiag[i];
-    for (int a=0; a < naff; a++) for (int k=0; k < 4; k++) { mjtNum md = aff[a].Mcp4[k][k]*ih2;
-      if (md > mmax) mmax = md; }
     kappa = 0.1*mmax;   // penalty stiffness mu = 0.1 * max(inertia diag), matched to the Hessian scale (paper Eq.20)
   }
-  {   // AL: persistent per-feature contact multiplier (warm-started across steps). Stride = max nfeat.
-    int stride = 1; for (int a=0; a < naff; a++) if (aff[a].nfeat > stride) stride = aff[a].nfeat;
-    if (g_calN != naff*stride) { mju_free(g_cal); g_calN = naff*stride; g_calStride = stride;
-      g_cal = (mjtNum*) mju_malloc((size_t)(g_calN > 0 ? g_calN : 1)*sizeof(mjtNum));
-      for (int i=0; i < g_calN; i++) g_cal[i] = 0; }
-    if (g_palN != npt) { mju_free(g_pal); g_palN = npt;       // per-free-point flex/sphere warm-start store
+  {   // AL: per-free-point flex/sphere contact-multiplier warm-start store (persisted across steps).
+    if (g_palN != npt) { mju_free(g_pal); g_palN = npt;
       g_pal = (mjtNum*) mju_malloc((size_t)(npt > 0 ? npt : 1)*sizeof(mjtNum));
       for (int i=0; i < npt; i++) g_pal[i] = 0; }            // zero ONLY on resize -> warm-start persists
-    int aacap = 1; for (int a=0; a < naff; a++) if (aff[a].ncap > aacap) aacap = aff[a].ncap;
-    g_caalCap = aacap;                                       // affine-affine per-capsule-pair multiplier store
-    int aaneed = naff*naff*aacap*aacap;
-    if (g_caalN != aaneed) { mju_free(g_caal); g_caalN = aaneed;
-      g_caal = (mjtNum*) mju_malloc((size_t)(aaneed > 0 ? aaneed : 1)*sizeof(mjtNum));
-      for (int i=0; i < aaneed; i++) g_caal[i] = 0; }
-    if (g_jalN != 2*m->njnt) { mju_free(g_jal); g_jalN = 2*m->njnt;   // per-(joint,side) AL joint-limit multiplier
-      g_jal = (mjtNum*) mju_malloc((size_t)(g_jalN > 0 ? g_jalN : 1)*sizeof(mjtNum));
-      for (int i=0; i < g_jalN; i++) g_jal[i] = 0; }                  // zero only on resize -> warm-start persists
   }
+  (void)kappa;
   // build the candidate-contact list once per step: detection threshold inflated by the predictor
   // displacement so any pair that could close during the step is captured (verified by gap checks)
   mjtNum maxdisp = 0;
@@ -2575,9 +1399,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   // warm start: with no candidate contacts within thresh, the predictor x~ is collision-free (the thresh
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
-  // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps. NOT for affine bodies:
-  // their contacts aren't in ncand, so x~ (the unconstrained rigid step) may penetrate -> start from xold.
-  if (ncand == 0 && naff == 0) for (int i=0; i < 3*npt; i++) x[i] = xtil[i];
+  // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
+  if (ncand == 0) for (int i=0; i < 3*npt; i++) x[i] = xtil[i];
   // sparse Hessian pattern (mesh + candidate-contact couplings) for the IC(0) preconditioner, once/step
   // Rayleigh damping uses the previous-step elongations e_prev = e(xold); xold is fixed over the Newton
   // loop, so cache e_prev once per step. Only needed when damping is on.
@@ -2596,22 +1419,15 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // closing-or-distance-active pairs (per-pair closing-bound prune), so every iter-0 candidate is a valid
   // initial active pair (seeding the active set from the first discrete-collision-detection pass).
   // lam/cnt were warm-started above. Aging + the per-iter CCD-toi merge then maintain it (bounded, not holdall).
-  if (naff == 0) {
-    naset = (ncand < candmax) ? ncand : candmax;
-    for (int c=0; c < naset; c++) { aset[c] = cand[c]; agap[c] = cgap[c]; }
-  }
-  // UNIFIED solve: one PCG in reduced coords u = [non-affine maximal DOF [0,Nna) ; affine reduced DOF (Nz)].
-  // The affine control points are the last 12*naff DOF of N (contiguous, see setup), so Nna = N - 12*naff is
-  // exactly the flex+free-point block. The IC(0) sparse Hessian sp covers ONLY that non-affine block; the
-  // affine block is preconditioned by its per-tree reduced-Hessian factor. (Both old paths -- the jointed
-  // CRB direct solve and the flex PCG -- are special cases of ipc_solveU below.)
-  int Nna = N - 12*naff;
-  if (Nna > 0) ipc_spBuild(&sp, Nna);   // per-vertex 3x3 block-diagonal pattern (block-Jacobi precond)
+  naset = (ncand < candmax) ? ncand : candmax;
+  for (int c=0; c < naset; c++) { aset[c] = cand[c]; agap[c] = cgap[c]; }
+  // block-Jacobi preconditioner: the per-vertex 3x3 diagonal of the maximal Hessian (sp, dim N).
+  if (N > 0) ipc_spBuild(&sp, N);   // per-vertex 3x3 block-diagonal pattern (block-Jacobi precond)
   // precompute element -> CSR scatter indices once per step (the pattern is fixed over the Newton loop), so
   // the per-Newton assembly avoids a binary-search ipc_spIdx per matrix entry. -1 marks skipped entries
   // (upper-tri or pinned vertex). Order matches the assembly loop: idx = (i*3+j)*9 + a*3+b.
-  int* escat = (Nna > 0) ? (int*) mju_malloc(ne*81*sizeof(int)) : NULL;
-  if (Nna > 0) for (int t=0; t < ne; t++) {
+  int* escat = (N > 0) ? (int*) mju_malloc(ne*81*sizeof(int)) : NULL;
+  if (N > 0) for (int t=0; t < ne; t++) {
     const ipcElem* elem = &elems[t]; int k = 0;
     for (int i=0; i < 3; i++) for (int j=0; j < 3; j++) {
       int fi = elem->fv[i], fj = elem->fv[j];
@@ -2627,81 +1443,46 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // iter by delta = 4*alpha*max|dx| (a bound on how fast any gap can shrink), and refreshing it exactly
   // when a candidate enters the set. So the lower bound crosses ghat no later than the true gap (no active
   // contact is ever missed in the barrier), and the CCD's cgap-based step cap stays conservative (safe).
-  // GENUINE reduced-coordinate solve for jointed-affine, no-flex scenes (humanoid, pendulums): the free DOFs
-  // z are the only unknowns (useCRB computed above). Per-body Mb/Nb derived once; the reduced Hessian is
-  // assembled per-body by a composite (CRB) tree pass and factored directly. flex/free-affine -> PCG below.
-  int Nz = 0; mjtNum *crbGz = NULL, *crbAdj = NULL, *crbHp = NULL, *crbHc = NULL,
-                     *crbP = NULL, *crbD = NULL, *crbA = NULL, *crbK = NULL, *crbS = NULL, *crbDcp = NULL,
-                     *thRO = NULL, *qoA_ro = NULL, *qnA_ro = NULL;
-  ipcJpH* jps = NULL; int njp = 0;   // joint-passive x-space rank-1 Hessian terms (rebuilt each Newton iter)
-  if (naff > 0) {
-    Nz = ipc_buildReduction(aff, naff);
-    crbGz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));      // affine reduced gradient RHS (gz)
-    crbAdj = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // matvec tree adjoint scratch
-    crbHp  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body H = affH + contact
-    crbHc  = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body contact Hessian
-    crbP   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// ABA composite (factor scratch)
-    crbD   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body pivot factors D
-    crbA   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body A = N^T P M
-    crbK   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body K = D^-1 A
-    crbS   = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp-space accumulator)
-    crbDcp = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp increments)
-    jps = (ipcJpH*) mju_malloc((size_t)(naff > 0 ? 3*naff : 1)*sizeof(ipcJpH));  // joint passive: <=3 hinge angles/body
-    thRO    = (mjtNum*) mju_malloc((size_t)3*naff*sizeof(mjtNum));   // per-iter hinge-angle increments (readback)
-    qoA_ro  = (mjtNum*) mju_malloc((size_t)4*naff*sizeof(mjtNum));   // readback quat scratch (xold pose)
-    qnA_ro  = (mjtNum*) mju_malloc((size_t)4*naff*sizeof(mjtNum));   // readback quat scratch (current x)
-  }
   for (int i=0; i < 3*npt; i++) xfree[i] = xold[i];   // intersection-free output path (paper x[k]), from feasible xold
-  // Unified AL Newton loop for BOTH paths (was: affine ran a nested outer(24)/inner(40) grind with
-  // product-to-0 beta + Armijo-break, leaving contact/joint forces off-equilibrium -> injected energy at impact).
-  // ONE single Newton loop (inner_cap=1), beta ACCUMULATES to 1 (beta += (1-beta)*ac), terminate when
+  // Single AL Newton loop: inner_cap=1, beta ACCUMULATES to 1 (beta += (1-beta)*ac), terminate when
   // beta >= 1 - IPC_TOI_THRESH (0.9) AND (outer+1 >= min_iter OR newton_converged); no floor, no CFL cap, plain
-  // monotone-or-converged line search. The affine ASSEMBLY (CRB reduction, ortho/kappaO Hessian, affine contact +
-  // joints) is unchanged -- only the loop CONTROL is unified across paths.
+  // monotone-or-converged line search.
   mjtNum beta = 0.0;
   mjtNum beta_eps = 1e-3;     // (legacy; only referenced by the profiler now)
   int inner_cap = 1;
   int outer_cap = 1024;       // newton_max_iter
   mjtNum last_maxdx = 1e30;    // last inner Newton-direction magnitude, exposed to the outer early-out
   int prof_outer=0, prof_inner=0, prof_cb=1, prof_nacon=0;   // MJ_IPC_PROF counters (cb: 1 initial build)
-  for (int outer=0; outer < outer_cap && N > 0; outer++) {   // OUTER loop (single AL loop for flex; paper Alg.1)
+  for (int outer=0; outer < outer_cap && N > 0; outer++) {   // OUTER loop (single AL loop; paper Alg.1)
   prof_outer++;
   g0 = -1;                    // reset the inner-Newton relative stop each outer iteration
-  // WORKING SET selection. AFFINE (naff>0): the per-iter broad-phase cand/cgap/held/ncand (UNCHANGED -- the affine
-  // path is byte-for-byte identical). FLEX (naff==0): the PERSISTENT active set aset/agap/aheld/naset maintained
-  // across outer iters by ipc_mergeActiveSet (the persistent active-set manager). aheld is all-1: assemble/energy/
-  // slack/lambda run over the ENTIRE persistent set (the aging eviction -- not a per-iter ld0<ghat test -- bounds it).
-  ipcCon* wcon = (naff == 0) ? aset  : cand;
-  mjtNum* wgap = (naff == 0) ? agap  : cgap;
-  int*    wheld = (naff == 0) ? aheld : held;
-  int     wn   = (naff == 0) ? naset : ncand;
+  // WORKING SET: the PERSISTENT active set aset/agap/aheld/naset maintained across outer iters by
+  // ipc_mergeActiveSet (the persistent active-set manager). aheld is all-1: assemble/energy/slack/lambda
+  // run over the ENTIRE persistent set (the aging eviction -- not a per-iter ld0<ghat test -- bounds it).
+  ipcCon* wcon = aset;
+  mjtNum* wgap = agap;
+  int*    wheld = aheld;
+  int     wn   = naset;
   // N1 linearize_constraints (at xfree, Eq.10): ld0/ln/lcw/liv this iter -> c(x) is linear in x.
   for (int c=0; c < wn; c++)
     wcon[c].ld0 = ipc_conGap(&wcon[c], m, d, xfree, gv, ge, r, rad,
                              wcon[c].ln, wcon[c].liv, wcon[c].lcw, &wcon[c].lniv, ghat);
-  // RESTART the optimizer from the feasible base each outer iter (flex path). Our design solves a FREE x and advances
+  // RESTART the optimizer from the feasible base each outer iter. Our design solves a FREE x and advances
   // a SEPARATE feasible shadow xfree; left to accumulate, x runs ahead of xfree whenever the CCD can't follow (ac->0),
-  // |x-xfree| grows, the re-query margin 4*maxstep (~line 2667) explodes the broad-phase (ncand 238k) and beta
-  // collapses -> the contact-set-explosion NaN. We COMMIT xfree (line ~2724), keeping a single CCD-advanced
-  // position, so tying x to the feasible base each iter costs nothing in committed motion and kills the divergence.
+  // |x-xfree| grows, the re-query margin explodes the broad-phase and beta collapses -> the contact-set-explosion
+  // NaN. We COMMIT xfree, keeping a single CCD-advanced position, so tying x to the feasible base each iter costs
+  // nothing in committed motion and kills the divergence.
   for (int i=0; i < 3*npt; i++) x[i] = xfree[i];   // restart the optimizer from the feasible base each Newton iter
   (void)minc; (void)appr; (void)gam; (void)actc;
-  // AFFINE held mask: hold distance-active candidates (ld0<ghat). FLEX: aheld is all-1 (the whole persistent set
-  // is assembled; the merge/aging is the active-set manager).
-  if (naff > 0) {
-    for (int c=0; c < wn; c++) wheld[c] = (wcon[c].ld0 < ghat) ? 1 : 0;
-  }
-  // N2 update_slack (at x): materialize s[c] and the slack-baked d the assemble (ipc_try) / lambda use. Runs for
-  // both paths so the shared flex/sphere contact bookkeeping is consistent (affine-specific contacts are separate).
+  // N2 update_slack (at x): materialize s[c] and the slack-baked d the assemble (ipc_try) / lambda use.
   ipc_updateSlack(wcon, wn, wheld, x, xfree, rad, ghat, mass, ih2);
-  mjtNum gprev = 1e30; int stall = 0;   // inner-Newton stagnation guard (affine path)
-  int newton_converged_out = 0;   // (flex) carry the last inner iter's newton_converged to the outer termination
+  int newton_converged_out = 0;   // carry the last inner iter's newton_converged to the outer termination
   for (int it=0; it < inner_cap && N > 0; it++) {
     prof_inner++; g_nact = 0;   // [PROF] reset active count; last inner iter's value is read in the profiler print
     for (int i=0; i < N; i++) grad[i] = 0;
-    if (Nna > 0) {                                            // IC0 sparse Hessian over the non-affine block
+    if (N > 0) {                                              // IC0 sparse Hessian (per-vertex 3x3 diagonal)
       for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;
-      for (int fi=0; fi < Nna/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
+      for (int fi=0; fi < N/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
         sp.val[ipc_spIdx(&sp, 3*fi+c, 3*fi+c)] += mdiag[3*fi+c];
     }
     for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
@@ -2768,19 +1549,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
         for (int kc=0; kc < 3; kc++) { int id = ipc_spIdx(&sp, 3*fi+kc, 3*fi+kc); if (id >= 0) sp.val[id] += qii; }
       }
     }
-    // affine bodies: inertia + FULL orthogonality Hessian (GN + geometric) -> affH (the matrix-free matvec =
-    // true Newton operator). The geometric part is also saved (affHgeo) so the PRECONDITIONER can use the PD
-    // Gauss-Newton block (affH - affHgeo); the full block in the preconditioner would lose definiteness and
-    // cost CG iterations. affH is NOT scattered into the IC0 sparse Hessian (the affine block is the per-tree factor).
-    for (int a=0; a < naff; a++) {
-      mjtNum g12[12], H12[12][12], H12geo[12][12];
-      ipc_affineGH(&aff[a], x, xtil, ih2, g12, H12, H12geo);
-      mjtNum* Hb = affH + 144*a; mjtNum* Hg = affHgeo + 144*a;
-      for (int i=0; i < 12; i++) for (int j=0; j < 12; j++) { Hb[12*i+j] = H12[i][j]; Hg[12*i+j] = H12geo[i][j]; }
-      for (int i=0; i < 12; i++) grad[aff[a].sdof[i/3] + (i%3)] += g12[i];
-    }
-    // (hinge joints are eliminated exactly by the reduced coordinates -- the per-body cp gradient/Hessian
-    // above are reduced into the free DOFs z inside ipc_solveU; nothing joint-related is added here.)
     // assemble active contacts. First Newton iter: scan all candidates (initializes cgap exactly). Later
     // iters: only re-test the active set {cgap < ghat} (cgap is a maintained lower bound, so this set
     // contains every candidate that is or could be active). grad/acon/ccache get the active barrier blocks.
@@ -2792,17 +1560,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < wn; c++) if (wheld[c] && wgap[c] < ghat)
         ipc_try(wcon[c], m, d, x, xfree, gv, ge, r, rad, ghat, xold, mass, ih2, fidx, grad, acon, ccache, &nacon, amax, &wgap[c]);
     }
-    if (naff > 0) for (int i=0; i < 144*naff; i++) crbHc[i] = 0;   // per-body contact Hessian (affine precond)
-    ipc_affineContact(m, d, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, naff > 0 ? crbHc : NULL);
-    int nacon_ground = nacon;   // [DIAG] contacts from body-vs-static-geom (incl. ground)
-    ipc_affineAffineContact(m, aff, naff, x, xold, kappa, grad, ccache, &nacon, amax, naff > 0 ? crbHc : NULL);  // self-collision
-    if (getenv("MJ_IPC_CSPLIT")) fprintf(stderr, "    CSPLIT ground=%d inter-affine=%d\n", nacon_ground, nacon - nacon_ground);
     if (nacon > prof_nacon) prof_nacon = nacon;
-    if (Nna > 0) for (int c=0; c < nacon; c++) {             // contact GN -> IC0 sparse Hessian (non-affine block)
+    for (int c=0; c < nacon; c++) {                          // contact GN -> IC0 sparse Hessian
       const ipcCC* cc = &ccache[c];
       for (int p=0; p < cc->nidx; p++) for (int q=0; q < cc->nidx; q++) {
         int fp = cc->f[p], fq = cc->f[q]; if (fp < 0 || fq < 0) continue;
-        if (3*fp >= Nna || 3*fq >= Nna) continue;   // affine DOF: not in sp (handled by the per-tree factor)
         mjtNum w2 = cc->bdd*cc->cw[p]*cc->cw[q];
         for (int a=0; a < 3; a++) for (int b=0; b < 3; b++) {
           int R = 3*fp+a, C = 3*fq+b; if (C > R) continue;
@@ -2814,89 +1576,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // than the old absolute 1e-8) so the test is scale-invariant across scenes/units: the absolute floor
     // depends on mass/h^2, kappa, mesh, so a fixed 1e-8 sat at/below the achievable gradient floor for
     // stiff-contact steps -> Newton ground out useless iterations after it had already converged.
-    // residual norm: reduced (||grad_z||, the genuine reduced gradient) for the CRB solve, else projected ||grad||
-    // unified reduced residual norm: ||[grad_na ; gz]|| spanning the non-affine block and the affine reduced
-    // gradient gz = -Nb^T adj (ipc_reduceGrad, on the affine block grad[Nna..N)). crbGz holds gz for the solve.
     mjtNum gnorm, gna2 = 0;
-    for (int i=0; i < Nna; i++) gna2 += grad[i]*grad[i];
-    mjtNum gaff = 0;
-    if (naff > 0) {
-      for (int a=0; a < naff; a++) for (int i=0; i < 144; i++)   // BLOCK-JACOBI precond: FULL per-body 12x12 Hessian
-        crbHp[144*a+i] = affH[144*a+i] + crbHc[144*a+i];          // (inertia + ortho_GN + PSD-projected geom + contact).
-      // The geom block is already PSD-clamped in ipc_affineGH (ipc_makeSPD4), so keeping it makes crbHp MATCH the
-      // matvec (affH) -- was affH - affHgeo (dropped geom, a pre-PSD-projection relic), which mismatched the operator and
-      // crawled the kappaO PCG past its 200 cap. Matching it converges the affine PCG in a few iters (the
-      // per-body 12x12 block-Jacobi preconditioner), so the single-Newton loop converges.
-      (void)affHgeo;
-      // joint passive (spring + damper + AL limit) in x-space: theta is a nonlinear function of the free points,
-      // so assemble dE/dtheta * dtheta/dx into the MAXIMAL gradient (grad) and h*(dtheta/dx)(dtheta/dx)^T as a
-      // matrix-free rank-1 term per angle (jps, applied in ipc_applyH); the Nb reduction (ipc_reduceGrad below +
-      // the CRB factor) then projects BOTH correctly, including the body-body parent coupling. (Was assembled into
-      // the reduced slot z[zadr+jl] assuming z==theta -- FALSE: Nb is an arbitrary null-space basis, so dtheta/dz is
-      // spread across columns; that mis-projection softened + mis-aimed the force. See review wm4stxw2z.)
-      njp = 0;
-      int nojp = getenv("MJ_IPC_NOJP") != NULL;   // [ABLATE] disable spring+damp+limit
-      mjtNum thmax = 0;
-      ipc_hingeTheta(aff, naff, d->xquat, xold, x, qoA_ro, qnA_ro, thRO);
-      if (!nojp) for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; if (!af->isHinge) continue;
-        for (int jl=0; jl < af->njnt; jl++) {
-          int jid = af->ja + jl;
-          mjtNum dth = thRO[3*a+jl], theta = d->qpos[af->qadr+jl] + dth;
-          if (theta > thmax) thmax = theta; else if (-theta > thmax) thmax = -theta;
-          mjtNum ks = m->jnt_stiffness[jid], cd = m->dof_damping[af->vadr+jl], ref = m->qpos_spring[af->qadr+jl];
-          mjtNum dEdth = ks*(theta - ref) + (cd/h)*dth, h2 = ks + cd/h;   // spring + damper: dE/dtheta, d2E/dtheta2
-          if (m->jnt_limited[jid]) {                                       // AL limit: dE/dtheta += fc, curvature += kj
-            mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
-            if (kj > 0) {
-              mjtNum fhi = g_jal[2*jid+1] - kj*(hi - theta); if (fhi > 0) { dEdth += fhi; h2 += kj; }   // upper
-              mjtNum flo = g_jal[2*jid+0] - kj*(theta - lo); if (flo > 0) { dEdth -= flo; h2 += kj; }   // lower
-            }
-          }
-          if (dEdth == 0 && h2 == 0) continue;
-          ipcJpH* jp = &jps[njp]; jp->ndof = 0; jp->h = h2;            // c = dtheta/dx (central FD) over body (+ parent) cps
-          const mjtNum eps = 1e-6;   // central diff: O(eps^2), no cancellation (theta ~ O(1); fwd eps=1e-7 lost ~7 digits)
-          for (int side=0; side < (af->jparent >= 0 ? 2 : 1); side++) {
-            const ipcAffine* ab = side == 0 ? af : &aff[af->jparent];
-            for (int c4=0; c4 < 4; c4++) { if (ab->sdof[c4] < 0) continue;   // pinned cp: no solver DOF, no force
-              for (int c=0; c < 3; c++) {
-                int pdof = 3*ab->cp[c4] + c;     // POINT index: x / ipc_hingeTheta are point-indexed (full)
-                int sdof = ab->sdof[c4] + c;     // SOLVER index: grad / Hp / dx are sdof-indexed (compacted by pins)
-                mjtNum sv = x[pdof];
-                x[pdof] = sv + eps; mjtNum thp = ipc_hingeThetaOne(aff, naff, a, jl, d->xquat, xold, x);
-                x[pdof] = sv - eps; mjtNum thm = ipc_hingeThetaOne(aff, naff, a, jl, d->xquat, xold, x);
-                x[pdof] = sv;
-                mjtNum cv = (thp - thm)/(2.0*eps);
-                if (cv != 0 && jp->ndof < 24) { jp->dof[jp->ndof] = sdof; jp->c[jp->ndof] = cv; jp->ndof++; }
-              }
-            }
-          }
-          for (int i=0; i < jp->ndof; i++) grad[jp->dof[i]] += dEdth * jp->c[i];   // x-space gradient
-          njp++;
-        }
-      }
-      if (getenv("MJ_IPC_JT")) fprintf(stderr, "  JNT thmax=%.3f rad (%.0f deg) njp=%d nojp=%d\n", thmax, thmax*57.3, njp, nojp);
-      gaff = ipc_reduceGrad(aff, naff, grad + Nna, crbGz, crbAdj);   // reduce grad (now incl. joint passive) -> crbGz
-    }
-    gnorm = sqrt(gna2 + gaff*gaff);
+    for (int i=0; i < N; i++) gna2 += grad[i]*grad[i];
+    gnorm = sqrt(gna2);
     if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
-    // AFFINE-only inner-Newton early stops (stagnation + relative residual). The FLEX path has inner_cap=1 and
-    // ALWAYS takes its single Newton step, so these are skipped for naff==0.
-    if (naff > 0) {
-      if (gnorm > 0.9*gprev) { if (++stall >= 2) break; } else stall = 0;   // stagnation -> hand to the outer loop
-      gprev = gnorm;
-      mjtNum ctol = 1e-6;   // AL multiplier converges only linearly; a tighter 1e-7 just wastes inner iterations
-      if (gnorm < ctol*g0 + 1e-9) break;
-    }
-    // ONE solver: per-tree affine preconditioner factors (from inertia+ortho+contact), then the unified PCG.
-    if (naff > 0) ipc_crbFactor(aff, naff, crbHp, crbP, crbD, crbA, crbK);
-    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, nbe, bends, njp, jps, estr, ccache, nacon,
-               affH, crbD, crbA, crbK, crbS, crbDcp, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj);
+    ipc_solveU(dx, grad, N, &sp, mdiag, ne, elems, nbe, bends, estr, ccache, nacon,
+               rcg, zcg, pcg, Hpv, usol);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
     for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
                                   if (n2 > maxdx) maxdx = n2; }
     maxdx = sqrt(maxdx);
     last_maxdx = maxdx;   // expose to the outer early-out (system-at-rest test)
-    if (naff == 0 && getenv("MJ_IPC_PROF")) {   // [DIAG] Newton-decrement sign: gdx=grad.dx>0 => ascent => indefinite H
+    if (getenv("MJ_IPC_PROF")) {   // [DIAG] Newton-decrement sign: gdx=grad.dx>0 => ascent => indefinite H
       mjtNum gdx = 0; for (int i=0; i < N; i++) gdx += grad[i]*dx[i];
       static long ac = 0; if (gdx > 1e-9 && ac++ < 30)
         fprintf(stderr, "[ASCENT] outer=%d gdx=%+.3e maxdx=%.3e -> indefinite H (PSD clamp insufficient)\n", outer, gdx, maxdx);
@@ -2905,8 +1596,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // COMPONENTS <= velocity_tol*dt, evaluated on the SOLVED dx BEFORE line search. Used to OR-accept the full step
     // in the line search and to allow termination once beta is feasible. No separate min_iter floor.
     int newton_converged = 0;
-    {   // L-infinity dx checker: L-infinity over dx (both paths now). The kappaO tail drives affine dx->0,
-        // which short-circuits the line search (like flex) rather than triggering an early break.
+    {   // L-infinity dx checker: converged once the largest dx component is below velocity_tol*dt.
       mjtNum maxc = 0;
       for (int i=0; i < N; i++) { mjtNum a = dx[i] < 0 ? -dx[i] : dx[i]; if (a > maxc) maxc = a; }
       newton_converged = (maxc <= IPC_VEL_TOL*h);
@@ -2924,20 +1614,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
       if (wheld[c] && wgap[c] < ghat + lub) candLS[nls++] = wcon[c];   // assembled-set parity with the Newton Hessian
     }
     // N7 line search. E0 baseline over the same candidate subset (candLS) as the trials.
-    mjtNum E0 = ipc_energy(m, d, npt, ne, elems, nbe, bends, x, xtil, fidx, mass, h, r, rad, ghat, kappa,
-                           gv, ge, candLS, nls, aff, naff, xold, xfree, qoA_ro, qnA_ro, thRO);
+    mjtNum E0 = ipc_energy(m, d, npt, ne, elems, nbe, bends, x, xtil, fidx, mass, h, r, rad, ghat,
+                           gv, ge, candLS, nls, xold, xfree);
     mjtNum alpha = 1.0;
     int lsok = 0;
-    // Line search for BOTH paths: plain monotone decrease + 1e-12 slop,
-    // OR newton_converged short-circuit; 8 backtracks /2; ALWAYS accept the final trial (NO Armijo-break grind --
-    // that off-equilibrium rejection was the affine energy injector). The reduced-coordinate dx is already mapped
-    // to the control points (CRB forward), so the same step/accept logic applies to affine.
+    // Line search: plain monotone decrease + 1e-12 slop, OR newton_converged short-circuit; 8 backtracks /2;
+    // ALWAYS accept the final trial (no Armijo-break grind).
     for (int ls=0; ls < 8; ls++) {
       for (int i=0; i < 3*npt; i++) xn[i] = x[i];
       for (int v=0; v < npt; v++) if (fidx[v] >= 0) { int fi = fidx[v];
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
-      mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat, kappa,
-                              gv, ge, candLS, nls, aff, naff, xold, xfree, qoA_ro, qnA_ro, thRO);
+      mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat,
+                              gv, ge, candLS, nls, xold, xfree);
       if (Etr <= E0 + 1e-12 || newton_converged) { lsok = 1; break; }
       alpha *= 0.5;
     }
@@ -2951,83 +1639,44 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int c=0; c < wn; c++) wgap[c] -= dgap;
   }
   // N8 non-penetration advance (every iter): dual ascent (lambda update + cnt) -> re-query@xfree -> CCD -> advance xfree.
-  if (naff == 0) {
-    // FLEX: non-penetration advance. Order is FIXED:
-    //   lambda update (on the persistent set) -> prepare CCD -> detect trajectory candidates(1.0)
-    //   -> alpha = CCD time-of-impact filter(1.0) -> active-set update (MERGE/AGING) -> advance non-penetrate positions(alpha)
-    //   -> beta = beta + (1-beta)*alpha.
-    // N8a lambda update + cnt on the ASSEMBLED persistent set (aset), then sink lam -> g_pal (warm start).
-    ipc_flexLamUpdate(m, d, x, xfree, gv, ge, r, rad, ghat, mass, ih2, aset, naset, aheld, g_pal, npt);
-    for (int c=0; c < naset; c++) ipc_cntSet(ipc_pairHash(&aset[c]), aset[c].cnt);   // persist cnt across steps
-    // N8b prepare CCD: disp = x - xfree (free-dof layout), base = xfree.
-    for (int v=0; v < npt; v++) if (fidx[v] >= 0)
-      for (int c=0; c < 3; c++) dx[3*fidx[v]+c] = x[3*v+c] - xfree[3*v+c];
-    // N8c detect trajectory candidates(1.0): re-query the broad-phase at xfree over the swept segment xfree->x.
-    // FIXED collar (3*ghat, maxdisp=0, d_hat expansion + thickness): the swept segment covers gross motion
-    // (no-tunnel), and maxdisp=0 keeps the count bounded regardless of |x-xfree| (the old displacement-scaled
-    // collar ballooned to 238k candidates when x flung -> NaN). This is the NEW-candidate source for the merge.
-    ncand = ipc_candidates(m, d, xfree, gv, ge, ngv, nge, r, rad, 3*ghat, 3*ghat, 0.0,
-                           xfree, x, ghat, nfv, npt, fidx, flist, fxadr, nfd, pt2flex, cand, candmax);
-    prof_cb++;
-    for (int c=0; c < ncand; c++) { mjtNum nn[3], cw[4]; int idv[4], ni;   // gaps at xfree (for CCD + admission)
-      cgap[c] = ipc_conGap(&cand[c], m, d, xfree, gv, ge, r, rad, nn, idv, cw, &ni, ghat); }
-    // N8d CCD time-of-impact filter(1.0): CCD over the trajectory candidates -> the advance alpha. appr[c] flags each candidate
-    // whose full step closes its gap into the active zone (== its individual CCD time-of-impact < 1).
-    mjtNum ac = ipc_ccd(m, d, xfree, dx, gv, ge, r, rad, nfv, fidx, cand, ncand, cgap, pt2flex, appr);
-    // N8e update_active_set: MERGE the admitted broad-phase candidates into the persistent set (keep existing with
-    // abs(cnt)<=25, add new with toi<1-1e-6, dedup). Admit a candidate iff it is closing this step (appr) OR already
-    // distance-active (gap<=0): both are the CCD time-of-impact < 1-1e-6 set. New entries seed lam(g_pal)/cnt(store).
-    for (int c=0; c < ncand; c++) actc[c] = (appr[c] || cgap[c] <= 0.0) ? 1 : 0;
-    ipc_mergeActiveSet(aset, &naset, cand, ncand, actc, amerge, g_pal, candmax);
-    // N8f advance non-penetrate positions(alpha): advance ONLY xfree, iff alpha > alpha lower bound. beta -> 1.
-    if (ac > IPC_ALPHA_LB) for (int i=0; i < 3*npt; i++) xfree[i] = (1.0-ac)*xfree[i] + ac*x[i];
-    beta = beta + (1.0 - beta)*ac;
-    // terminate: beta feasible (>= 1 - IPC_TOI_THRESH) AND (newton_iter+1 >= min_iter OR newton_converged).
-    if (beta >= 1.0 - IPC_TOI_THRESH && (outer+1 >= IPC_FLEX_MIN_ITER || newton_converged_out)) break;
-    (void)last_maxdx;
-  } else {
-    // AFFINE: dual ascent -> re-query cand -> CCD -> product-to-0 beta.
-    ipc_affineLamUpdate(m, d, aff, naff, x, kappa);   // dual ascent at the converged optimizer x (affine, Alg.2 tail)
-    ipc_affineAffineLamUpdate(m, aff, naff, x, kappa); // dual ascent for affine-affine capsule pairs
-    if (naff > 0) { ipc_hingeTheta(aff, naff, d->xquat, xold, x, qoA_ro, qnA_ro, thRO);   // joint angle at converged x
-                    ipc_jntLimitLamUpdate(m, d, aff, naff, thRO); }   // AL dual ascent for joint limits
-    // N8a update_lambda + cnt (at x): two-branch AL update with the cnt state machine, then sink lam->g_pal.
-    ipc_flexLamUpdate(m, d, x, xfree, gv, ge, r, rad, ghat, mass, ih2, cand, ncand, held, g_pal, npt);
-    for (int c=0; c < ncand; c++) ipc_cntSet(ipc_pairHash(&cand[c]), cand[c].cnt);   // persist cnt to the store
-    // N8c re-query candidates at xfree with a margin covering the actual inner displacement, so EVERY pair the
-    // committed CCD step could cross is in the sweep (RE-QUERY EVERY iter -- needed for moving inter-flex contacts).
-    mjtNum maxstep = 0;
-    for (int v=0; v < npt; v++) if (fidx[v] >= 0) { mjtNum dd = 0;
-      for (int k=0; k < 3; k++) { mjtNum t = x[3*v+k]-xfree[3*v+k]; dd += t*t; } if (dd > maxstep) maxstep = dd; }
-    maxstep = mju_sqrt(maxstep); (void)maxstep;
-    ncand = ipc_candidates(m, d, xfree, gv, ge, ngv, nge, r, rad, 3*ghat, 3*ghat, 0.0,
-                           xfree, x, ghat, nfv, npt, fidx, flist, fxadr, nfd, pt2flex, cand, candmax);
-    prof_cb++;
-    for (int c=0; c < ncand; c++) {   // re-seed lambda from g_pal + re-hydrate cnt from the per-pair store EVERY iter
-      int vv[4], nvv; ipc_conVerts(&cand[c], vv, &nvv);
-      mjtNum s = 0; for (int q=0; q < nvv; q++) if (g_pal[vv[q]] > s) s = g_pal[vv[q]];
-      cand[c].lam = s; cand[c].cnt = ipc_cntGet(ipc_pairHash(&cand[c])); cand[c].s = 0; gam[c] = 1.0;
-    }
-    // N8b/N8d/N8f prepare CCD (disp = x-xfree, base = xfree) + CCD time-of-impact filter -> alpha, advance ONLY xfree.
-    for (int v=0; v < npt; v++) if (fidx[v] >= 0)
-      for (int c=0; c < 3; c++) dx[3*fidx[v]+c] = x[3*v+c] - xfree[3*v+c];   // displacement xfree->x (free-dof layout)
-    for (int c=0; c < ncand; c++) { mjtNum nn[3], cw[4]; int idv[4], ni;     // candidate gaps at the feasible xfree
-      cgap[c] = ipc_conGap(&cand[c], m, d, xfree, gv, ge, r, rad, nn, idv, cw, &ni, ghat); }
-    mjtNum ac = ipc_ccd(m, d, xfree, dx, gv, ge, r, rad, nfv, fidx, cand, ncand, cgap, pt2flex, appr);
-    { mjtNum a2 = ipc_affineContactCCD(m, d, aff, naff, xfree, dx); if (a2 < ac) ac = a2; }
-    { mjtNum a2 = ipc_affineAffineCCD(m, aff, naff, xfree, dx);     if (a2 < ac) ac = a2; }
-    for (int i=0; i < 3*npt; i++) xfree[i] = (1.0-ac)*xfree[i] + ac*x[i];
-    // beta: ACCUMULATE toward 1 + feasible-AND-converged termination, like flex --
-    // was beta*=(1-ac) (shrinks to 0) + beta<beta_eps break, which never reached a clean feasible step.
-    beta = beta + (1.0 - beta)*ac;
-    if (beta >= 1.0 - IPC_TOI_THRESH && (outer+1 >= IPC_FLEX_MIN_ITER || newton_converged_out)) break;
-    (void)last_maxdx; (void)beta_eps;
-  }
+  // Order is FIXED:
+  //   lambda update (on the persistent set) -> prepare CCD -> detect trajectory candidates(1.0)
+  //   -> alpha = CCD time-of-impact filter(1.0) -> active-set update (MERGE/AGING) -> advance non-penetrate positions(alpha)
+  //   -> beta = beta + (1-beta)*alpha.
+  // N8a lambda update + cnt on the ASSEMBLED persistent set (aset), then sink lam -> g_pal (warm start).
+  ipc_flexLamUpdate(m, d, x, xfree, gv, ge, r, rad, ghat, mass, ih2, aset, naset, aheld, g_pal, npt);
+  for (int c=0; c < naset; c++) ipc_cntSet(ipc_pairHash(&aset[c]), aset[c].cnt);   // persist cnt across steps
+  // N8b prepare CCD: disp = x - xfree (free-dof layout), base = xfree.
+  for (int v=0; v < npt; v++) if (fidx[v] >= 0)
+    for (int c=0; c < 3; c++) dx[3*fidx[v]+c] = x[3*v+c] - xfree[3*v+c];
+  // N8c detect trajectory candidates(1.0): re-query the broad-phase at xfree over the swept segment xfree->x.
+  // FIXED collar (3*ghat, maxdisp=0, d_hat expansion + thickness): the swept segment covers gross motion
+  // (no-tunnel), and maxdisp=0 keeps the count bounded regardless of |x-xfree| (the old displacement-scaled
+  // collar ballooned to 238k candidates when x flung -> NaN). This is the NEW-candidate source for the merge.
+  ncand = ipc_candidates(m, d, xfree, gv, ge, ngv, nge, r, rad, 3*ghat, 3*ghat, 0.0,
+                         xfree, x, ghat, nfv, npt, fidx, flist, fxadr, nfd, pt2flex, cand, candmax);
+  prof_cb++;
+  for (int c=0; c < ncand; c++) { mjtNum nn[3], cw[4]; int idv[4], ni;   // gaps at xfree (for CCD + admission)
+    cgap[c] = ipc_conGap(&cand[c], m, d, xfree, gv, ge, r, rad, nn, idv, cw, &ni, ghat); }
+  // N8d CCD time-of-impact filter(1.0): CCD over the trajectory candidates -> the advance alpha. appr[c] flags each candidate
+  // whose full step closes its gap into the active zone (== its individual CCD time-of-impact < 1).
+  mjtNum ac = ipc_ccd(m, d, xfree, dx, gv, ge, r, rad, nfv, fidx, cand, ncand, cgap, pt2flex, appr);
+  // N8e update_active_set: MERGE the admitted broad-phase candidates into the persistent set (keep existing with
+  // abs(cnt)<=25, add new with toi<1-1e-6, dedup). Admit a candidate iff it is closing this step (appr) OR already
+  // distance-active (gap<=0): both are the CCD time-of-impact < 1-1e-6 set. New entries seed lam(g_pal)/cnt(store).
+  for (int c=0; c < ncand; c++) actc[c] = (appr[c] || cgap[c] <= 0.0) ? 1 : 0;
+  ipc_mergeActiveSet(aset, &naset, cand, ncand, actc, amerge, g_pal, candmax);
+  // N8f advance non-penetrate positions(alpha): advance ONLY xfree, iff alpha > alpha lower bound. beta -> 1.
+  if (ac > IPC_ALPHA_LB) for (int i=0; i < 3*npt; i++) xfree[i] = (1.0-ac)*xfree[i] + ac*x[i];
+  beta = beta + (1.0 - beta)*ac;
+  // terminate: beta feasible (>= 1 - IPC_TOI_THRESH) AND (newton_iter+1 >= min_iter OR newton_converged).
+  if (beta >= 1.0 - IPC_TOI_THRESH && (outer+1 >= IPC_FLEX_MIN_ITER || newton_converged_out)) break;
+  (void)last_maxdx; (void)beta_eps;
   }   // OUTER loop close
   if (getenv("MJ_IPC_PROF")) {
     static long pstep = 0;
-    fprintf(stderr, "IPCPROF step=%ld outer=%d inner=%d pcg=%ld candbuilds=%d ncand=%d naff=%d nacon=%d nbe=%d beta=%.2e\n",
-            pstep++, prof_outer, prof_inner, g_pcgN, prof_cb, ncand, naff, prof_nacon, nbe, beta);
+    fprintf(stderr, "IPCPROF step=%ld outer=%d inner=%d pcg=%ld candbuilds=%d ncand=%d nacon=%d nbe=%d beta=%.2e\n",
+            pstep++, prof_outer, prof_inner, g_pcgN, prof_cb, ncand, prof_nacon, nbe, beta);
     fprintf(stderr, "        active(fc>0)=%ld of held=%d\n", g_nact, prof_nacon);
     int th[6] = {0,0,0,0,0,0}; for (int c=0; c < ncand; c++) if (cand[c].type>=0 && cand[c].type<6) th[cand[c].type]++;
     fprintf(stderr, "        cand-by-type: t0(sph-flex)=%d t1(EE)=%d t2(pt-geom)=%d t3(flex-geom)=%d t4=%d t5(sph-sph)=%d  sp.nnz=%d\n",
@@ -3043,7 +1692,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
   g_pcgN = 0;   // [PROF] reset per step
   for (int i=0; i < 3*npt; i++) x[i] = xfree[i];   // commit the intersection-free output (readback uses x)
   for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
-    if (pcp[v]) continue;   // affine control point: pose recovered in the affine readback loop below
     int da = dofadr[v];
     int qa = qpadr[v];   // qpos by joint qposadr; qvel/accel by dof address
     // x/xold are world; the slide dofs are in the body-local frame -> map the world displacement back
@@ -3054,88 +1702,19 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mju_mulMatTVec3(dpl, R, dpw);
     for (int c=0; c < 3; c++) { d->qvel[da+c] = dpl[c]/h; d->qpos[qa+c] += dpl[c]; }
   }
-  // affine bodies: recover qpos/qvel from each body's OWN 4 control points. Fit every body's rotation at
-  // xold and x; a free body writes its full pose, a hinge body writes the angle about its axis as the body's
-  // world twist minus its parent's (zero for a hinge to a static parent). Each body is read independently --
-  // no shared control points -- so a coplanar/parallel joint configuration is no longer special.
-  mjtNum* qoA = (mjtNum*) mju_malloc((naff > 0 ? 4*naff : 1)*sizeof(mjtNum));
-  mjtNum* qnA = (mjtNum*) mju_malloc((naff > 0 ? 4*naff : 1)*sizeof(mjtNum));
-  for (int a=0; a < naff; a++) {
-    ipcAffine* af = &aff[a];
-    mjtNum cpo[4][3], cpn[4][3];
-    for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo[k][c] = xold[3*af->cp[k]+c]; cpn[k][c] = x[3*af->cp[k]+c]; }
-    ipc_affineQuat(af, cpo, d->xquat+4*af->body, qoA+4*a);
-    ipc_affineQuat(af, cpn, d->xquat+4*af->body, qnA+4*a);
-  }
-  for (int a=0; a < naff; a++) {
-    ipcAffine* af = &aff[a];
-    if (!af->isHinge) {
-      mjtNum cp[4][3];
-      for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) cp[k][c] = x[3*af->cp[k]+c];
-      mjtNum pos_old[3], quat_old[4];
-      for (int c=0; c < 3; c++) pos_old[c]  = d->qpos[af->qadr+c];   // start-of-step pose (qpos not yet
-      for (int c=0; c < 4; c++) quat_old[c] = d->qpos[af->qadr+3+c]; // overwritten for this body)
-      ipc_affineReadback(af, cp, h, pos_old, quat_old, d->qpos, d->qvel);
-    } else {
-      // relative rotation vector (body twist minus parent twist), projected onto the k hinge axes by
-      // least-squares -> k angle increments. For k=1 this is just the component along the axis.
-      int k = af->njnt;
-      mjtNum wrel[3]; ipc_twistVec(qnA+4*a, qoA+4*a, wrel);
-      if (af->jparent >= 0) { mjtNum wp[3]; ipc_twistVec(qnA+4*af->jparent, qoA+4*af->jparent, wp);
-        for (int c=0; c < 3; c++) wrel[c] -= wp[c]; }
-      mjtNum AtA[9] = {0}, Atb[3] = {0}, th[3] = {0};               // solve (A^T A) th = A^T wrel
-      for (int i=0; i < k; i++) {
-        for (int j=0; j < k; j++) { mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*af->jaxis[j][c]; AtA[3*i+j] = s; }
-        mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*wrel[c]; Atb[i] = s;
-      }
-      if (k == 1) { th[0] = Atb[0]/AtA[0]; }
-      else {
-        // k=2/3: truncated-SVD pseudo-inverse of the axis Gram matrix AtA. At gimbal lock the stacked hinge
-        // axes become near-coplanar, AtA -> singular, and the naive inverse amplifies the small committed-
-        // rotation noise into a huge angle increment (det(AtA)~3e-5 -> th~10rad -> qvel~5000). Dropping the
-        // near-null eigendirection gives the minimum-norm angle that reproduces the well-determined rotation.
-        // Well-conditioned joints are unchanged (all eigenvalues survive the threshold).
-        mjtNum eval[3], evec[9], q4[4];
-        mju_eig3(eval, evec, q4, AtA);                  // eval DECREASING; evec columns = eigenvectors (row-major)
-        mjtNum tol = 1e-2 * (eval[0] > 0 ? eval[0] : 1.0);
-        th[0] = th[1] = th[2] = 0;
-        for (int j=0; j < 3; j++) {
-          if (eval[j] <= tol) continue;                 // skip gimbal-lock null direction
-          mjtNum vAtb = evec[j]*Atb[0] + evec[3+j]*Atb[1] + evec[6+j]*Atb[2];
-          mjtNum cf = vAtb/eval[j];
-          th[0] += cf*evec[j]; th[1] += cf*evec[3+j]; th[2] += cf*evec[6+j];
-        }
-      }
-      if (getenv("MJ_IPC_HINGE")) {
-        mjtNum mth = 0; for (int i=0; i < k; i++) { mjtNum a2 = th[i] < 0 ? -th[i] : th[i]; if (a2 > mth) mth = a2; }
-        if (mth/h > 50.0) {
-          mjtNum det = (k==1) ? AtA[0] : (k==2) ? (AtA[0]*AtA[4]-AtA[1]*AtA[3]) :
-            (AtA[0]*(AtA[4]*AtA[8]-AtA[5]*AtA[7])-AtA[1]*(AtA[3]*AtA[8]-AtA[5]*AtA[6])+AtA[2]*(AtA[3]*AtA[7]-AtA[4]*AtA[6]));
-          fprintf(stderr, "HINGE a=%d body=%d k=%d det(AtA)=%.3e |wrel|=%.3e max|th|=%.3e qvel=%.1f\n",
-                  a, af->body, k, det, mju_norm3(wrel), mth, mth/h);
-        }
-      }
-      for (int i=0; i < k; i++) { d->qpos[af->qadr+i] += th[i]; d->qvel[af->vadr+i] = th[i]/h; }
-    }
-  }
-  mju_free(qoA); mju_free(qnA);
   d->time += h;
-  if (naff > 0) { mju_free(crbGz); mju_free(crbAdj); mju_free(crbHp); mju_free(crbHc);
-                mju_free(crbP); mju_free(crbD); mju_free(crbA); mju_free(crbK); mju_free(crbS); mju_free(crbDcp);
-                mju_free(thRO); mju_free(qoA_ro); mju_free(qnA_ro); mju_free(jps); }
-  if (Nna > 0) ipc_spFree(&sp);
+  if (N > 0) ipc_spFree(&sp);
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems); mju_free(bends);
-  mju_free(rad); mju_free(pbody); mju_free(pgeom); mju_free(pcp); mju_free(aff);
-  mju_free(xpos_pred); mju_free(xquat_pred); mju_free(isAff); mju_free(bidx);
+  mju_free(rad); mju_free(pbody); mju_free(pgeom);
   mju_free(flist); mju_free(fxadr); mju_free(pt2vg); mju_free(pt2flex);
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS); mju_free(minc); mju_free(held);
   mju_free(gam); mju_free(actc); mju_free(appr); mju_free(actpt);
   mju_free(aset); mju_free(agap); mju_free(aheld); mju_free(amerge);
-  mju_free(gv); mju_free(ge); mju_free(estr); mju_free(affH); mju_free(affHgeo);
+  mju_free(gv); mju_free(ge); mju_free(estr);
   mju_free(x); mju_free(xfree); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(grad); mju_free(dx); mju_free(mdiag); mju_free(qacc_pred);
-  mju_free(rcg); mju_free(zcg); mju_free(pcg); mju_free(Hpv); mju_free(usol); mju_free(dxm); mju_free(Hpm);
+  mju_free(rcg); mju_free(zcg); mju_free(pcg); mju_free(Hpv); mju_free(usol);
 }
 
 
