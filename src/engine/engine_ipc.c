@@ -294,7 +294,10 @@ static int ipc_geomEdges(const mjModel* m, int gi, const mjtNum* gpos, const mjt
 // it shrinks for thin participants (ghc small -> thin cloth keeps its no-penetration guarantee) and is capped so
 // big affine bodies don't carry a fat layer. Same rule for flex and affine contacts.
 #define IPC_DELTACAP 0.001   // 1 mm standoff cap
-#define IPC_JNTLIMIT_K 0.0   // penalty limit DISABLED (it froze the humanoid); to be replaced by an AL-constraint limit
+#define IPC_JNTLIMIT_KAPPA 1.0e-4   // AL joint-limit stiffness kj = this*kappaO (kappaO = 1e4*I_rot/h^2). ~10x the
+                                     // per-body nominal 0.1*I_rot/h^2: a limit resists the descendant chain's torque
+                                     // (effective inertia >> body's own I_rot), so this converges it to ~0 in 1-2
+                                     // steps; the AL multiplier adapts, so kj only sets the transient ramp (1e-5 lags ~6deg).
 #define IPC_CDAMP_FLEX 0.1   // flex-contact normal dashpot coeff (cde = IPC_CDAMP_FLEX*m/h^2); affine uses 0.1
 #define IPC_DUAL_OMEGA 1.0   // AL dual-ascent over-relaxation (lam -= OMEGA*kappa*c): faster ramp -> fewer outer iters
 #define IPC_AFFINE_GEOM 1   // 1: full Newton (GN+geometric) affine Hessian; 0: Gauss-Newton only (test)
@@ -691,6 +694,9 @@ static mjtNum* g_caal = NULL; static int g_caalN = 0, g_caalCap = 0;
 // ipc_try contacts, whose LIVE multiplier rides in ipcCon.lam. Seeded into cand[].lam at step start, sunk back
 // after the step (binding = max over a contact's free-point participants). npt-sized.
 static mjtNum* g_pal = NULL; static int g_palN = 0;
+// AL joint-LIMIT multipliers, per (model joint, side): 2*jid+0 = lower limit, 2*jid+1 = upper. Persisted across
+// Newton iters AND steps (warm start). Updated once per accepted step (lam <- max(0, lam - mu*c)). Size 2*njnt.
+static mjtNum* g_jal = NULL; static int g_jalN = 0;
 static long g_pcgN = 0;   // [PROF] PCG iterations (accumulated per step, printed + reset in MJ_IPC_PROF)
 
 // per-pair cnt state machine (active-set aging + 0.3^c stiffness decay) persisted across the per-iter
@@ -751,7 +757,7 @@ static void ipc_makeSPD4(mjtNum A[4][4]) {
     for (int p=0; p < 4; p++) for (int q=p+1; q < 4; q++) off += A[p][q]*A[p][q];
     if (off < 1e-30) break;
     for (int p=0; p < 4; p++) for (int q=p+1; q < 4; q++) {
-      if (A[p][q]*A[p][q] < 1e-30*(A[p][p]*A[p][p] + A[q][q]*A[q][q] + 1e-300)) continue;
+      if (A[p][q]*A[p][q] < 1e-30*(A[p][p]*A[p][p] + A[q][q]*A[q][q]) + 1e-300) continue;
       mjtNum theta = (A[q][q] - A[p][p]) / (2.0*A[p][q]);
       mjtNum t = (theta >= 0 ? 1.0 : -1.0) / (mju_abs(theta) + sqrt(theta*theta + 1.0));
       mjtNum cc = 1.0/sqrt(t*t + 1.0), s = t*cc;
@@ -932,6 +938,22 @@ static void ipc_affineLamUpdate(const mjModel* m, const mjData* d, const ipcAffi
       mjtNum* lam = &g_cal[a*g_calStride + ft];
       if (mn < ghc) { mjtNum nl = *lam - IPC_DUAL_OMEGA*kappa*(mn - ipc_off(ghc)); *lam = nl > 0 ? nl : 0; }   // binding gap, rest at delta
       else *lam = 0;                                                            // out of range -> decay
+    }
+  }
+}
+
+// AL joint-LIMIT multiplier update, once per accepted Newton step at the converged angle theta = qpos + thRO:
+// lam_side <- max(0, lam_side - OMEGA*kj*c_side); c_hi = hi-theta, c_lo = theta-lo (both >= 0 within range).
+static void ipc_jntLimitLamUpdate(const mjModel* m, const mjData* d, const ipcAffine* aff, int naff,
+                                  const mjtNum* thRO) {
+  for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; if (!af->isHinge) continue;
+    mjtNum kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
+    for (int jl=0; jl < af->njnt; jl++) { int jid = af->ja + jl;
+      if (!m->jnt_limited[jid]) continue;
+      mjtNum theta = d->qpos[af->qadr+jl] + thRO[3*a+jl];
+      mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1];
+      mjtNum* lhi = &g_jal[2*jid+1]; mjtNum nhi = *lhi - IPC_DUAL_OMEGA*kj*(hi - theta); *lhi = nhi > 0 ? nhi : 0;
+      mjtNum* llo = &g_jal[2*jid+0]; mjtNum nlo = *llo - IPC_DUAL_OMEGA*kj*(theta - lo); *llo = nlo > 0 ? nlo : 0;
     }
   }
 }
@@ -1220,9 +1242,14 @@ static mjtNum ipc_affineContactCCD(const mjModel* m, const mjData* d, const ipcA
   return cap;
 }
 
+// joint-passive (spring/damper/limit) x-space Hessian: rank-1 h*(c.x)^2 per hinge angle, c = dtheta/dx over the
+// body's (and parent's) control-point DOFs. Applied matrix-free in ipc_applyH; the Nb reduction then projects it.
+typedef struct { int ndof; int dof[24]; mjtNum c[24], h; } ipcJpH;
+
 static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
                        int nelem, const ipcElem* elems, const mjtNum* estr,
                        int nbe, const ipcBend* bends,
+                       int njp, const ipcJpH* jps,
                        const ipcCC* ccache, int nacon,
                        int naff, const ipcAffine* aff, const mjtNum* affH) {
   for (int i=0; i < N; i++) Hp[i] = mdiag[i]*p[i];
@@ -1259,6 +1286,12 @@ static void ipc_applyH(const mjtNum* p, mjtNum* Hp, int N, const mjtNum* mdiag,
         for (int j=0; j < 4; j++) { int fj = bn->fv[j]; if (fj < 0) continue; s += Q[4*i+j]*p[3*fj+k]; }
         Hp[3*fi+k] += s; }
     }
+  }
+  for (int jt=0; jt < njp; jt++) {                        // joint passive: rank-1 h*(c.p) per hinge angle (matrix-free)
+    const ipcJpH* jp = &jps[jt]; mjtNum dp = 0;
+    for (int i=0; i < jp->ndof; i++) dp += jp->c[i]*p[jp->dof[i]];
+    mjtNum hd = jp->h*dp;
+    for (int i=0; i < jp->ndof; i++) Hp[jp->dof[i]] += jp->c[i]*hd;
   }
   for (int c=0; c < nacon; c++) {
     const ipcCC* cc = &ccache[c];
@@ -1474,31 +1507,32 @@ static void ipc_uPrecond(const ipcSparse* sp, int Nna, const ipcAffine* aff, int
 static void ipc_uMatvec(const mjtNum* p, mjtNum* Hp, int N, int Nna, int Nz,
                         const ipcAffine* aff, int naff, const mjtNum* mdiag, int ne, const ipcElem* elems,
                         int nbe, const ipcBend* bends,
+                        int njp, const ipcJpH* jps,
                         const mjtNum* estr, const ipcCC* ccache, int nacon, const mjtNum* affH,
-                        mjtNum* dxm, mjtNum* Hpm, mjtNum* adj, const mjtNum* jntDiag) {
+                        mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
   if (naff == 0) {   // pure flex: no reduction, apply the maximal matrix-free Hessian directly (== old ipc_pcg)
-    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon, 0, aff, affH); return;
+    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, njp, jps, ccache, nacon, 0, aff, affH); return;
   }
   for (int i=0; i < Nna; i++) dxm[i] = p[i];                    // expand: na identity
   if (naff > 0) {                                               // affine: forward tree map (dcp in Hpm scratch)
     ipc_crbForward(aff, naff, p + Nna, Hpm);
     for (int a=0; a < naff; a++) for (int i=0; i < 12; i++) dxm[Nna+12*a+i] = Hpm[12*a+i];
   }
-  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon, naff, aff, affH);
+  ipc_applyH(dxm, Hpm, N, mdiag, ne, elems, estr, nbe, bends, njp, jps, ccache, nacon, naff, aff, affH);
   for (int i=0; i < Nna; i++) Hp[i] = Hpm[i];                   // reduce: na identity
   if (naff > 0) ipc_crbAdjoint(aff, naff, Hpm + Nna, Hp + Nna, adj);   // affine: adjoint tree map
-  if (jntDiag) for (int i=0; i < Nz; i++) Hp[Nna+i] += jntDiag[i]*p[Nna+i];   // implicit joint passive: reduced-Hessian diagonal
 }
 
 // unified preconditioned CG. RHS r_u = [-grad_na ; gz] (gz = the affine reduced gradient RHS from
 // ipc_reduceGrad). bjf = prebuilt per-tree factors. Writes the maximal Newton direction dx[N].
 static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
                       const ipcAffine* aff, int naff, const ipcSparse* sp, const mjtNum* mdiag,
-                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends, const mjtNum* estr, const ipcCC* ccache, int nacon,
+                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends, int njp, const ipcJpH* jps,
+                      const mjtNum* estr, const ipcCC* ccache, int nacon,
                       const mjtNum* affH, const mjtNum* D, const mjtNum* A, const mjtNum* K,
                       mjtNum* sfac, mjtNum* dcp, const mjtNum* gz,
                       mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol,
-                      mjtNum* dxm, mjtNum* Hpm, mjtNum* adj, const mjtNum* jntDiag) {
+                      mjtNum* dxm, mjtNum* Hpm, mjtNum* adj) {
   int Nu = Nna + Nz;
   for (int i=0; i < Nna; i++) r[i] = -grad[i];
   for (int j=0; j < Nz; j++) r[Nna+j] = gz[j];
@@ -1509,7 +1543,7 @@ static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, int Nna, int Nz,
   mjtNum rz = 0; for (int i=0; i < Nu; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
   int it = 0;
   for (; it < 200; it++) {   // matches the old ipc_pcg cap -> naff==0 is bit-identical to the flex PCG
-    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, nbe, bends, estr, ccache, nacon, affH, dxm, Hpm, adj, jntDiag);
+    ipc_uMatvec(p, Hp, N, Nna, Nz, aff, naff, mdiag, ne, elems, nbe, bends, njp, jps, estr, ccache, nacon, affH, dxm, Hpm, adj);
     mjtNum pHp = 0; for (int i=0; i < Nu; i++) pHp += p[i]*Hp[i];
     if (pHp <= 1e-30) break;
     mjtNum alpha = rz/pHp, rr = 0;
@@ -1588,9 +1622,13 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
         mjtNum k = m->jnt_stiffness[jid], cc = m->dof_damping[af->vadr+jl], ref = m->qpos_spring[af->qadr+jl];
         if (nojp) { k = 0; cc = 0; }
         E += 0.5*k*(theta-ref)*(theta-ref) + 0.5*(cc/h)*dth*dth;
-        if (m->jnt_limited[jid] && !nojp) { mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kb = IPC_JNTLIMIT_K;
-          if (theta > hi)      E += 0.5*kb*(theta-hi)*(theta-hi);
-          else if (theta < lo) E += 0.5*kb*(theta-lo)*(theta-lo); }
+        if (m->jnt_limited[jid] && !nojp) {   // AL limit merit E = 0.5*kj*min(0, c - lam/kj)^2 per side (c >= 0 desired)
+          mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
+          if (kj > 0) {
+            mjtNum chi = (hi - theta) - g_jal[2*jid+1]/kj; if (chi < 0) E += 0.5*kj*chi*chi;   // upper limit
+            mjtNum clo = (theta - lo) - g_jal[2*jid+0]/kj; if (clo < 0) E += 0.5*kj*clo*clo;   // lower limit
+          }
+        }
       }
     }
   }
@@ -1956,6 +1994,45 @@ static void ipc_hingeTheta(const ipcAffine* aff, int naff, const mjtNum* bquat,
     }
     thOut[3*a] = th[0]; thOut[3*a+1] = th[1]; thOut[3*a+2] = th[2];
   }
+}
+
+// single-body hinge angle theta_jl at free-point positions x (relative to xold), for the joint-passive FD Jacobian
+// dtheta/dx. Mirrors ipc_hingeTheta's per-body axis projection but for ONE body (+ its parent), so each FD
+// perturbation is O(1). Returns the jl-th component of the axis-projected relative twist.
+static mjtNum ipc_hingeThetaOne(const ipcAffine* aff, int naff, int a, int jl,
+                                const mjtNum* bquat, const mjtNum* xold, const mjtNum* x) {
+  const ipcAffine* af = &aff[a];
+  mjtNum cpo[4][3], cpn[4][3], qo[4], qn[4], wrel[3];
+  for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo[k][c] = xold[3*af->cp[k]+c]; cpn[k][c] = x[3*af->cp[k]+c]; }
+  ipc_affineQuat(af, cpo, bquat+4*af->body, qo);
+  ipc_affineQuat(af, cpn, bquat+4*af->body, qn);
+  ipc_twistVec(qn, qo, wrel);
+  if (af->jparent >= 0) { const ipcAffine* afp = &aff[af->jparent];
+    mjtNum cpo2[4][3], cpn2[4][3], qo2[4], qn2[4], wp[3];
+    for (int k=0; k < 4; k++) for (int c=0; c < 3; c++) { cpo2[k][c] = xold[3*afp->cp[k]+c]; cpn2[k][c] = x[3*afp->cp[k]+c]; }
+    ipc_affineQuat(afp, cpo2, bquat+4*afp->body, qo2);
+    ipc_affineQuat(afp, cpn2, bquat+4*afp->body, qn2);
+    ipc_twistVec(qn2, qo2, wp);
+    for (int c=0; c < 3; c++) wrel[c] -= wp[c];
+  }
+  int k = af->njnt; mjtNum AtA[9] = {0}, Atb[3] = {0}, th[3] = {0};
+  for (int i=0; i < k; i++) {
+    for (int j=0; j < k; j++) { mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*af->jaxis[j][c]; AtA[3*i+j] = s; }
+    mjtNum s = 0; for (int c=0; c < 3; c++) s += af->jaxis[i][c]*wrel[c]; Atb[i] = s;
+  }
+  if (k == 1) { th[0] = Atb[0]/AtA[0]; }
+  else {
+    mjtNum eval[3], evec[9], q4[4];
+    mju_eig3(eval, evec, q4, AtA);
+    mjtNum tol = 1e-2 * (eval[0] > 0 ? eval[0] : 1.0);
+    for (int j=0; j < 3; j++) {
+      if (eval[j] <= tol) continue;
+      mjtNum vAtb = evec[j]*Atb[0] + evec[3+j]*Atb[1] + evec[6+j]*Atb[2];
+      mjtNum cf = vAtb/eval[j];
+      th[0] += cf*evec[j]; th[1] += cf*evec[3+j]; th[2] += cf*evec[6+j];
+    }
+  }
+  return th[jl];
 }
 
 void mj_IPC(const mjModel* m, mjData* d) {
@@ -2468,6 +2545,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
     if (g_caalN != aaneed) { mju_free(g_caal); g_caalN = aaneed;
       g_caal = (mjtNum*) mju_malloc((size_t)(aaneed > 0 ? aaneed : 1)*sizeof(mjtNum));
       for (int i=0; i < aaneed; i++) g_caal[i] = 0; }
+    if (g_jalN != 2*m->njnt) { mju_free(g_jal); g_jalN = 2*m->njnt;   // per-(joint,side) AL joint-limit multiplier
+      g_jal = (mjtNum*) mju_malloc((size_t)(g_jalN > 0 ? g_jalN : 1)*sizeof(mjtNum));
+      for (int i=0; i < g_jalN; i++) g_jal[i] = 0; }                  // zero only on resize -> warm-start persists
   }
   // build the candidate-contact list once per step: detection threshold inflated by the predictor
   // displacement so any pair that could close during the step is captured (verified by gap checks)
@@ -2552,7 +2632,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // assembled per-body by a composite (CRB) tree pass and factored directly. flex/free-affine -> PCG below.
   int Nz = 0; mjtNum *crbGz = NULL, *crbAdj = NULL, *crbHp = NULL, *crbHc = NULL,
                      *crbP = NULL, *crbD = NULL, *crbA = NULL, *crbK = NULL, *crbS = NULL, *crbDcp = NULL,
-                     *jntDiag = NULL, *thRO = NULL, *qoA_ro = NULL, *qnA_ro = NULL;
+                     *thRO = NULL, *qoA_ro = NULL, *qnA_ro = NULL;
+  ipcJpH* jps = NULL; int njp = 0;   // joint-passive x-space rank-1 Hessian terms (rebuilt each Newton iter)
   if (naff > 0) {
     Nz = ipc_buildReduction(aff, naff);
     crbGz  = (mjtNum*) mju_malloc((size_t)Nz*sizeof(mjtNum));      // affine reduced gradient RHS (gz)
@@ -2565,7 +2646,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     crbK   = (mjtNum*) mju_malloc((size_t)144*naff*sizeof(mjtNum));// per-body K = D^-1 A
     crbS   = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp-space accumulator)
     crbDcp = (mjtNum*) mju_malloc((size_t)12*naff*sizeof(mjtNum)); // apply scratch (cp increments)
-    jntDiag = (mjtNum*) mju_malloc((size_t)(Nz > 0 ? Nz : 1)*sizeof(mjtNum));   // implicit joint passive: reduced-Hessian diagonal
+    jps = (ipcJpH*) mju_malloc((size_t)(naff > 0 ? 3*naff : 1)*sizeof(ipcJpH));  // joint passive: <=3 hinge angles/body
     thRO    = (mjtNum*) mju_malloc((size_t)3*naff*sizeof(mjtNum));   // per-iter hinge-angle increments (readback)
     qoA_ro  = (mjtNum*) mju_malloc((size_t)4*naff*sizeof(mjtNum));   // readback quat scratch (xold pose)
     qnA_ro  = (mjtNum*) mju_malloc((size_t)4*naff*sizeof(mjtNum));   // readback quat scratch (current x)
@@ -2747,35 +2828,54 @@ void mj_IPC(const mjModel* m, mjData* d) {
       // crawled the kappaO PCG past its 200 cap. Matching it converges the affine PCG in a few iters (the
       // per-body 12x12 block-Jacobi preconditioner), so the single-Newton loop converges.
       (void)affHgeo;
-      gaff = ipc_reduceGrad(aff, naff, grad + Nna, crbGz, crbAdj);   // crbGz = gz (affine RHS), gaff = ||gz||
-      // IMPLICIT joint spring + damping on the reduced joint DOFs (replaces the explicit qfrc_passive dropped from
-      // the gravity prediction). theta = step-start qpos + the readback increment (gimbal-lock-robust). Add
-      // k*(theta-ref) + (c/h)*dtheta to the reduced FORCE crbGz (=-dE/dz) and k+c/h to the reduced-Hessian diagonal,
-      // so the springs/dampers resist the fold IMPLICITLY (the Newton step accounts for them) instead of lagging.
-      for (int i=0; i < Nz; i++) jntDiag[i] = 0;
-      ipc_hingeTheta(aff, naff, d->xquat, xold, x, qoA_ro, qnA_ro, thRO);
-      int nojp = getenv("MJ_IPC_NOJP") != NULL;   // [ABLATE] disable spring+damp (keep limits) to isolate over-hold
+      // joint passive (spring + damper + AL limit) in x-space: theta is a nonlinear function of the free points,
+      // so assemble dE/dtheta * dtheta/dx into the MAXIMAL gradient (grad) and h*(dtheta/dx)(dtheta/dx)^T as a
+      // matrix-free rank-1 term per angle (jps, applied in ipc_applyH); the Nb reduction (ipc_reduceGrad below +
+      // the CRB factor) then projects BOTH correctly, including the body-body parent coupling. (Was assembled into
+      // the reduced slot z[zadr+jl] assuming z==theta -- FALSE: Nb is an arbitrary null-space basis, so dtheta/dz is
+      // spread across columns; that mis-projection softened + mis-aimed the force. See review wm4stxw2z.)
+      njp = 0;
+      int nojp = getenv("MJ_IPC_NOJP") != NULL;   // [ABLATE] disable spring+damp+limit
       mjtNum thmax = 0;
-      for (int a=0; a < naff; a++) {
-        const ipcAffine* af = &aff[a];
-        if (!af->isHinge) continue;
+      ipc_hingeTheta(aff, naff, d->xquat, xold, x, qoA_ro, qnA_ro, thRO);
+      if (!nojp) for (int a=0; a < naff; a++) { const ipcAffine* af = &aff[a]; if (!af->isHinge) continue;
         for (int jl=0; jl < af->njnt; jl++) {
-          int idx = af->zadr + jl, jid = af->ja + jl;
-          mjtNum dth = thRO[3*a+jl];                                 // joint-angle increment from step start
-          mjtNum theta = d->qpos[af->qadr+jl] + dth;                 // current joint angle
+          int jid = af->ja + jl;
+          mjtNum dth = thRO[3*a+jl], theta = d->qpos[af->qadr+jl] + dth;
           if (theta > thmax) thmax = theta; else if (-theta > thmax) thmax = -theta;
-          mjtNum k = m->jnt_stiffness[jid], cc = m->dof_damping[af->vadr+jl], ref = m->qpos_spring[af->qadr+jl];
-          if (nojp) { k = 0; cc = 0; }
-          crbGz[idx] -= k*(theta - ref) + (cc/h)*dth;
-          jntDiag[idx] += k + cc/h;
-          if (m->jnt_limited[jid] && !nojp) {   // range-limit barrier (quadratic penalty past jnt_range; in the energy too)
-            mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kb = IPC_JNTLIMIT_K;
-            if (theta > hi)      { crbGz[idx] -= kb*(theta - hi); jntDiag[idx] += kb; }
-            else if (theta < lo) { crbGz[idx] -= kb*(theta - lo); jntDiag[idx] += kb; }
+          mjtNum ks = m->jnt_stiffness[jid], cd = m->dof_damping[af->vadr+jl], ref = m->qpos_spring[af->qadr+jl];
+          mjtNum dEdth = ks*(theta - ref) + (cd/h)*dth, h2 = ks + cd/h;   // spring + damper: dE/dtheta, d2E/dtheta2
+          if (m->jnt_limited[jid]) {                                       // AL limit: dE/dtheta += fc, curvature += kj
+            mjtNum lo = m->jnt_range[2*jid], hi = m->jnt_range[2*jid+1], kj = IPC_JNTLIMIT_KAPPA*af->kappaO;
+            if (kj > 0) {
+              mjtNum fhi = g_jal[2*jid+1] - kj*(hi - theta); if (fhi > 0) { dEdth += fhi; h2 += kj; }   // upper
+              mjtNum flo = g_jal[2*jid+0] - kj*(theta - lo); if (flo > 0) { dEdth -= flo; h2 += kj; }   // lower
+            }
           }
+          if (dEdth == 0 && h2 == 0) continue;
+          ipcJpH* jp = &jps[njp]; jp->ndof = 0; jp->h = h2;            // c = dtheta/dx (central FD) over body (+ parent) cps
+          const mjtNum eps = 1e-6;   // central diff: O(eps^2), no cancellation (theta ~ O(1); fwd eps=1e-7 lost ~7 digits)
+          for (int side=0; side < (af->jparent >= 0 ? 2 : 1); side++) {
+            const ipcAffine* ab = side == 0 ? af : &aff[af->jparent];
+            for (int c4=0; c4 < 4; c4++) { if (ab->sdof[c4] < 0) continue;   // pinned cp: no solver DOF, no force
+              for (int c=0; c < 3; c++) {
+                int pdof = 3*ab->cp[c4] + c;     // POINT index: x / ipc_hingeTheta are point-indexed (full)
+                int sdof = ab->sdof[c4] + c;     // SOLVER index: grad / Hp / dx are sdof-indexed (compacted by pins)
+                mjtNum sv = x[pdof];
+                x[pdof] = sv + eps; mjtNum thp = ipc_hingeThetaOne(aff, naff, a, jl, d->xquat, xold, x);
+                x[pdof] = sv - eps; mjtNum thm = ipc_hingeThetaOne(aff, naff, a, jl, d->xquat, xold, x);
+                x[pdof] = sv;
+                mjtNum cv = (thp - thm)/(2.0*eps);
+                if (cv != 0 && jp->ndof < 24) { jp->dof[jp->ndof] = sdof; jp->c[jp->ndof] = cv; jp->ndof++; }
+              }
+            }
+          }
+          for (int i=0; i < jp->ndof; i++) grad[jp->dof[i]] += dEdth * jp->c[i];   // x-space gradient
+          njp++;
         }
       }
-      if (getenv("MJ_IPC_JT")) fprintf(stderr, "  JNT thmax=%.3f rad (%.0f deg) nojp=%d\n", thmax, thmax*57.3, nojp);
+      if (getenv("MJ_IPC_JT")) fprintf(stderr, "  JNT thmax=%.3f rad (%.0f deg) njp=%d nojp=%d\n", thmax, thmax*57.3, njp, nojp);
+      gaff = ipc_reduceGrad(aff, naff, grad + Nna, crbGz, crbAdj);   // reduce grad (now incl. joint passive) -> crbGz
     }
     gnorm = sqrt(gna2 + gaff*gaff);
     if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
@@ -2789,9 +2889,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
     // ONE solver: per-tree affine preconditioner factors (from inertia+ortho+contact), then the unified PCG.
     if (naff > 0) ipc_crbFactor(aff, naff, crbHp, crbP, crbD, crbA, crbK);
-    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, nbe, bends, estr, ccache, nacon,
-               affH, crbD, crbA, crbK, crbS, crbDcp, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj,
-               naff > 0 ? jntDiag : NULL);
+    ipc_solveU(dx, grad, N, Nna, Nz, aff, naff, &sp, mdiag, ne, elems, nbe, bends, njp, jps, estr, ccache, nacon,
+               affH, crbD, crbA, crbK, crbS, crbDcp, crbGz, rcg, zcg, pcg, Hpv, usol, dxm, Hpm, crbAdj);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
     for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
                                   if (n2 > maxdx) maxdx = n2; }
@@ -2887,9 +2986,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
     if (beta >= 1.0 - IPC_TOI_THRESH && (outer+1 >= IPC_FLEX_MIN_ITER || newton_converged_out)) break;
     (void)last_maxdx;
   } else {
-    // AFFINE (UNCHANGED, byte-for-byte): dual ascent -> re-query cand -> CCD -> product-to-0 beta.
+    // AFFINE: dual ascent -> re-query cand -> CCD -> product-to-0 beta.
     ipc_affineLamUpdate(m, d, aff, naff, x, kappa);   // dual ascent at the converged optimizer x (affine, Alg.2 tail)
     ipc_affineAffineLamUpdate(m, aff, naff, x, kappa); // dual ascent for affine-affine capsule pairs
+    if (naff > 0) { ipc_hingeTheta(aff, naff, d->xquat, xold, x, qoA_ro, qnA_ro, thRO);   // joint angle at converged x
+                    ipc_jntLimitLamUpdate(m, d, aff, naff, thRO); }   // AL dual ascent for joint limits
     // N8a update_lambda + cnt (at x): two-branch AL update with the cnt state machine, then sink lam->g_pal.
     ipc_flexLamUpdate(m, d, x, xfree, gv, ge, r, rad, ghat, mass, ih2, cand, ncand, held, g_pal, npt);
     for (int c=0; c < ncand; c++) ipc_cntSet(ipc_pairHash(&cand[c]), cand[c].cnt);   // persist cnt to the store
@@ -3021,7 +3122,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   d->time += h;
   if (naff > 0) { mju_free(crbGz); mju_free(crbAdj); mju_free(crbHp); mju_free(crbHc);
                 mju_free(crbP); mju_free(crbD); mju_free(crbA); mju_free(crbK); mju_free(crbS); mju_free(crbDcp);
-                mju_free(jntDiag); mju_free(thRO); mju_free(qoA_ro); mju_free(qnA_ro); }
+                mju_free(thRO); mju_free(qoA_ro); mju_free(qnA_ro); mju_free(jps); }
   if (Nna > 0) ipc_spFree(&sp);
   mju_free(escat);
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems); mju_free(bends);

@@ -419,5 +419,54 @@ TEST_F(IpcTest, AffineChain) {
   mj_deleteData(de); mj_deleteModel(me);
 }
 
+// a rigid arm on a LIMITED hinge swings down under gravity into its upper bound; the augmented-Lagrangian joint
+// limit holds it at the bound (vs swinging on to ~pi/2 without the limit). Exercises the x-space joint-passive
+// assembly + the AL limit dual update.
+TEST_F(IpcTest, AffineHingeLimit) {
+  constexpr char xml[] = R"(
+  <mujoco>
+    <option timestep="0.002" integrator="ipc"/>
+    <worldbody>
+      <body name="arm" pos="0 0 1">
+        <joint name="hinge" type="hinge" axis="0 1 0" pos="0 0 0" limited="true" range="-1 0.4"/>
+        <geom type="capsule" fromto="0 0 0 0.4 0 0" size="0.04" density="500"/>
+      </body>
+    </worldbody>
+  </mujoco>)";
+  mjModel* m = Load(xml);
+  ASSERT_TRUE(m->jnt_limited[0]) << "model did not register the joint limit";
+  mjData* d = mj_makeData(m);
+  mjtNum hi = m->jnt_range[1];                 // 0.4 rad: gravity drives the +x arm end down -> +hinge angle
+  mjtNum peak = -1e9, maxviol = 0;
+  for (int s = 0; s < 500; s++) {
+    mj_step(m, d);
+    ASSERT_FALSE(std::isnan(d->qpos[0])) << "NaN at step " << s;
+    mjtNum th = d->qpos[0];
+    if (th > peak) peak = th;
+    if (th - hi > maxviol) maxviol = th - hi;
+  }
+  EXPECT_GT(peak, hi - 0.05) << "the limit was never reached -- the test is not exercising it";
+  EXPECT_LT(maxviol, 0.2) << "joint overshot its upper limit by " << maxviol << " rad (limit not holding)";
+  EXPECT_NEAR(d->qpos[0], hi, 0.1) << "arm did not settle against the upper limit";
+
+  // sanity: the SAME arm with the limit removed swings well past where the limit held it
+  constexpr char xml_free[] = R"(
+  <mujoco>
+    <option timestep="0.002" integrator="ipc"/>
+    <worldbody>
+      <body name="arm" pos="0 0 1">
+        <joint name="hinge" type="hinge" axis="0 1 0" pos="0 0 0"/>
+        <geom type="capsule" fromto="0 0 0 0.4 0 0" size="0.04" density="500"/>
+      </body>
+    </worldbody>
+  </mujoco>)";
+  mjModel* mf = Load(xml_free); mjData* df = mj_makeData(mf);
+  for (int s = 0; s < 500; s++) mj_step(mf, df);
+  EXPECT_GT(df->qpos[0], hi + 0.3) << "unlimited arm should swing well past the limited one";
+
+  mj_deleteData(d); mj_deleteModel(m);
+  mj_deleteData(df); mj_deleteModel(mf);
+}
+
 }  // namespace
 }  // namespace mujoco
