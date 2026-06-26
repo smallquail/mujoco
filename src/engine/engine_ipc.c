@@ -517,8 +517,16 @@ static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const 
 // over the involved free-dof indices f[0..nidx) (f<0 = pinned, skipped).
 typedef struct { mjtNum n[3], cw[8], bdd; int f[8], nidx; } ipcCC;   // up to 8 involved free dofs
 // SOFT flex-rigid contact pair: rigid sphere ri vs a flex triangle (type 0, idx=tri verts), a static geom
-// (type 2, gi), or another sphere (type 5, idx[0]=rj). One-sided penalty only; never in the hard set/CCD.
-typedef struct { int type, ri, idx[3], gi; } ipcSoft;
+// (type 2, gi), another sphere (type 5, idx[0]=rj), or a flex VERTEX vs an ARTICULATED body's geom (type 3:
+// vp=flex free-point, gi=geom, atree=the geom's tree, plocal=contact point in geom-body local frame, n=FROZEN
+// normal geom->vertex, dist0=gap at detection, k=contact-space stiffness, bn=tree_dofnum; the frozen direction
+// b=Jcp^T n lives in the g_bsoft side array). One-sided penalty only; never in the hard set/CCD.
+typedef struct { int type, ri, idx[3], gi;
+                 int atree, vp, bn; mjtNum plocal[3], n[3], dist0, k; } ipcSoft;
+
+// ACTIVE type-3 pair (gap<0 at the current Newton iterate), built each iter in ipc_softTry, consumed by ipc_apply
+// for the tree+cross Hessian. Vertex self k*n n^T lives in ccache; here = vertex-tree cross + tree(self+cross).
+typedef struct { int fv, o, bn; mjtNum k, n[3]; const mjtNum* b; } ipcS3;
 
 // One membrane element (2D triangle): the 3 flex vertices (global vg, free-dof fv, -1 if pinned),
 // the FEM stiffness metric M (symmetric 3x3 over the element's 3 edges, read from flex_stiffness),
@@ -814,56 +822,72 @@ typedef struct {
 } ipcSparse;
 static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r);  // per-vertex 3x3 block-Jacobi (below)
 
-// UNIFIED PCG context: one solver loop (ipc_solveU) serves both the dense-packed flex/sphere DOFs and the
-// articulated trees, dispatched per family. FLEX (rigid==0): the kinetic is the diagonal mdiag, the Hessian
-// apply/precond are the EXISTING ipc_applyH/ipc_jacobiApply (byte-identical -- the dense 3*nfree packing is kept).
-// ARTICULATED (rigid==1): the kinetic block is ih2*M applied via mj_mulM, preconditioned by its exact inverse
-// (ih2*M)^-1 = h2*M^-1 via mj_solveM, plus the one-sided contact rank-1 terms (active set acti, dir cb, stiff kvec).
+// RIGID-RIGID geom-geom contact (articulated body vs articulated body / static), anchored at q_n with a frozen
+// normal + direction b=J_B^T n - J_A^T n; LIVE nonlinear gap each Newton iter (gconGap, defined below). One rank-1
+// k*b b^T per active contact carries both bodies' self+cross blocks. Defined here (above ipcCtx/ipc_apply) so the
+// flex ctx can thread the active set into the matrix-free Hessian apply.
 typedef struct {
-  int rigid;
+  int    bodyA, bodyB, movA, movB;
+  mjtNum pA[3], pB[3];     // contact point in each body's local frame (anchors)
+  mjtNum xA0[3], xB0[3];   // world anchors at q_n (== con->pos); used live for the static side
+  mjtNum n[3];             // frozen unit normal, geom[0]->geom[1]
+  mjtNum dist0, k;         // signed gap at detection (<0 = penetration); penalty stiffness
+} ipcGcon;
+
+// UNIFIED PCG context for ipc_solveU: the dense-packed flex/sphere DOFs (kinetic = diagonal mdiag, Hessian
+// apply/precond = ipc_applyH/ipc_jacobiApply over the 3*nfree packing) PLUS the appended articulated trees and
+// the ported rigid-rigid contacts. Both families run through the SAME apply/precond (no rigid/flex dispatch).
+typedef struct {
   const ipcSparse* sp; const mjtNum* mdiag;                  // flex precond + kinetic diagonal
   int nelem; const ipcElem* elems; const mjtNum* estr; int nbe; const ipcBend* bends;  // flex elastic
   const ipcCC* ccache; int nacon;                            // flex contact
   const mjModel* m; mjData* d; mjtNum ih2, h2;               // articulated kinetic / precond (mj_mulM / mj_solveM)
-  int na; const int* acti; const mjtNum* cb; const mjtNum* kvec;  // rigid-ctx (mj_ipcTree) active contacts
   // FLEX-ctx appended articulated trees: ipc_applyH runs over N_flex, then each artic tree's block [aoff[t],
   // aoff[t]+tdofnum[t]) gets ih2*M / h2*M^-1 via ONE mj_mulM / mj_solveM through an nv-indexed gather/scatter
   // (M block-diagonal over trees -> the zeroed non-tree nv slots contribute nothing). na_artic==0 -> dead.
   int N_flex, na_artic, nv; const int* atid; const int* aoff; const int* tdofadr; const int* tdofnum;
   mjtNum* ptmp; mjtNum* Htmp; mjtNum* rtmp; mjtNum* ztmp;
+  const ipcS3* s3; int ns3;                                  // active type-3 (flex-vert vs artic-geom) tree+cross Hessian
+  const ipcGcon* gcon; const mjtNum* gcb; const int* gci; int ngc; const int* dof2slot;  // rigid-rigid (ported mj_ipcTree contact)
 } ipcCtx;
 
 static void ipc_apply(const mjtNum* p, mjtNum* Hp, int N, const ipcCtx* c) {
-  if (!c->rigid) {
-    ipc_applyH(p, Hp, c->N_flex, c->mdiag, c->nelem, c->elems, c->estr, c->nbe, c->bends, c->ccache, c->nacon);
-    if (c->na_artic) {                                       // ih2*M on the appended articulated blocks
-      for (int i=0; i < c->nv; i++) c->ptmp[i] = 0;
-      for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
-        for (int i=0; i < nd; i++) c->ptmp[da+i] = p[o+i]; }
-      mj_mulM(c->m, c->d, c->Htmp, c->ptmp);
-      for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
-        for (int i=0; i < nd; i++) Hp[o+i] = c->ih2*c->Htmp[da+i]; }
-    }
-    return;
+  (void)N;   // solver dimension is carried by the ctx (c->N_flex + the appended maps)
+  ipc_applyH(p, Hp, c->N_flex, c->mdiag, c->nelem, c->elems, c->estr, c->nbe, c->bends, c->ccache, c->nacon);
+  if (c->na_artic) {                                       // ih2*M on the appended articulated blocks
+    for (int i=0; i < c->nv; i++) c->ptmp[i] = 0;
+    for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
+      for (int i=0; i < nd; i++) c->ptmp[da+i] = p[o+i]; }
+    mj_mulM(c->m, c->d, c->Htmp, c->ptmp);
+    for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
+      for (int i=0; i < nd; i++) Hp[o+i] = c->ih2*c->Htmp[da+i]; }
   }
-  mj_mulM(c->m, c->d, Hp, p); for (int i=0; i < N; i++) Hp[i] *= c->ih2;          // ih2*M*p (M frozen at q_n)
-  for (int a=0; a < c->na; a++) { const mjtNum* b = c->cb + c->acti[a]*N;
-    mjtNum ks = c->kvec[c->acti[a]]*mju_dot(b, p, N); for (int i=0; i < N; i++) Hp[i] += ks*b[i]; }
+  for (int j=0; j < c->ns3; j++) {   // type-3 tree+cross Hessian (vertex self k*n n^T is already in ccache)
+    const ipcS3* e = &c->s3[j];
+    mjtNum bt = 0; for (int i=0; i < e->bn; i++) bt += e->b[i]*p[e->o+i];   // b . p_tree
+    mjtNum nv_ = (e->fv >= 0 ? mju_dot3(e->n, &p[3*e->fv]) : 0);           // n . p_v (pinned vertex -> 0)
+    mjtNum s = nv_ - bt;
+    if (e->fv >= 0) for (int cc=0; cc < 3; cc++) Hp[3*e->fv+cc] += -e->k*bt*e->n[cc];  // vertex-tree cross
+    for (int i=0; i < e->bn; i++) Hp[e->o+i] += -e->k*s*e->b[i];           // tree self + tree-vertex cross
+  }
+  for (int a=0; a < c->ngc; a++) {   // rigid-rigid rank-1 k*(b.p)*b scattered through dof2slot (== aoff[t]+localdof)
+    int cc = c->gci[a]; const mjtNum* b = c->gcb + (size_t)cc*c->nv;        // b[i]!=0 only on appended-tree dofs (dof2slot>=0)
+    mjtNum bp = 0; for (int i=0; i < c->nv; i++) if (b[i] != 0) bp += b[i]*p[c->dof2slot[i]];
+    mjtNum ks = c->gcon[cc].k*bp;
+    for (int i=0; i < c->nv; i++) if (b[i] != 0) Hp[c->dof2slot[i]] += ks*b[i];
+  }
 }
 static void ipc_precond(mjtNum* z, const mjtNum* r, int N, const ipcCtx* c) {
-  if (!c->rigid) {
-    ipc_jacobiApply(c->sp, z, r);
-    if (c->na_artic) {                                       // h2*M^-1 on the appended articulated blocks
-      for (int i=0; i < c->nv; i++) c->rtmp[i] = 0;
-      for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
-        for (int i=0; i < nd; i++) c->rtmp[da+i] = r[o+i]; }
-      mj_solveM(c->m, c->d, c->ztmp, c->rtmp, 1);
-      for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
-        for (int i=0; i < nd; i++) z[o+i] = c->h2*c->ztmp[da+i]; }
-    }
-    return;
+  (void)N;
+  ipc_jacobiApply(c->sp, z, r);
+  if (c->na_artic) {                                       // h2*M^-1 on the appended articulated blocks
+    for (int i=0; i < c->nv; i++) c->rtmp[i] = 0;
+    for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
+      for (int i=0; i < nd; i++) c->rtmp[da+i] = r[o+i]; }
+    mj_solveM(c->m, c->d, c->ztmp, c->rtmp, 1);
+    for (int a=0; a < c->na_artic; a++) { int t=c->atid[a], o=c->aoff[t], da=c->tdofadr[t], nd=c->tdofnum[t];
+      for (int i=0; i < nd; i++) z[o+i] = c->h2*c->ztmp[da+i]; }
   }
-  mj_solveM(c->m, c->d, z, r, 1); for (int i=0; i < N; i++) z[i] *= c->h2;        // (ih2*M)^-1 = h2*M^-1
 }
 
 // matrix-free preconditioned CG, RHS r = -grad. Writes the Newton direction dx[N] = -H^-1 grad. Apply + precond
@@ -975,8 +999,26 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
 // the spring recovers it over the next steps. k = IPC_SOFT_K*mass*ih2 (moderate: ~the kinetic Hessian).
 static void ipc_softTry(const ipcSoft* s, const mjModel* m, const mjData* d, const mjtNum* x, int nfv,
                         const mjtNum* rrad, const mjtNum* rad, const mjtNum* rmass, mjtNum ih2, int nfree_flex,
-                        const int* fidx, mjtNum* grad, ipcCC* ccache, int* nacon, int amax) {
+                        const int* fidx, mjtNum* grad, ipcCC* ccache, int* nacon, int amax,
+                        const mjtNum* bpair, const int* aoff, ipcS3* s3list, int* ns3cnt) {
   if (*nacon >= amax) return;
+  if (s->type == 3) {   // flex VERTEX vs ARTICULATED geom (no sphere ri -> handle FIRST, before ci/k touch rmass[ri])
+    // LIVE gap (gconGap form): x_v live (flex SoA) + cp live via FK of the frozen geom-local anchor (caller has
+    // run mj_kinematics at the trial articulated config). n FROZEN at q_n -> full nonlinear FK, no tunneling.
+    mjtNum cp[3]; mj_local2Global((mjData*)d, cp, NULL, s->plocal, NULL, m->geom_bodyid[s->gi], mjSAMEFRAME_NONE);
+    mjtNum g3 = s->dist0 + mju_dot3(s->n, &x[3*s->vp]) - mju_dot3(s->n, cp);
+    if (g3 >= 0) return;
+    mjtNum gco = s->k*g3; int fv = fidx[s->vp];                 // gco<0 on penetration
+    ipcCC* cc = &ccache[*nacon]; cc->bdd = s->k; cc->nidx = 1; cc->f[0] = fv; cc->cw[0] = 1;   // vertex self (flex diag)
+    for (int c=0; c < 3; c++) cc->n[c] = s->n[c];
+    if (fv >= 0) for (int c=0; c < 3; c++) grad[3*fv+c] += gco*s->n[c];   // vertex ejected along +n
+    (*nacon)++;
+    int o = aoff[s->atree];                                     // tree side -> appended slots only (NEVER ccache/sp)
+    for (int i=0; i < s->bn; i++) grad[o+i] += gco*(-bpair[i]);  // geom driven along -b away from the vertex
+    if (s3list) { ipcS3* e = &s3list[*ns3cnt]; e->fv = fv; e->o = o; e->bn = s->bn; e->k = s->k;   // record for Hessian
+      mju_copy3(e->n, s->n); e->b = bpair; (*ns3cnt)++; }
+    return;
+  }
   const mjtNum* ci = &x[3*(nfv + s->ri)];
   mjtNum n[3], cw[4], gap, k = IPC_SOFT_K*rmass[s->ri]*ih2; int f[4], ni;
   if (s->type == 0) {                                            // sphere vs flex triangle
@@ -1014,6 +1056,12 @@ static mjtNum ipc_softEnergy(const ipcSoft* soft, int nsoft, const mjModel* m, c
                              const mjtNum* rmass, mjtNum ih2) {
   mjtNum E = 0;
   for (int si=0; si < nsoft; si++) { const ipcSoft* s = &soft[si];
+    if (s->type == 3) {   // flex VERTEX vs ARTICULATED geom: live-FK gap (caller FK'd at the trial config), no ri
+      mjtNum cp[3]; mj_local2Global((mjData*)d, cp, NULL, s->plocal, NULL, m->geom_bodyid[s->gi], mjSAMEFRAME_NONE);
+      mjtNum g3 = s->dist0 + mju_dot3(s->n, &x[3*s->vp]) - mju_dot3(s->n, cp);
+      if (g3 < 0) E += 0.5*s->k*g3*g3;
+      continue;
+    }
     const mjtNum* ci = &x[3*(nfv+s->ri)]; mjtNum gap, k = IPC_SOFT_K*rmass[s->ri]*ih2;
     if (s->type == 0) { int A=s->idx[0], B=s->idx[1], C=s->idx[2];
       mjtNum cp[3], w[3], dd = ipc_ptTri(ci, &x[3*A], &x[3*B], &x[3*C], cp, w); gap = dd - (rrad[s->ri]+rad[A]);
@@ -1263,14 +1311,7 @@ static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 // FROZEN nv gradient direction b = J_B^T n - J_A^T n (mj_jac, stored separately) fix the push-out direction and
 // the Gauss-Newton Hessian; the SCALAR gap is recomputed LIVE through full nonlinear FK each Newton iter (the foot
 // cannot tunnel). k = m_eff/h^2, m_eff = 1/(b^T M^-1 b) the contact-space effective mass (= the sphere's mass/h^2
-// as a special case, and the reduced mass for body-vs-body).
-typedef struct {
-  int    bodyA, bodyB, movA, movB;
-  mjtNum pA[3], pB[3];     // contact point in each body's local frame (anchors)
-  mjtNum xA0[3], xB0[3];   // world anchors at q_n (== con->pos); used live for the static side
-  mjtNum n[3];             // frozen unit normal, geom[0]->geom[1]
-  mjtNum dist0, k;         // signed gap at detection (<0 = penetration); penalty stiffness
-} ipcGcon;
+// as a special case, and the reduced mass for body-vs-body). The ipcGcon struct is defined above ipcCtx.
 
 // LIVE signed gap of contact c at the CURRENT FK config (caller must have set d->qpos and run mj_kinematics).
 // gap = dist0 + n.(xB - xA), xA/xB = world anchors via FK (a static side keeps its frozen q_n anchor). The
@@ -1284,133 +1325,12 @@ static mjtNum gconGap(mjData* d, const ipcGcon* c) {
   return c->dist0 + mju_dot3(c->n, xB) - mju_dot3(c->n, xA);
 }
 
-// Energy of the per-tree incremental potential at config q: kinetic 0.5/h^2 d(q~,q)^T M d(q~,q) PLUS the simple
-// one-sided penalty 0.5*k*min(0,gap)^2 over the tracked contacts. FK is refreshed at q (mj_kinematics only, M
-// stays frozen) so gconGap sees the live anchors.
-static mjtNum ipc_treeE(const mjModel* m, mjData* d, const mjtNum* q, const mjtNum* qtil,
-                        mjtNum ih2, int nv, mjtNum* rbuf, mjtNum* mrbuf, int nc, const ipcGcon* C) {
-  mju_copy(d->qpos, q, m->nq);
-  mj_kinematics(m, d);
-  mj_differentiatePos(m, rbuf, 1.0, qtil, q);
-  mj_mulM(m, d, mrbuf, rbuf);                                  // M*r matrix-free (M frozen at q_n via d->qM)
-  mjtNum E = 0.5*ih2*mju_dot(rbuf, mrbuf, nv);                 // kinetic incremental potential
+// one-sided rigid-rigid penalty merit 0.5*k*min(0,gap)^2 over ALL tracked contacts (gap<0 re-filtered live each
+// eval, matching the old ipc_treeE) -- the line-search energy term for the merged nfd==0 path. Pure FK reader.
+static mjtNum ipc_gconEnergy(mjData* d, const ipcGcon* C, int nc) {
+  mjtNum E = 0;
   for (int c=0; c < nc; c++) { mjtNum gap = gconGap(d, &C[c]); if (gap < 0) E += 0.5*C[c].k*gap*gap; }
   return E;
-}
-
-// PER-TREE variational implicit-Euler core, generalized-coordinate form (the destination architecture: ONE
-// energy minimized over the nv tangent; flex vertices and slide spheres are the trivial 1-body-tree case, an
-// articulated body is one tree whose mass block is its dense M). Built rigid-first: handles the all-rigid (no-
-// flex) case; the flex elastic/AL folds into the SAME Newton later. Smooth forces enter EXPLICITLY through the
-// predictor (qacc_smooth) so with no contact this is semi-implicit Euler exactly (round-off match to mjINT_EULER).
-//   q~ = q_n (+) h*(v_n + h*qacc_smooth)  [mj_integratePos];  minimize 0.5/h^2 d(q~,q)^T M d(q~,q) + penalty
-//   v_{n+1} = (q_n (-) q_{n+1})/h  [mj_differentiatePos].  M = M(q_n) dense-frozen; Newton solved densely.
-// CONTACT: the SIMPLE one-sided penalty 0.5*k*min(0,gap)^2 over MuJoCo's OWN collision result d->contact (all geom
-// types, articulated bodies). Each contact is anchored at q_n with a FROZEN normal/direction b (via mj_jac) but a
-// LIVE nonlinear gap (FK each Newton iter) -> a fast body can't tunnel. One rank-1 term k*b b^T per contact carries
-// both bodies' self + cross blocks. Rigid bodies NEVER enter a multiplier / CCD / feasibility cap -- penetrate +
-// recover (frictionless, no solref yet). The penetration-free AL guarantee stays flex-flex (the flex path). nv is
-// small (rigid-only), so a dense Cholesky is used; the per-tree block-Jacobi PCG replaces it at larger scale.
-static void mj_ipcTree(const mjModel* m, mjData* d) {
-  mjtNum h = m->opt.timestep; int nv = m->nv, nq = m->nq; mjtNum ih2 = 1.0/(h*h);
-  // ---- detect once at q_n from d->contact (populated by the predictor mj_forward: for the no-flex case mj_step
-  // leaves CONTACT enabled, only the constraint solve is skipped -- so native collision ran at q_n) ----
-  int cap = 256, nc = 0;
-  ipcGcon* C = (ipcGcon*) mju_malloc(cap*sizeof(ipcGcon));
-  mjtNum* cb = (mjtNum*) mju_malloc((nv > 0 ? cap*nv : 1)*sizeof(mjtNum));   // frozen nv gradient dir per contact
-  mjtNum* JA = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));     // detect-time scratch
-  mjtNum* JB = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));
-  mjtNum* Mb = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  for (int ic=0; ic < d->ncon && nc < cap; ic++) {
-    const mjContact* con = d->contact + ic;
-    if (con->geom[0] < 0 || con->geom[1] < 0) continue;      // skip flex contacts (handled by the flex path)
-    int bA = m->geom_bodyid[con->geom[0]], bB = m->geom_bodyid[con->geom[1]];
-    int movA = (m->body_weldid[bA] != 0), movB = (m->body_weldid[bB] != 0);
-    if (!movA && !movB) continue;                            // static-static: nothing to do
-    ipcGcon* c = &C[nc];
-    c->bodyA=bA; c->bodyB=bB; c->movA=movA; c->movB=movB; c->dist0=con->dist;
-    mju_copy3(c->n, con->frame);                             // frame[0:3] = unit normal geom[0]->geom[1]
-    mju_copy3(c->xA0, con->pos); mju_copy3(c->xB0, con->pos);
-    mjtNum rel[3];
-    mju_sub3(rel, con->pos, d->xpos+3*bA); mju_mulMatTVec3(c->pA, d->xmat+9*bA, rel);   // world -> body-local anchor
-    mju_sub3(rel, con->pos, d->xpos+3*bB); mju_mulMatTVec3(c->pB, d->xmat+9*bB, rel);
-    mj_jac(m, d, JA, NULL, con->pos, bA);                    // 3 x nv (zero rows for a weld-to-world body)
-    mj_jac(m, d, JB, NULL, con->pos, bB);
-    mjtNum* b = cb + nc*nv;                                  // gradient dir b = J_B^T n - J_A^T n (geom1 - geom0)
-    for (int i=0; i < nv; i++) { mjtNum s=0; for (int rr=0; rr<3; rr++) s += (JB[rr*nv+i]-JA[rr*nv+i])*c->n[rr]; b[i]=s; }
-    mj_solveM(m, d, Mb, b, 1);                               // M^-1 b on the frozen q_n factorization
-    mjtNum bMb = mju_dot(b, Mb, nv);
-    if (bMb < mjMINVAL) continue;                            // both ends immovable along n -> drop
-    c->k = ih2/bMb;                                          // k = m_eff/h^2, m_eff = 1/(b^T M^-1 b)
-    nc++;
-  }
-  // ---- predictor q~, save q_n, Newton over the tangent with a MATRIX-FREE PCG inner solve + line search ----
-  // The Hessian H = ih2*M + sum_active k*b b^T is applied matrix-free (mj_mulM for the kinetic block, rank-1 per
-  // active contact); preconditioned by the exact inverse of the kinetic block, (ih2*M)^-1 = h^2*M^-1, via h^2*
-  // mj_solveM on the frozen q_n factorization. M block-diagonal over trees -> mj_solveM IS the per-tree block
-  // solve, so contact-free PCG converges in ~1 iter and contact adds O(n_active) iters. (STEP 1 of the flex unify:
-  // rigid path only; the dense Cholesky is gone; the same PCG callbacks generalize to the flex packing later.)
-  int cap2 = nc > 0 ? nc : 1;
-  mjtNum* qtil = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
-  mjtNum* qn   = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
-  mjtNum* q    = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
-  mjtNum* qtr  = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
-  mjtNum* vp   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* r    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* g    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* dv   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* Mr   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));   // M*r (gradient) + ipc_treeE scratch
-  mjtNum* pr   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));   // PCG residual / search / H*p
-  mjtNum* pz   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* pp   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* pHp  = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  int*    acti = (int*)    mju_malloc(cap2*sizeof(int));                   // active-contact indices (gap<0)
-  mjtNum* kvec = (mjtNum*) mju_malloc(cap2*sizeof(mjtNum));                // per-contact stiffness (for the ctx)
-  for (int c=0; c < nc; c++) kvec[c] = C[c].k;
-  for (int i=0; i < nq; i++) qn[i] = d->qpos[i];             // q_n (d->qpos / FK currently at q_n)
-  for (int i=0; i < nv; i++) vp[i] = d->qvel[i] + h*d->qacc_smooth[i];
-  for (int i=0; i < nq; i++) qtil[i] = qn[i];
-  mj_integratePos(m, qtil, vp, h);                           // predictor q~
-  for (int i=0; i < nq; i++) q[i] = qn[i];                   // start at q_n
-  for (int it=0; it < 32; it++) {
-    mju_copy(d->qpos, q, nq); mj_kinematics(m, d);           // load-bearing: FK at trial q so gconGap is live
-    mj_differentiatePos(m, r, 1.0, qtil, q);                 // r = d(q~, q)
-    mj_mulM(m, d, Mr, r); for (int i=0; i < nv; i++) g[i] = ih2*Mr[i];   // kinetic gradient ih2*M*r
-    int na = 0;                                              // freeze the active set + accumulate contact gradient
-    for (int cc=0; cc < nc; cc++) {
-      mjtNum gap = gconGap(d, &C[cc]);
-      if (gap < 0) { const mjtNum* b = cb + cc*nv; mjtNum kg = C[cc].k*gap;
-        for (int i=0; i < nv; i++) g[i] += kg*b[i];
-        acti[na++] = cc;
-      }
-    }
-    // shared PCG (ipc_solveU, the unified loop): solve H dv = g, H = ih2*M + sum_a k_a b_a b_a^T; rigid ctx ->
-    // ih2*M apply via mj_mulM, precond h^2*M^-1 via mj_solveM. dx = -H^-1 g is the Newton step directly. (Mr is
-    // free after the gradient -> reused as the ipc_solveU usol scratch.)
-    ipcCtx rctx = {0};
-    rctx.rigid = 1; rctx.m = m; rctx.d = d; rctx.ih2 = ih2; rctx.h2 = h*h;
-    rctx.na = na; rctx.acti = acti; rctx.cb = cb; rctx.kvec = kvec;
-    ipc_solveU(dv, g, nv, &rctx, 1e-20, pr, pz, pp, pHp, Mr);
-    mjtNum dvn = 0; for (int i=0; i < nv; i++) { mjtNum a = dv[i] < 0 ? -dv[i] : dv[i]; if (a > dvn) dvn = a; }
-    if (dvn < 1e-10) break;                                  // step ~ 0 -> converged
-    mjtNum E0 = ipc_treeE(m, d, q, qtil, ih2, nv, r, Mr, nc, C), alpha = 1.0; int ok = 0;
-    for (int ls=0; ls < 12; ls++) {
-      for (int i=0; i < nq; i++) qtr[i] = q[i];
-      mj_integratePos(m, qtr, dv, alpha);
-      if (ipc_treeE(m, d, qtr, qtil, ih2, nv, r, Mr, nc, C) <= E0 + 1e-12) { ok = 1; break; }
-      alpha *= 0.5;
-    }
-    if (!ok) break;                                          // frozen-Jacobian descent stalled -> stop
-    mj_integratePos(m, q, dv, alpha);
-  }
-  // ---- readback + commit; leave FK consistent at the committed config for downstream ----
-  mj_differentiatePos(m, d->qvel, h, qn, q);                 // v_{n+1} = (q_{n+1} (-) q_n)/h
-  for (int i=0; i < nq; i++) d->qpos[i] = q[i];              // commit q_{n+1}
-  mj_kinematics(m, d); mj_comPos(m, d);                      // FK + cdof at q_{n+1}
-  d->time += h;
-  mju_free(C); mju_free(cb); mju_free(JA); mju_free(JB); mju_free(Mb);
-  mju_free(qtil); mju_free(qn); mju_free(q); mju_free(qtr); mju_free(vp); mju_free(r); mju_free(g); mju_free(dv);
-  mju_free(Mr); mju_free(pr); mju_free(pz); mju_free(pp); mju_free(pHp); mju_free(acti); mju_free(kvec);
 }
 
 // APPENDED ARTICULATED kinetic residual for the flex-unify path: given the candidate generalized tangent qdc
@@ -1441,7 +1361,8 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // into the free-point array in flex order; fxadr[k] is the free-point offset of dim-2 flex flist[k].
   int nfd = 0;
   for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) nfd++;
-  if (nfd == 0) { mj_ipcTree(m, d); return; }   // no 2D flex -> per-tree generalized-coordinate core
+  // nfd==0 (no 2D flex: pure rigid/articulated, e.g. the humanoid) now falls through to the SAME unified path:
+  // the appended articulated block carries the generalized tangent and the ported ipcGcon rigid-rigid contact.
   int* flist = (int*) mju_malloc(nfd*sizeof(int));   // the dim-2 flex ids
   int* fxadr = (int*) mju_malloc(nfd*sizeof(int));   // free-point offset of each dim-2 flex
   int nfv = 0, ne = 0;                               // total dim-2 flex verts / elements (all flexes)
@@ -1544,6 +1465,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   mju_free(isartictree);
   int N_total = N + N_artic, Na = (N_total > 0 ? N_total : 1);   // Na sizes the full (flex+appended) solver vector
+  // global dof -> appended solver slot (aoff[tree]+localdof), or -1 if its tree is not appended (flex/slide-sphere/
+  // static). Scatters the rigid-rigid contact's full-nv b into grad/p/Hp; only ever indexed where b[i]!=0 (=> >=0).
+  int* dof2slot = (int*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(int));
+  for (int i=0; i < m->nv; i++) { int t = m->dof_treeid[i];
+    dof2slot[i] = (aoff[t] >= 0) ? (aoff[t] + i - m->tree_dofadr[t]) : -1; }
   (void) NVTREE;                                             // consumed in 4c (mixed-contact side store)
   int nstate = nfv + nrigid;                                  // state-vector length (flex points + rigid bodies)
   // FEM membrane elements (all dim-2 flexes): consume MuJoCo's precomputed flex_stiffness metric (from the
@@ -1686,6 +1612,48 @@ void mj_IPC(const mjModel* m, mjData* d) {
     mju_copy(qtil_a, qn_a, m->nq); mj_integratePos(m, qtil_a, a_gdq, h);    // q~ = q_n (+) h*(v + h*qacc_smooth)
   }
 
+  // RIGID-RIGID geom-geom contact (ported from the deleted mj_ipcTree): detect ONCE at q_n from d->contact, which
+  // is populated only when nfd==0 (engine_forward leaves CONTACT enabled iff no dim-2 flex). FK/qLD/qM are all at
+  // q_n here (the predictor's frozen factorization), exactly what mj_jac/mj_solveM need.
+  int gcap = (nfd == 0 && na_artic) ? 256 : 1;
+  ipcGcon* gcon = (ipcGcon*) mju_malloc(gcap*sizeof(ipcGcon));
+  mjtNum*  gcb  = (mjtNum*)  mju_malloc((size_t)gcap*(m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));   // frozen nv direction b per contact
+  int*     gci  = (int*)     mju_malloc(gcap*sizeof(int));                                     // active-contact indices (gap<0)
+  mjtNum*  g_JA = (mjtNum*)  mju_malloc((gcap > 1 ? 3*m->nv : 1)*sizeof(mjtNum));
+  mjtNum*  g_JB = (mjtNum*)  mju_malloc((gcap > 1 ? 3*m->nv : 1)*sizeof(mjtNum));
+  mjtNum*  g_Mb = (mjtNum*)  mju_malloc((gcap > 1 ? m->nv : 1)*sizeof(mjtNum));
+  int ngc = 0, ngc_act = 0;
+  if (nfd == 0 && na_artic) {
+    for (int ic=0; ic < d->ncon && ngc < gcap; ic++) {
+      const mjContact* con = d->contact + ic;
+      if (con->geom[0] < 0 || con->geom[1] < 0) continue;     // flex contacts -> the flex path, not here
+      int bA = m->geom_bodyid[con->geom[0]], bB = m->geom_bodyid[con->geom[1]];
+      int movA = (m->body_weldid[bA] != 0), movB = (m->body_weldid[bB] != 0);
+      if (!movA && !movB) continue;                           // static-static: nothing to do
+      // each MOVABLE end must sit on an appended articulated tree. Excludes slide-spheres (soft path) + flex.
+      // NOTE: a slide-sphere-vs-articulated contact gets NO force here (neither hard nor soft type-2) -- a known
+      // narrow gap vs the old mj_ipcTree (step-5 review SEV-2); fold rbodies into this detection if one surfaces.
+      if (movA && dof2slot[m->body_dofadr[bA]] < 0) continue;
+      if (movB && dof2slot[m->body_dofadr[bB]] < 0) continue;
+      ipcGcon* c = &gcon[ngc];
+      c->bodyA=bA; c->bodyB=bB; c->movA=movA; c->movB=movB; c->dist0=con->dist;
+      mju_copy3(c->n, con->frame);                            // frame[0:3] = unit normal geom[0]->geom[1]
+      mju_copy3(c->xA0, con->pos); mju_copy3(c->xB0, con->pos);
+      mjtNum rel[3];
+      mju_sub3(rel, con->pos, d->xpos+3*bA); mju_mulMatTVec3(c->pA, d->xmat+9*bA, rel);   // world -> body-local anchor
+      mju_sub3(rel, con->pos, d->xpos+3*bB); mju_mulMatTVec3(c->pB, d->xmat+9*bB, rel);
+      mj_jac(m, d, g_JA, NULL, con->pos, bA);                 // 3 x nv (zero rows for a weld-to-world body)
+      mj_jac(m, d, g_JB, NULL, con->pos, bB);
+      mjtNum* b = gcb + (size_t)ngc*m->nv;                    // b = J_B^T n - J_A^T n (geom1 - geom0)
+      for (int i=0; i < m->nv; i++) { mjtNum s=0; for (int rr=0; rr<3; rr++) s += (g_JB[rr*m->nv+i]-g_JA[rr*m->nv+i])*c->n[rr]; b[i]=s; }
+      mj_solveM(m, d, g_Mb, b, 1);                            // M^-1 b on the frozen q_n factorization
+      mjtNum bMb = mju_dot(b, g_Mb, m->nv);
+      if (bMb < mjMINVAL) continue;                           // both ends immovable along n -> drop
+      c->k = (1.0/(h*h))/bMb;                                 // k = m_eff/h^2, m_eff = 1/(b^T M^-1 b)
+      ngc++;
+    }
+  }
+
   const mjtNum* vx = d->flexvert_xpos;
   for (int v=0; v < npt; v++) {
     // xold position source: flex vertex from flexvert_xpos (the point array is flex-only now)
@@ -1822,8 +1790,11 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // at xold + a margin. One-sided penalty only (penetrate+recover); never enters the hard set / CCD / line-search
   // feasibility. The gap is recomputed at the current x each Newton iter (ipc_softTry); the PAIR set is fixed here.
   mjtNum softmargin = 0.02;
-  int softcap = nrigid*(ne + m->ngeom + nrigid) + 16;
+  int softcap = nrigid*(ne + m->ngeom + nrigid) + na_artic*nfv + 16;   // + the type-3 (flex-vert vs artic geom) budget
   ipcSoft* soft = (ipcSoft*) mju_malloc((size_t)softcap*sizeof(ipcSoft));
+  mjtNum* g_bsoft = (mjtNum*) mju_malloc((size_t)softcap*(NVTREE > 0 ? NVTREE : 1)*sizeof(mjtNum));  // frozen Jcp^T n per type-3 pair
+  mjtNum* a_jbuf  = (mjtNum*) mju_malloc((na_artic ? 3*m->nv : 1)*sizeof(mjtNum));   // mj_jac scratch (type-3 build)
+  ipcS3*  a_s3    = (ipcS3*)  mju_malloc((size_t)softcap*sizeof(ipcS3));   // active type-3 (rebuilt each Newton iter)
   int nsoft = 0;
   for (int i=0; i < nrigid; i++) {
     const mjtNum* ci = &xold[3*(nfv+i)];
@@ -1847,10 +1818,46 @@ void mj_IPC(const mjModel* m, mjData* d) {
         soft[nsoft].type=5; soft[nsoft].ri=i; soft[nsoft].idx[0]=j; soft[nsoft].gi=-1; nsoft++; }
     }
   }
+  // TYPE 3: flex VERTEX vs ARTICULATED-body geom (the cloth-grasping case). One-sided penalty, built ONCE at q_n
+  // with a velocity-inflated collar (the geom is FK'd at q_n only; its tip can sweep ~h*v_tip within the step).
+  // FROZEN normal n + direction b=Jcp^T n (g_bsoft) + stiffness k; the LIVE gap is recomputed in ipc_softTry.
+  for (int g=0; na_artic > 0 && g < m->ngeom; g++) {
+    int gb = m->geom_bodyid[g];
+    if (m->body_dofnum[gb] == 0) continue;
+    int gt = m->dof_treeid[m->body_dofadr[gb]];
+    if (aoff[gt] < 0) continue;                                 // geom must sit on an articulated tree
+    if (m->geom_contype[g]==0 && m->geom_conaffinity[g]==0) continue;
+    int gnd = m->tree_dofnum[gt], gda = m->tree_dofadr[gt];
+    mjtNum vtip = 0;                                            // end-of-step predicted tree speed
+    for (int i=0; i < gnd; i++) { mjtNum vv = d->qvel[gda+i] + h*qacc_pred[gda+i]; vv = vv<0?-vv:vv; if (vv > vtip) vtip = vv; }
+    mjtNum collar = softmargin + h*vtip*0.5 + 0.05;            // conservative (only widens detection)
+    for (int v=0; v < nfv; v++) {
+      if (fidx[v] < 0 || nsoft >= softcap) continue;
+      mjtNum nn[3], dd = ipc_geomDist(m, g, d->geom_xpos+3*g, d->geom_xmat+9*g, &xold[3*v], nn, 1e30);
+      mjtNum gap0 = dd - rad[v];
+      if (gap0 >= collar) continue;
+      mjtNum cp[3], rel[3];
+      for (int c=0; c < 3; c++) cp[c] = xold[3*v+c] - (gap0 + rad[v])*nn[c];   // closest point on the geom surface
+      mj_jac(m, d, a_jbuf, NULL, cp, gb);                       // Jcp (3 x nv) at q_n
+      for (int i=0; i < m->nv; i++) a_gr[i] = 0;               // a_gr := bfull (nv) = J_tree^T n
+      for (int i=0; i < gnd; i++) { mjtNum bi = 0; for (int r=0; r < 3; r++) bi += a_jbuf[r*m->nv + gda+i]*nn[r];
+        a_gr[gda+i] = bi; g_bsoft[nsoft*NVTREE + i] = bi; }
+      mj_solveM(m, d, a_gMr, a_gr, 1);                          // M^-1 bfull
+      mjtNum invm = (mass[v] > mjMINVAL ? 1.0/mass[v] : 0) + mju_dot(a_gr, a_gMr, m->nv);
+      if (invm < mjMINVAL) continue;
+      ipcSoft* s = &soft[nsoft];
+      // dist0 = -rad so the LIVE gap = dist0 + n.(x_v - cp) = n.(x_v - cp) - rad equals gap0 at q_n (cp is ON the
+      // geom surface so n.(x_v_n - cp_n) = dd; storing gap0 here would double-count -> engaged only when deep).
+      s->type=3; s->ri=-1; s->vp=v; s->gi=g; s->atree=gt; s->bn=gnd; s->dist0=-rad[v]; s->k=ih2/invm;
+      mju_copy3(s->n, nn);
+      mju_sub3(rel, cp, d->xpos+3*gb); mju_mulMatTVec3(s->plocal, d->xmat+9*gb, rel);   // world -> geom-body local
+      nsoft++;
+    }
+  }
   int outer_cap = 1024;       // newton_max_iter
   mjtNum last_maxdx = 1e30;    // last inner Newton-direction magnitude, exposed to the outer early-out
   int prof_outer=0, prof_inner=0, prof_cb=1, prof_nacon=0;   // MJ_IPC_PROF counters (cb: 1 initial build)
-  for (int outer=0; outer < outer_cap && N > 0; outer++) {   // OUTER loop (single AL loop; paper Alg.1)
+  for (int outer=0; outer < outer_cap && N_total > 0; outer++) {   // OUTER loop (single AL loop; paper Alg.1). N_total (not N): the appended articulated block must run even with no flex packing (humanoid: N==0, N_total==nv)
   prof_outer++;
   g0 = -1;                    // reset the inner-Newton relative stop each outer iteration
   // WORKING SET: the PERSISTENT active set aset/agap/aheld/naset maintained across outer iters by
@@ -1874,9 +1881,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // N2 update_slack (at x): materialize s[c] and the slack-baked d the assemble (ipc_try) / lambda use.
   ipc_updateSlack(wcon, wn, wheld, x, xfree, rad, ghat, mass, ih2);
   int newton_converged_out = 0;   // carry the last inner iter's newton_converged to the outer termination
-  for (int it=0; it < inner_cap && N > 0; it++) {
+  for (int it=0; it < inner_cap && N_total > 0; it++) {
     prof_inner++; g_nact = 0;   // [PROF] reset active count; last inner iter's value is read in the profiler print
-    for (int i=0; i < N; i++) grad[i] = 0;
+    for (int i=0; i < N_total; i++) grad[i] = 0;   // zero flex + appended (type-3 tree-grad and kinetic both +=)
     if (N > 0) {                                              // IC0 sparse Hessian (per-vertex 3x3 diagonal)
       for (int i=0; i < sp.nnz; i++) sp.val[i] = 0;
       for (int fi=0; fi < N/3; fi++) for (int c=0; c < 3; c++)   // inertia: diagonal
@@ -1961,8 +1968,26 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < wn; c++) if (wheld[c] && wgap[c] < ghat)
         ipc_try(wcon[c], m, d, x, xfree, gv, ge, r, rad, ghat, xold, mass, ih2, fidx, grad, acon, ccache, &nacon, amax, &wgap[c]);
     }
+    if (na_artic) {   // FK the articulated geoms at q_n (+) qdelta so type-3 soft contacts read live poses (qM/qLD
+      for (int i=0; i < m->nv; i++) a_gdq[i] = 0;              // stay frozen at q_n -> mj_mulM/mj_solveM unaffected)
+      for (int a=0; a < na_artic; a++) { int t=atid[a], o=aoff[t], da=m->tree_dofadr[t], nd=m->tree_dofnum[t];
+        for (int i=0; i < nd; i++) a_gdq[da+i] = qdelta[o+i-N]; }
+      mju_copy(d->qpos, qn_a, m->nq); mj_integratePos(m, d->qpos, a_gdq, 1); mj_kinematics(m, d);
+    }
+    ngc_act = 0;   // RIGID-RIGID active set (gap<0) + contact gradient, rebuilt each Newton iter (gconGap is live: FK above)
+    if (nfd == 0 && na_artic) {
+      for (int cc=0; cc < ngc; cc++) {
+        mjtNum gap = gconGap(d, &gcon[cc]);
+        if (gap < 0) { const mjtNum* b = gcb + (size_t)cc*m->nv; mjtNum kg = gcon[cc].k*gap;
+          for (int i=0; i < m->nv; i++) if (b[i] != 0) grad[dof2slot[i]] += kg*b[i];   // push-out; dof2slot[i]>=0 where b[i]!=0
+          gci[ngc_act++] = cc;
+        }
+      }
+    }
+    int ns3 = 0;                                                // active type-3 list, rebuilt each Newton iter
     for (int s=0; s < nsoft; s++)                               // SOFT flex-rigid penalty (penetration only); shares ccache/nacon
-      ipc_softTry(&soft[s], m, d, x, nfv, rrad, rad, rmass, ih2, nfree_flex, fidx, grad, ccache, &nacon, amax);
+      ipc_softTry(&soft[s], m, d, x, nfv, rrad, rad, rmass, ih2, nfree_flex, fidx, grad, ccache, &nacon, amax,
+                  g_bsoft + (size_t)s*(NVTREE > 0 ? NVTREE : 1), aoff, a_s3, &ns3);
     if (nacon > prof_nacon) prof_nacon = nacon;
     for (int c=0; c < nacon; c++) {                          // contact GN -> IC0 sparse Hessian
       const ipcCC* cc = &ccache[c];
@@ -1984,16 +2009,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
     gnorm = sqrt(gna2);
     if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
     ipcCtx fctx = {0};
-    fctx.rigid = 0; fctx.sp = &sp; fctx.mdiag = mdiag; fctx.nelem = ne; fctx.elems = elems; fctx.estr = estr;
+    fctx.sp = &sp; fctx.mdiag = mdiag; fctx.nelem = ne; fctx.elems = elems; fctx.estr = estr;
     fctx.nbe = nbe; fctx.bends = bends; fctx.ccache = ccache; fctx.nacon = nacon;
     fctx.m = m; fctx.d = d; fctx.ih2 = ih2; fctx.h2 = h*h; fctx.N_flex = N; fctx.na_artic = na_artic; fctx.nv = m->nv;
     fctx.atid = atid; fctx.aoff = aoff; fctx.tdofadr = m->tree_dofadr; fctx.tdofnum = m->tree_dofnum;
     fctx.ptmp = a_ptmp; fctx.Htmp = a_Htmp; fctx.rtmp = a_rtmp; fctx.ztmp = a_ztmp;
+    fctx.s3 = a_s3; fctx.ns3 = ns3;                            // active type-3 tree+cross Hessian
+    fctx.gcon = gcon; fctx.gcb = gcb; fctx.gci = gci; fctx.ngc = ngc_act; fctx.dof2slot = dof2slot;  // rigid-rigid rank-1
     // appended ARTICULATED kinetic gradient: grad[appended] = ih2*M*(q (-) q~), q = q_n (+) qdelta (frozen M@q_n)
     if (na_artic) {
       ipc_articResid(m, d, qn_a, qtil_a, qdelta, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr);
       for (int a=0; a < na_artic; a++) { int t=atid[a], o=aoff[t], da=m->tree_dofadr[t], nd=m->tree_dofnum[t];
-        for (int i=0; i < nd; i++) grad[o+i] = ih2*a_gMr[da+i]; }
+        for (int i=0; i < nd; i++) grad[o+i] += ih2*a_gMr[da+i]; }   // += : the type-3 tree-grad already landed here
     }
     ipc_solveU(dx, grad, N_total, &fctx, 1e-8, rcg, zcg, pcg, Hpv, usol);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
@@ -2032,6 +2059,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
                            gv, ge, candLS, nls, xold, xfree, nrigid, rmass);
     E0 += ipc_softEnergy(soft, nsoft, m, d, x, nfv, rrad, rad, rmass, ih2);   // soft flex-rigid (parity w/ ipc_softTry)
     E0 += ipc_articResid(m, d, qn_a, qtil_a, qdelta, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr);
+    if (nfd == 0 && na_artic) E0 += ipc_gconEnergy(d, gcon, ngc);   // rigid-rigid penalty (FK above is at q_n(+)qdelta)
     mjtNum alpha = 1.0;
     int lsok = 0;
     // Line search: plain monotone decrease + 1e-12 slop, OR newton_converged short-circuit; 8 backtracks /2;
@@ -2042,11 +2070,18 @@ void mj_IPC(const mjModel* m, mjData* d) {
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
       for (int i=0; i < nrigid; i++) { int fi = nfree_flex + i, v = nfv + i;   // rigid line-search update
         for (int c=0; c < 3; c++) xn[3*v+c] = x[3*v+c] + alpha*dx[3*fi+c]; }
+      for (int j=0; j < N_artic; j++) qdtmp[j] = qdelta[j] + alpha*dx[N+j];       // articulated trial tangent
+      if (na_artic) {   // FK at the trial articulated config so ipc_softEnergy's type-3 live gap sees the right geom
+        for (int i=0; i < m->nv; i++) a_gdq[i] = 0;
+        for (int a=0; a < na_artic; a++) { int t=atid[a], o=aoff[t], da=m->tree_dofadr[t], nd=m->tree_dofnum[t];
+          for (int i=0; i < nd; i++) a_gdq[da+i] = qdtmp[o+i-N]; }
+        mju_copy(d->qpos, qn_a, m->nq); mj_integratePos(m, d->qpos, a_gdq, 1); mj_kinematics(m, d);
+      }
       mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat,
                               gv, ge, candLS, nls, xold, xfree, nrigid, rmass);
-      Etr += ipc_softEnergy(soft, nsoft, m, d, xn, nfv, rrad, rad, rmass, ih2);   // soft flex-rigid at the trial
-      for (int j=0; j < N_artic; j++) qdtmp[j] = qdelta[j] + alpha*dx[N+j];       // articulated trial tangent
+      Etr += ipc_softEnergy(soft, nsoft, m, d, xn, nfv, rrad, rad, rmass, ih2);   // soft flex-rigid at the trial (geom @ qdtmp)
       Etr += ipc_articResid(m, d, qn_a, qtil_a, qdtmp, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr);
+      if (nfd == 0 && na_artic) Etr += ipc_gconEnergy(d, gcon, ngc);   // rigid-rigid penalty at the trial config
       if (Etr <= E0 + 1e-12 || newton_converged) { lsok = 1; break; }
       alpha *= 0.5;
     }
@@ -2151,6 +2186,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
         }
       for (int i=0; i < nd; i++) d->qvel[da+i] = qdelta[o+i-N]/h;
     }
+    // pure-articulated (no-flex) path: refresh FK + COM/cinert at q_{n+1} for downstream (the next predictor's
+    // qacc_smooth + sensors), mirroring the old mj_ipcTree. Gated nfd==0 so the flex bag stays byte-identical.
+    if (nfd == 0) { mj_kinematics(m, d); mj_comPos(m, d); }
   }
   d->time += h;
   if (N > 0) ipc_spFree(&sp);
@@ -2158,7 +2196,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems); mju_free(bends);
   mju_free(rad); mju_free(pbody); mju_free(pgeom);
   mju_free(rbody); mju_free(rqadr); mju_free(rdofadr); mju_free(rmass); mju_free(rgeom); mju_free(rrad);
-  mju_free(soft);
+  mju_free(soft); mju_free(g_bsoft); mju_free(a_jbuf); mju_free(a_s3);
   mju_free(flist); mju_free(fxadr); mju_free(pt2vg); mju_free(pt2flex);
   mju_free(acon); mju_free(ccache); mju_free(cand); mju_free(cgap); mju_free(candLS); mju_free(minc); mju_free(held);
   mju_free(gam); mju_free(actc); mju_free(appr); mju_free(actpt);
@@ -2166,6 +2204,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(gv); mju_free(ge); mju_free(estr);
   mju_free(x); mju_free(xfree); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(aoff); mju_free(atid);
+  mju_free(gcon); mju_free(gcb); mju_free(gci); mju_free(dof2slot); mju_free(g_JA); mju_free(g_JB); mju_free(g_Mb);
   mju_free(qn_a); mju_free(qtil_a); mju_free(qcur_a); mju_free(qdelta); mju_free(qdtmp);
   mju_free(a_ptmp); mju_free(a_Htmp); mju_free(a_rtmp); mju_free(a_ztmp); mju_free(a_gdq); mju_free(a_gr); mju_free(a_gMr);
   mju_free(grad); mju_free(dx); mju_free(mdiag); mju_free(qacc_pred);
