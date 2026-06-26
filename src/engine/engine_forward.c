@@ -1981,17 +1981,19 @@ void mj_step(const mjModel* m, mjData* d) {
   // common to all integrators
   mj_checkPos(m, d);
   mj_checkVel(m, d);
-  // The IPC integrator owns contact (barrier) and the flex elasticity (implicit, from flex_stiffness),
-  // so for the predictor we want the free-flight state x~ = x + h*v + h^2*a from inertia + gravity
-  // ONLY. Disable, for the predictor mj_forward: the constraint solve and collision detection (IPC
-  // ignores d->contact; the native contacts only mislead the viewer) AND the passive forces -- the
-  // FEM elastic spring is stiff and computed EXPLICITLY in qacc_smooth, which would make x~ blow up
-  // for the light flex vertices and double-count the elasticity the IPC solve adds implicitly.
+  // The FLEX IPC predictor must be pure free-flight x~ = x + h*v + h^2*a: the stiff FEM elastic is computed
+  // EXPLICITLY in qacc_smooth (disable SPRING+DAMPER -- both, so mj_passive early-returns at engine_passive.c:981,
+  // since mj_flexPassiveStretch ignores its own flags -- else x~ blows up for the light flex vertices and double-
+  // counts the elasticity), and the flex path does its OWN per-vertex contact (disable CONSTRAINT+CONTACT; native
+  // contacts would only mislead the viewer). The RIGID IPC path (mj_ipcTree) instead drives its penalty from the
+  // NATIVE contact set and needs the rigid passive forces; qacc_smooth is ALREADY the unconstrained accel, so it
+  // just runs the normal forward (collision populates d->contact; the native constraint solve runs but is ignored).
+  int ipcflex = 0;
   if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
+    for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { ipcflex = 1; break; }
+  }
+  if (ipcflex) {
     int saved = m->opt.disableflags;
-    // also disable DAMPER: with BOTH spring+damper off, mj_passive early-returns (engine_passive.c:981) so the flex
-    // elastic+damper do NOT leak into qacc_smooth -> x~. (Disabling only SPRING did not work: mj_flexPassiveStretch
-    // ignores its enbl_spring/enbl_damper flags, so the early-return is the reliable way to keep x~ = inertia+gravity.)
     ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING | mjDSBL_DAMPER;
     mj_forward(m, d);
     ((mjModel*) m)->opt.disableflags = saved;

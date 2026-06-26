@@ -27,6 +27,10 @@
 #include <mujoco/mjmodel.h>
 #include <mujoco/mjtype.h>
 #include "engine/engine_forward.h"      // mj_Euler (fallback)
+#include "engine/engine_support.h"      // mj_mulM, mj_integratePos, mj_differentiatePos (per-tree mass + manifold)
+#include "engine/engine_core_smooth.h"  // mj_solveM, mj_kinematics, mj_comPos (per-tree M^-1, FK at trial q)
+#include "engine/engine_core_util.h"    // mj_local2Global (anchor body-local -> world for the live gap)
+#include "engine/engine_util_solve.h"   // mju_cholFactor, mju_cholSolve (dense Newton solve)
 #include "engine/engine_util_blas.h"    // mju_dot3, mju_mulMatVec3
 #include "engine/engine_util_spatial.h" // mju_cross (flex bending)
 #include "engine/engine_util_errmem.h"  // mju_malloc, mju_free
@@ -1204,6 +1208,147 @@ static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 // (matched to the system Hessian scale, paper Eq.20); this is only the pre-mdiag init placeholder.
 #define IPC_KAPPA0   1000.0
 
+// A tracked GENERAL rigid penalty contact, ANCHORED at q_n, driven by MuJoCo's own collision result d->contact.
+// End A = geom[0]'s body, end B = geom[1]'s body; either may be static (welded to world). The contact point
+// con->pos is stored as a body-LOCAL anchor in each body (pA, pB). The FROZEN normal n (geom[0]->geom[1]) and the
+// FROZEN nv gradient direction b = J_B^T n - J_A^T n (mj_jac, stored separately) fix the push-out direction and
+// the Gauss-Newton Hessian; the SCALAR gap is recomputed LIVE through full nonlinear FK each Newton iter (the foot
+// cannot tunnel). k = m_eff/h^2, m_eff = 1/(b^T M^-1 b) the contact-space effective mass (= the sphere's mass/h^2
+// as a special case, and the reduced mass for body-vs-body).
+typedef struct {
+  int    bodyA, bodyB, movA, movB;
+  mjtNum pA[3], pB[3];     // contact point in each body's local frame (anchors)
+  mjtNum xA0[3], xB0[3];   // world anchors at q_n (== con->pos); used live for the static side
+  mjtNum n[3];             // frozen unit normal, geom[0]->geom[1]
+  mjtNum dist0, k;         // signed gap at detection (<0 = penetration); penalty stiffness
+} ipcGcon;
+
+// LIVE signed gap of contact c at the CURRENT FK config (caller must have set d->qpos and run mj_kinematics).
+// gap = dist0 + n.(xB - xA), xA/xB = world anchors via FK (a static side keeps its frozen q_n anchor). The
+// (xB - xA) = (geom1 - geom0) ordering matches con->dist so deeper penetration -> more-negative gap; at q_n the
+// anchors coincide (both == con->pos) so gap == dist0 exactly. xA,xB are full NONLINEAR FK of the material contact
+// points, so this does NOT reduce to the frozen-J linear gap that tunnels.
+static mjtNum gconGap(mjData* d, const ipcGcon* c) {
+  mjtNum xA[3], xB[3];
+  if (c->movA) mj_local2Global(d, xA, NULL, c->pA, NULL, c->bodyA, mjSAMEFRAME_NONE); else mju_copy3(xA, c->xA0);
+  if (c->movB) mj_local2Global(d, xB, NULL, c->pB, NULL, c->bodyB, mjSAMEFRAME_NONE); else mju_copy3(xB, c->xB0);
+  return c->dist0 + mju_dot3(c->n, xB) - mju_dot3(c->n, xA);
+}
+
+// Energy of the per-tree incremental potential at config q: kinetic 0.5/h^2 d(q~,q)^T M d(q~,q) PLUS the simple
+// one-sided penalty 0.5*k*min(0,gap)^2 over the tracked contacts. FK is refreshed at q (mj_kinematics only, M
+// stays frozen) so gconGap sees the live anchors.
+static mjtNum ipc_treeE(const mjModel* m, mjData* d, const mjtNum* q, const mjtNum* qtil, const mjtNum* M,
+                        mjtNum ih2, int nv, mjtNum* rbuf, int nc, const ipcGcon* C) {
+  mju_copy(d->qpos, q, m->nq);
+  mj_kinematics(m, d);
+  mj_differentiatePos(m, rbuf, 1.0, qtil, q);
+  mjtNum E = 0;
+  for (int i=0; i < nv; i++) { mjtNum s = 0; for (int j=0; j < nv; j++) s += M[i*nv+j]*rbuf[j]; E += 0.5*ih2*rbuf[i]*s; }
+  for (int c=0; c < nc; c++) { mjtNum gap = gconGap(d, &C[c]); if (gap < 0) E += 0.5*C[c].k*gap*gap; }
+  return E;
+}
+
+// PER-TREE variational implicit-Euler core, generalized-coordinate form (the destination architecture: ONE
+// energy minimized over the nv tangent; flex vertices and slide spheres are the trivial 1-body-tree case, an
+// articulated body is one tree whose mass block is its dense M). Built rigid-first: handles the all-rigid (no-
+// flex) case; the flex elastic/AL folds into the SAME Newton later. Smooth forces enter EXPLICITLY through the
+// predictor (qacc_smooth) so with no contact this is semi-implicit Euler exactly (round-off match to mjINT_EULER).
+//   q~ = q_n (+) h*(v_n + h*qacc_smooth)  [mj_integratePos];  minimize 0.5/h^2 d(q~,q)^T M d(q~,q) + penalty
+//   v_{n+1} = (q_n (-) q_{n+1})/h  [mj_differentiatePos].  M = M(q_n) dense-frozen; Newton solved densely.
+// CONTACT: the SIMPLE one-sided penalty 0.5*k*min(0,gap)^2 over MuJoCo's OWN collision result d->contact (all geom
+// types, articulated bodies). Each contact is anchored at q_n with a FROZEN normal/direction b (via mj_jac) but a
+// LIVE nonlinear gap (FK each Newton iter) -> a fast body can't tunnel. One rank-1 term k*b b^T per contact carries
+// both bodies' self + cross blocks. Rigid bodies NEVER enter a multiplier / CCD / feasibility cap -- penetrate +
+// recover (frictionless, no solref yet). The penetration-free AL guarantee stays flex-flex (the flex path). nv is
+// small (rigid-only), so a dense Cholesky is used; the per-tree block-Jacobi PCG replaces it at larger scale.
+static void mj_ipcTree(const mjModel* m, mjData* d) {
+  mjtNum h = m->opt.timestep; int nv = m->nv, nq = m->nq; mjtNum ih2 = 1.0/(h*h);
+  // ---- detect once at q_n from d->contact (populated by the predictor mj_forward: for the no-flex case mj_step
+  // leaves CONTACT enabled, only the constraint solve is skipped -- so native collision ran at q_n) ----
+  int cap = 256, nc = 0;
+  ipcGcon* C = (ipcGcon*) mju_malloc(cap*sizeof(ipcGcon));
+  mjtNum* cb = (mjtNum*) mju_malloc((nv > 0 ? cap*nv : 1)*sizeof(mjtNum));   // frozen nv gradient dir per contact
+  mjtNum* JA = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));     // detect-time scratch
+  mjtNum* JB = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));
+  mjtNum* Mb = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* M  = (mjtNum*) mju_malloc((nv > 0 ? nv*nv : 1)*sizeof(mjtNum));
+  mj_fullM(m, d, M);                                          // frozen M(q_n)
+  for (int ic=0; ic < d->ncon && nc < cap; ic++) {
+    const mjContact* con = d->contact + ic;
+    if (con->geom[0] < 0 || con->geom[1] < 0) continue;      // skip flex contacts (handled by the flex path)
+    int bA = m->geom_bodyid[con->geom[0]], bB = m->geom_bodyid[con->geom[1]];
+    int movA = (m->body_weldid[bA] != 0), movB = (m->body_weldid[bB] != 0);
+    if (!movA && !movB) continue;                            // static-static: nothing to do
+    ipcGcon* c = &C[nc];
+    c->bodyA=bA; c->bodyB=bB; c->movA=movA; c->movB=movB; c->dist0=con->dist;
+    mju_copy3(c->n, con->frame);                             // frame[0:3] = unit normal geom[0]->geom[1]
+    mju_copy3(c->xA0, con->pos); mju_copy3(c->xB0, con->pos);
+    mjtNum rel[3];
+    mju_sub3(rel, con->pos, d->xpos+3*bA); mju_mulMatTVec3(c->pA, d->xmat+9*bA, rel);   // world -> body-local anchor
+    mju_sub3(rel, con->pos, d->xpos+3*bB); mju_mulMatTVec3(c->pB, d->xmat+9*bB, rel);
+    mj_jac(m, d, JA, NULL, con->pos, bA);                    // 3 x nv (zero rows for a weld-to-world body)
+    mj_jac(m, d, JB, NULL, con->pos, bB);
+    mjtNum* b = cb + nc*nv;                                  // gradient dir b = J_B^T n - J_A^T n (geom1 - geom0)
+    for (int i=0; i < nv; i++) { mjtNum s=0; for (int rr=0; rr<3; rr++) s += (JB[rr*nv+i]-JA[rr*nv+i])*c->n[rr]; b[i]=s; }
+    mj_solveM(m, d, Mb, b, 1);                               // M^-1 b on the frozen q_n factorization
+    mjtNum bMb = mju_dot(b, Mb, nv);
+    if (bMb < mjMINVAL) continue;                            // both ends immovable along n -> drop
+    c->k = ih2/bMb;                                          // k = m_eff/h^2, m_eff = 1/(b^T M^-1 b)
+    nc++;
+  }
+  // ---- predictor q~, save q_n, Newton over the tangent (dense) with backtracking line search ----
+  mjtNum* qtil = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
+  mjtNum* qn   = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
+  mjtNum* q    = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
+  mjtNum* qtr  = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
+  mjtNum* vp   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* r    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* g    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* dv   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* H    = (mjtNum*) mju_malloc((nv > 0 ? nv*nv : 1)*sizeof(mjtNum));
+  for (int i=0; i < nq; i++) qn[i] = d->qpos[i];             // q_n (d->qpos / FK currently at q_n)
+  for (int i=0; i < nv; i++) vp[i] = d->qvel[i] + h*d->qacc_smooth[i];
+  for (int i=0; i < nq; i++) qtil[i] = qn[i];
+  mj_integratePos(m, qtil, vp, h);                           // predictor q~
+  for (int i=0; i < nq; i++) q[i] = qn[i];                   // start at q_n
+  for (int it=0; it < 32; it++) {
+    mju_copy(d->qpos, q, nq); mj_kinematics(m, d);           // load-bearing: FK at trial q so gconGap is live
+    mj_differentiatePos(m, r, 1.0, qtil, q);                 // r = d(q~, q)
+    for (int i=0; i < nv; i++) { mjtNum s = 0; for (int j=0; j < nv; j++) s += M[i*nv+j]*r[j]; g[i] = ih2*s; }
+    for (int k=0; k < nv*nv; k++) H[k] = ih2*M[k];           // gradient ih2 M r, Hessian ih2 M
+    for (int cc=0; cc < nc; cc++) {                          // + general penalty: one rank-1 term per active contact
+      mjtNum gap = gconGap(d, &C[cc]);
+      if (gap < 0) {
+        const mjtNum* b = cb + cc*nv; mjtNum kc = C[cc].k, kg = kc*gap;
+        for (int i=0; i < nv; i++) g[i] += kg*b[i];
+        for (int i=0; i < nv; i++) { mjtNum kb = kc*b[i]; for (int j=0; j < nv; j++) H[i*nv+j] += kb*b[j]; }
+      }
+    }
+    mju_cholFactor(H, nv, mjMINVAL);
+    mju_cholSolve(dv, H, g, nv);                             // dv = H^-1 g (Newton step is -dv)
+    mjtNum dvn = 0; for (int i=0; i < nv; i++) { mjtNum a = dv[i] < 0 ? -dv[i] : dv[i]; if (a > dvn) dvn = a; }
+    if (dvn < 1e-10) break;                                  // converged
+    for (int i=0; i < nv; i++) dv[i] = -dv[i];
+    mjtNum E0 = ipc_treeE(m, d, q, qtil, M, ih2, nv, r, nc, C), alpha = 1.0; int ok = 0;
+    for (int ls=0; ls < 12; ls++) {
+      for (int i=0; i < nq; i++) qtr[i] = q[i];
+      mj_integratePos(m, qtr, dv, alpha);
+      if (ipc_treeE(m, d, qtr, qtil, M, ih2, nv, r, nc, C) <= E0 + 1e-12) { ok = 1; break; }
+      alpha *= 0.5;
+    }
+    if (!ok) break;                                          // frozen-Jacobian descent stalled -> stop
+    mj_integratePos(m, q, dv, alpha);
+  }
+  // ---- readback + commit; leave FK consistent at the committed config for downstream ----
+  mj_differentiatePos(m, d->qvel, h, qn, q);                 // v_{n+1} = (q_{n+1} (-) q_n)/h
+  for (int i=0; i < nq; i++) d->qpos[i] = q[i];              // commit q_{n+1}
+  mj_kinematics(m, d); mj_comPos(m, d);                      // FK + cdof at q_{n+1}
+  d->time += h;
+  mju_free(C); mju_free(cb); mju_free(JA); mju_free(JB); mju_free(Mb); mju_free(M);
+  mju_free(qtil); mju_free(qn); mju_free(q); mju_free(qtr); mju_free(vp); mju_free(r); mju_free(g); mju_free(dv); mju_free(H);
+}
+
 void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum h = m->opt.timestep;
   mjtNum kappa = IPC_KAPPA0;   // placeholder; set to the auto mu = 0.1*max(inertia diag) once mdiag is known
@@ -1211,7 +1356,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // into the free-point array in flex order; fxadr[k] is the free-point offset of dim-2 flex flist[k].
   int nfd = 0;
   for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) nfd++;
-  if (nfd == 0) { mj_Euler(m, d); return; }   // flex-only integrator: no 2D flex -> Euler fallback
+  if (nfd == 0) { mj_ipcTree(m, d); return; }   // no 2D flex -> per-tree generalized-coordinate core
   int* flist = (int*) mju_malloc(nfd*sizeof(int));   // the dim-2 flex ids
   int* fxadr = (int*) mju_malloc(nfd*sizeof(int));   // free-point offset of each dim-2 flex
   int nfv = 0, ne = 0;                               // total dim-2 flex verts / elements (all flexes)
