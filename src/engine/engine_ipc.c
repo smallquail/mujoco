@@ -1238,13 +1238,13 @@ static mjtNum gconGap(mjData* d, const ipcGcon* c) {
 // Energy of the per-tree incremental potential at config q: kinetic 0.5/h^2 d(q~,q)^T M d(q~,q) PLUS the simple
 // one-sided penalty 0.5*k*min(0,gap)^2 over the tracked contacts. FK is refreshed at q (mj_kinematics only, M
 // stays frozen) so gconGap sees the live anchors.
-static mjtNum ipc_treeE(const mjModel* m, mjData* d, const mjtNum* q, const mjtNum* qtil, const mjtNum* M,
-                        mjtNum ih2, int nv, mjtNum* rbuf, int nc, const ipcGcon* C) {
+static mjtNum ipc_treeE(const mjModel* m, mjData* d, const mjtNum* q, const mjtNum* qtil,
+                        mjtNum ih2, int nv, mjtNum* rbuf, mjtNum* mrbuf, int nc, const ipcGcon* C) {
   mju_copy(d->qpos, q, m->nq);
   mj_kinematics(m, d);
   mj_differentiatePos(m, rbuf, 1.0, qtil, q);
-  mjtNum E = 0;
-  for (int i=0; i < nv; i++) { mjtNum s = 0; for (int j=0; j < nv; j++) s += M[i*nv+j]*rbuf[j]; E += 0.5*ih2*rbuf[i]*s; }
+  mj_mulM(m, d, mrbuf, rbuf);                                  // M*r matrix-free (M frozen at q_n via d->qM)
+  mjtNum E = 0.5*ih2*mju_dot(rbuf, mrbuf, nv);                 // kinetic incremental potential
   for (int c=0; c < nc; c++) { mjtNum gap = gconGap(d, &C[c]); if (gap < 0) E += 0.5*C[c].k*gap*gap; }
   return E;
 }
@@ -1272,8 +1272,6 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   mjtNum* JA = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));     // detect-time scratch
   mjtNum* JB = (mjtNum*) mju_malloc((nv > 0 ? 3*nv : 1)*sizeof(mjtNum));
   mjtNum* Mb = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* M  = (mjtNum*) mju_malloc((nv > 0 ? nv*nv : 1)*sizeof(mjtNum));
-  mj_fullM(m, d, M);                                          // frozen M(q_n)
   for (int ic=0; ic < d->ncon && nc < cap; ic++) {
     const mjContact* con = d->contact + ic;
     if (con->geom[0] < 0 || con->geom[1] < 0) continue;      // skip flex contacts (handled by the flex path)
@@ -1297,7 +1295,13 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
     c->k = ih2/bMb;                                          // k = m_eff/h^2, m_eff = 1/(b^T M^-1 b)
     nc++;
   }
-  // ---- predictor q~, save q_n, Newton over the tangent (dense) with backtracking line search ----
+  // ---- predictor q~, save q_n, Newton over the tangent with a MATRIX-FREE PCG inner solve + line search ----
+  // The Hessian H = ih2*M + sum_active k*b b^T is applied matrix-free (mj_mulM for the kinetic block, rank-1 per
+  // active contact); preconditioned by the exact inverse of the kinetic block, (ih2*M)^-1 = h^2*M^-1, via h^2*
+  // mj_solveM on the frozen q_n factorization. M block-diagonal over trees -> mj_solveM IS the per-tree block
+  // solve, so contact-free PCG converges in ~1 iter and contact adds O(n_active) iters. (STEP 1 of the flex unify:
+  // rigid path only; the dense Cholesky is gone; the same PCG callbacks generalize to the flex packing later.)
+  int cap2 = nc > 0 ? nc : 1;
   mjtNum* qtil = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
   mjtNum* qn   = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
   mjtNum* q    = (mjtNum*) mju_malloc((nq > 0 ? nq : 1)*sizeof(mjtNum));
@@ -1306,7 +1310,12 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   mjtNum* r    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
   mjtNum* g    = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
   mjtNum* dv   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
-  mjtNum* H    = (mjtNum*) mju_malloc((nv > 0 ? nv*nv : 1)*sizeof(mjtNum));
+  mjtNum* Mr   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));   // M*r (gradient) + ipc_treeE scratch
+  mjtNum* pr   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));   // PCG residual / search / H*p
+  mjtNum* pz   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* pp   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  mjtNum* pHp  = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
+  int*    acti = (int*)    mju_malloc(cap2*sizeof(int));                   // active-contact indices (gap<0)
   for (int i=0; i < nq; i++) qn[i] = d->qpos[i];             // q_n (d->qpos / FK currently at q_n)
   for (int i=0; i < nv; i++) vp[i] = d->qvel[i] + h*d->qacc_smooth[i];
   for (int i=0; i < nq; i++) qtil[i] = qn[i];
@@ -1315,26 +1324,42 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   for (int it=0; it < 32; it++) {
     mju_copy(d->qpos, q, nq); mj_kinematics(m, d);           // load-bearing: FK at trial q so gconGap is live
     mj_differentiatePos(m, r, 1.0, qtil, q);                 // r = d(q~, q)
-    for (int i=0; i < nv; i++) { mjtNum s = 0; for (int j=0; j < nv; j++) s += M[i*nv+j]*r[j]; g[i] = ih2*s; }
-    for (int k=0; k < nv*nv; k++) H[k] = ih2*M[k];           // gradient ih2 M r, Hessian ih2 M
-    for (int cc=0; cc < nc; cc++) {                          // + general penalty: one rank-1 term per active contact
+    mj_mulM(m, d, Mr, r); for (int i=0; i < nv; i++) g[i] = ih2*Mr[i];   // kinetic gradient ih2*M*r
+    int na = 0;                                              // freeze the active set + accumulate contact gradient
+    for (int cc=0; cc < nc; cc++) {
       mjtNum gap = gconGap(d, &C[cc]);
-      if (gap < 0) {
-        const mjtNum* b = cb + cc*nv; mjtNum kc = C[cc].k, kg = kc*gap;
+      if (gap < 0) { const mjtNum* b = cb + cc*nv; mjtNum kg = C[cc].k*gap;
         for (int i=0; i < nv; i++) g[i] += kg*b[i];
-        for (int i=0; i < nv; i++) { mjtNum kb = kc*b[i]; for (int j=0; j < nv; j++) H[i*nv+j] += kb*b[j]; }
+        acti[na++] = cc;
       }
     }
-    mju_cholFactor(H, nv, mjMINVAL);
-    mju_cholSolve(dv, H, g, nv);                             // dv = H^-1 g (Newton step is -dv)
+    // PCG: solve H dv = g, H = ih2*M + sum_a k_a b_a b_a^T, precond (ih2*M)^-1 = h^2*M^-1
+    for (int i=0; i < nv; i++) { dv[i] = 0; pr[i] = g[i]; }
+    mj_solveM(m, d, pz, pr, 1); for (int i=0; i < nv; i++) pz[i] *= h*h;
+    for (int i=0; i < nv; i++) pp[i] = pz[i];
+    mjtNum rz = mju_dot(pr, pz, nv), r0 = mju_dot(pr, pr, nv);
+    for (int pit=0; pit < 200; pit++) {
+      mj_mulM(m, d, pHp, pp); for (int i=0; i < nv; i++) pHp[i] *= ih2;  // H*p = ih2*M*p + rank-1 contacts
+      for (int a=0; a < na; a++) { const mjtNum* b = cb + acti[a]*nv;
+        mjtNum ks = C[acti[a]].k*mju_dot(b, pp, nv); for (int i=0; i < nv; i++) pHp[i] += ks*b[i]; }
+      mjtNum pHpp = mju_dot(pp, pHp, nv);
+      if (pHpp < mjMINVAL) break;
+      mjtNum alpha = rz/pHpp;
+      for (int i=0; i < nv; i++) { dv[i] += alpha*pp[i]; pr[i] -= alpha*pHp[i]; }
+      mjtNum rr = mju_dot(pr, pr, nv);
+      if (rr < 1e-20*r0 + 1e-30) break;                      // converged
+      mj_solveM(m, d, pz, pr, 1); for (int i=0; i < nv; i++) pz[i] *= h*h;
+      mjtNum rznew = mju_dot(pr, pz, nv), beta = rznew/rz; rz = rznew;
+      for (int i=0; i < nv; i++) pp[i] = pz[i] + beta*pp[i];
+    }
     mjtNum dvn = 0; for (int i=0; i < nv; i++) { mjtNum a = dv[i] < 0 ? -dv[i] : dv[i]; if (a > dvn) dvn = a; }
     if (dvn < 1e-10) break;                                  // converged
-    for (int i=0; i < nv; i++) dv[i] = -dv[i];
-    mjtNum E0 = ipc_treeE(m, d, q, qtil, M, ih2, nv, r, nc, C), alpha = 1.0; int ok = 0;
+    for (int i=0; i < nv; i++) dv[i] = -dv[i];               // Newton step is -H^-1 g
+    mjtNum E0 = ipc_treeE(m, d, q, qtil, ih2, nv, r, Mr, nc, C), alpha = 1.0; int ok = 0;
     for (int ls=0; ls < 12; ls++) {
       for (int i=0; i < nq; i++) qtr[i] = q[i];
       mj_integratePos(m, qtr, dv, alpha);
-      if (ipc_treeE(m, d, qtr, qtil, M, ih2, nv, r, nc, C) <= E0 + 1e-12) { ok = 1; break; }
+      if (ipc_treeE(m, d, qtr, qtil, ih2, nv, r, Mr, nc, C) <= E0 + 1e-12) { ok = 1; break; }
       alpha *= 0.5;
     }
     if (!ok) break;                                          // frozen-Jacobian descent stalled -> stop
@@ -1345,8 +1370,9 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   for (int i=0; i < nq; i++) d->qpos[i] = q[i];              // commit q_{n+1}
   mj_kinematics(m, d); mj_comPos(m, d);                      // FK + cdof at q_{n+1}
   d->time += h;
-  mju_free(C); mju_free(cb); mju_free(JA); mju_free(JB); mju_free(Mb); mju_free(M);
-  mju_free(qtil); mju_free(qn); mju_free(q); mju_free(qtr); mju_free(vp); mju_free(r); mju_free(g); mju_free(dv); mju_free(H);
+  mju_free(C); mju_free(cb); mju_free(JA); mju_free(JB); mju_free(Mb);
+  mju_free(qtil); mju_free(qn); mju_free(q); mju_free(qtr); mju_free(vp); mju_free(r); mju_free(g); mju_free(dv);
+  mju_free(Mr); mju_free(pr); mju_free(pz); mju_free(pp); mju_free(pHp); mju_free(acti);
 }
 
 void mj_IPC(const mjModel* m, mjData* d) {
