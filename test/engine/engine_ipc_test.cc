@@ -381,5 +381,36 @@ TEST_F(IpcTest, ArticulatedCapsuleDoesNotTunnel) {
   mj_deleteData(d); mj_deleteModel(m);
 }
 
+// FLEX-UNIFY 4b: articulated bodies participate in the UNIFIED flex solver vector with bit-exact kinetics. A hinge
+// integrated in a flex scene (the unified path: its generalized DOFs are appended to the dense flex packing, share
+// the one PCG + line search, with ih2*M / h2*M^-1 applied via mj_mulM/mj_solveM and a qdelta state) must match the
+// SAME hinge alone (the mj_ipcTree path) to solver tolerance. A far, pinned cloth forces the unified path without
+// any contact. This is the regression gate for the appended-articulated-kinetic machinery.
+TEST_F(IpcTest, ArticulatedKineticInFlexMatchesTree) {
+  mjModel* m1 = Load(R"(
+    <mujoco><option timestep="0.002" gravity="0 0 -9.81" integrator="ipc"/>
+      <worldbody><body pos="0 0 1"><joint type="hinge" axis="0 1 0"/>
+        <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.03" mass="1"/></body></worldbody></mujoco>)");
+  mjModel* m2 = Load(R"(
+    <mujoco><option timestep="0.002" gravity="0 0 -9.81" integrator="ipc"/>
+      <worldbody><body pos="0 0 1"><joint type="hinge" axis="0 1 0"/>
+        <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.03" mass="1"/></body>
+        <flexcomp name="cloth" type="grid" dim="2" count="3 3 1" spacing="0.05 0.05 1" radius="0.005" mass="0.05"
+                  pos="3 0 1"><pin id="0 2 6 8"/></flexcomp>
+      </worldbody></mujoco>)");
+  ASSERT_GT(m2->nv, m1->nv) << "the flex scene must add DOFs (forces the unified path)";
+  mjData* d1 = mj_makeData(m1);   // hinge alone -> mj_ipcTree
+  mjData* d2 = mj_makeData(m2);   // hinge + far cloth -> unified flex path (na_artic==1)
+  mjtNum worst = 0;
+  for (int s = 0; s < 400; s++) {
+    mj_step(m1, d1); mj_step(m2, d2);
+    worst = std::max(worst, std::abs(d1->qpos[0] - d2->qpos[0]));   // qpos[0] is the hinge angle in both
+    ASSERT_FALSE(std::isnan(d2->qpos[0])) << "NaN at step " << s;
+  }
+  EXPECT_LT(worst, 1e-9) << "hinge in the unified flex path must match mj_ipcTree (max diff " << worst << ")";
+  mj_deleteData(d1); mj_deleteModel(m1);
+  mj_deleteData(d2); mj_deleteModel(m2);
+}
+
 }  // namespace
 }  // namespace mujoco
