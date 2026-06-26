@@ -814,30 +814,52 @@ typedef struct {
 } ipcSparse;
 static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r);  // per-vertex 3x3 block-Jacobi (below)
 
-// matrix-free preconditioned CG over the flex maximal DOF (block-Jacobi precond sp). RHS r = -grad.
-// Writes the Newton direction dx[N]. (This is the old pure-flex PCG, the naff==0 special case of the
-// former unified ipc_solveU; the affine reduced-coordinate path was removed.)
-static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N,
-                      const ipcSparse* sp, const mjtNum* mdiag,
-                      int ne, const ipcElem* elems, int nbe, const ipcBend* bends,
-                      const mjtNum* estr, const ipcCC* ccache, int nacon,
+// UNIFIED PCG context: one solver loop (ipc_solveU) serves both the dense-packed flex/sphere DOFs and the
+// articulated trees, dispatched per family. FLEX (rigid==0): the kinetic is the diagonal mdiag, the Hessian
+// apply/precond are the EXISTING ipc_applyH/ipc_jacobiApply (byte-identical -- the dense 3*nfree packing is kept).
+// ARTICULATED (rigid==1): the kinetic block is ih2*M applied via mj_mulM, preconditioned by its exact inverse
+// (ih2*M)^-1 = h2*M^-1 via mj_solveM, plus the one-sided contact rank-1 terms (active set acti, dir cb, stiff kvec).
+typedef struct {
+  int rigid;
+  const ipcSparse* sp; const mjtNum* mdiag;                  // flex precond + kinetic diagonal
+  int nelem; const ipcElem* elems; const mjtNum* estr; int nbe; const ipcBend* bends;  // flex elastic
+  const ipcCC* ccache; int nacon;                            // flex contact
+  const mjModel* m; mjData* d; mjtNum ih2, h2;               // articulated kinetic / precond (mj_mulM / mj_solveM)
+  int na; const int* acti; const mjtNum* cb; const mjtNum* kvec;  // articulated active contacts
+} ipcCtx;
+
+static void ipc_apply(const mjtNum* p, mjtNum* Hp, int N, const ipcCtx* c) {
+  if (!c->rigid) { ipc_applyH(p, Hp, N, c->mdiag, c->nelem, c->elems, c->estr, c->nbe, c->bends, c->ccache, c->nacon); return; }
+  mj_mulM(c->m, c->d, Hp, p); for (int i=0; i < N; i++) Hp[i] *= c->ih2;          // ih2*M*p (M frozen at q_n)
+  for (int a=0; a < c->na; a++) { const mjtNum* b = c->cb + c->acti[a]*N;
+    mjtNum ks = c->kvec[c->acti[a]]*mju_dot(b, p, N); for (int i=0; i < N; i++) Hp[i] += ks*b[i]; }
+}
+static void ipc_precond(mjtNum* z, const mjtNum* r, int N, const ipcCtx* c) {
+  if (!c->rigid) { ipc_jacobiApply(c->sp, z, r); return; }
+  mj_solveM(c->m, c->d, z, r, 1); for (int i=0; i < N; i++) z[i] *= c->h2;        // (ih2*M)^-1 = h2*M^-1
+}
+
+// matrix-free preconditioned CG, RHS r = -grad. Writes the Newton direction dx[N] = -H^-1 grad. Apply + precond
+// dispatch via ctx; tol is the relative residual-norm-squared stop. Flex passes tol=1e-8 + the flex ctx -> this is
+// byte-identical to the former pure-flex PCG (same arithmetic, same operation order).
+static int ipc_solveU(mjtNum* dx, const mjtNum* grad, int N, const ipcCtx* ctx, mjtNum tol,
                       mjtNum* r, mjtNum* z, mjtNum* p, mjtNum* Hp, mjtNum* usol) {
   for (int i=0; i < N; i++) r[i] = -grad[i];
   for (int i=0; i < N; i++) usol[i] = 0;
   mjtNum r0 = 0; for (int i=0; i < N; i++) r0 += r[i]*r[i];
   if (r0 < 1e-30) { for (int i=0; i < N; i++) dx[i] = 0; return 0; }
-  ipc_jacobiApply(sp, z, r);
+  ipc_precond(z, r, N, ctx);
   mjtNum rz = 0; for (int i=0; i < N; i++) { p[i] = z[i]; rz += r[i]*z[i]; }
   int it = 0;
   for (; it < 200; it++) {
-    ipc_applyH(p, Hp, N, mdiag, ne, elems, estr, nbe, bends, ccache, nacon);
+    ipc_apply(p, Hp, N, ctx);
     mjtNum pHp = 0; for (int i=0; i < N; i++) pHp += p[i]*Hp[i];
     if (pHp <= 1e-30) break;
     mjtNum alpha = rz/pHp, rr = 0;
     for (int i=0; i < N; i++) { usol[i] += alpha*p[i]; r[i] -= alpha*Hp[i]; rr += r[i]*r[i]; }
-    if (rr < 1e-8*r0) break;
+    if (rr < tol*r0) break;
     g_pcgN += 1;   // [PROF] total PCG iterations this step
-    ipc_jacobiApply(sp, z, r);
+    ipc_precond(z, r, N, ctx);
     mjtNum rznew = 0; for (int i=0; i < N; i++) rznew += r[i]*z[i];
     mjtNum beta = rznew/rz; rz = rznew;
     for (int i=0; i < N; i++) p[i] = z[i] + beta*p[i];
@@ -1316,6 +1338,8 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   mjtNum* pp   = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
   mjtNum* pHp  = (mjtNum*) mju_malloc((nv > 0 ? nv : 1)*sizeof(mjtNum));
   int*    acti = (int*)    mju_malloc(cap2*sizeof(int));                   // active-contact indices (gap<0)
+  mjtNum* kvec = (mjtNum*) mju_malloc(cap2*sizeof(mjtNum));                // per-contact stiffness (for the ctx)
+  for (int c=0; c < nc; c++) kvec[c] = C[c].k;
   for (int i=0; i < nq; i++) qn[i] = d->qpos[i];             // q_n (d->qpos / FK currently at q_n)
   for (int i=0; i < nv; i++) vp[i] = d->qvel[i] + h*d->qacc_smooth[i];
   for (int i=0; i < nq; i++) qtil[i] = qn[i];
@@ -1333,28 +1357,15 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
         acti[na++] = cc;
       }
     }
-    // PCG: solve H dv = g, H = ih2*M + sum_a k_a b_a b_a^T, precond (ih2*M)^-1 = h^2*M^-1
-    for (int i=0; i < nv; i++) { dv[i] = 0; pr[i] = g[i]; }
-    mj_solveM(m, d, pz, pr, 1); for (int i=0; i < nv; i++) pz[i] *= h*h;
-    for (int i=0; i < nv; i++) pp[i] = pz[i];
-    mjtNum rz = mju_dot(pr, pz, nv), r0 = mju_dot(pr, pr, nv);
-    for (int pit=0; pit < 200; pit++) {
-      mj_mulM(m, d, pHp, pp); for (int i=0; i < nv; i++) pHp[i] *= ih2;  // H*p = ih2*M*p + rank-1 contacts
-      for (int a=0; a < na; a++) { const mjtNum* b = cb + acti[a]*nv;
-        mjtNum ks = C[acti[a]].k*mju_dot(b, pp, nv); for (int i=0; i < nv; i++) pHp[i] += ks*b[i]; }
-      mjtNum pHpp = mju_dot(pp, pHp, nv);
-      if (pHpp < mjMINVAL) break;
-      mjtNum alpha = rz/pHpp;
-      for (int i=0; i < nv; i++) { dv[i] += alpha*pp[i]; pr[i] -= alpha*pHp[i]; }
-      mjtNum rr = mju_dot(pr, pr, nv);
-      if (rr < 1e-20*r0 + 1e-30) break;                      // converged
-      mj_solveM(m, d, pz, pr, 1); for (int i=0; i < nv; i++) pz[i] *= h*h;
-      mjtNum rznew = mju_dot(pr, pz, nv), beta = rznew/rz; rz = rznew;
-      for (int i=0; i < nv; i++) pp[i] = pz[i] + beta*pp[i];
-    }
+    // shared PCG (ipc_solveU, the unified loop): solve H dv = g, H = ih2*M + sum_a k_a b_a b_a^T; rigid ctx ->
+    // ih2*M apply via mj_mulM, precond h^2*M^-1 via mj_solveM. dx = -H^-1 g is the Newton step directly. (Mr is
+    // free after the gradient -> reused as the ipc_solveU usol scratch.)
+    ipcCtx rctx = {0};
+    rctx.rigid = 1; rctx.m = m; rctx.d = d; rctx.ih2 = ih2; rctx.h2 = h*h;
+    rctx.na = na; rctx.acti = acti; rctx.cb = cb; rctx.kvec = kvec;
+    ipc_solveU(dv, g, nv, &rctx, 1e-20, pr, pz, pp, pHp, Mr);
     mjtNum dvn = 0; for (int i=0; i < nv; i++) { mjtNum a = dv[i] < 0 ? -dv[i] : dv[i]; if (a > dvn) dvn = a; }
-    if (dvn < 1e-10) break;                                  // converged
-    for (int i=0; i < nv; i++) dv[i] = -dv[i];               // Newton step is -H^-1 g
+    if (dvn < 1e-10) break;                                  // step ~ 0 -> converged
     mjtNum E0 = ipc_treeE(m, d, q, qtil, ih2, nv, r, Mr, nc, C), alpha = 1.0; int ok = 0;
     for (int ls=0; ls < 12; ls++) {
       for (int i=0; i < nq; i++) qtr[i] = q[i];
@@ -1372,7 +1383,7 @@ static void mj_ipcTree(const mjModel* m, mjData* d) {
   d->time += h;
   mju_free(C); mju_free(cb); mju_free(JA); mju_free(JB); mju_free(Mb);
   mju_free(qtil); mju_free(qn); mju_free(q); mju_free(qtr); mju_free(vp); mju_free(r); mju_free(g); mju_free(dv);
-  mju_free(Mr); mju_free(pr); mju_free(pz); mju_free(pp); mju_free(pHp); mju_free(acti);
+  mju_free(Mr); mju_free(pr); mju_free(pz); mju_free(pp); mju_free(pHp); mju_free(acti); mju_free(kvec);
 }
 
 void mj_IPC(const mjModel* m, mjData* d) {
@@ -1872,8 +1883,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int i=0; i < N; i++) gna2 += grad[i]*grad[i];
     gnorm = sqrt(gna2);
     if (g0 < 0) g0 = gnorm;                                   // initial residual (first Newton iteration)
-    ipc_solveU(dx, grad, N, &sp, mdiag, ne, elems, nbe, bends, estr, ccache, nacon,
-               rcg, zcg, pcg, Hpv, usol);
+    ipcCtx fctx = {0};
+    fctx.rigid = 0; fctx.sp = &sp; fctx.mdiag = mdiag; fctx.nelem = ne; fctx.elems = elems; fctx.estr = estr;
+    fctx.nbe = nbe; fctx.bends = bends; fctx.ccache = ccache; fctx.nacon = nacon;
+    ipc_solveU(dx, grad, N, &fctx, 1e-8, rcg, zcg, pcg, Hpv, usol);
     mjtNum maxdx = 0;   // max free-vertex displacement of the Newton direction (for the lower-bound decay)
     for (int v=0; v < N/3; v++) { mjtNum n2 = dx[3*v]*dx[3*v]+dx[3*v+1]*dx[3*v+1]+dx[3*v+2]*dx[3*v+2];
                                   if (n2 > maxdx) maxdx = n2; }
