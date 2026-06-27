@@ -994,12 +994,11 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
 // sided spring active only on penetration (gap<0): grad += k*gap*(w_p n) on the verts + k*gap*(-b) on the geom's
 // tree; GN Hessian into the SHARED ccache (weighted vertex self) + the ipcS3 list (vertex-tree cross + tree).
 // NEVER in the active set / CCD -> penetrate + recover. k = ih2/(Sum_p w_p^2/m_p + b^T M^-1 b).
-static void ipc_softTry(const ipcSoft* s, const mjModel* m, const mjData* d, const mjtNum* x, int nfv,
-                        const mjtNum* rrad, const mjtNum* rad, const mjtNum* rmass, mjtNum ih2, int nfree_flex,
+static void ipc_softTry(const ipcSoft* s, const mjModel* m, const mjData* d, const mjtNum* x,
                         const int* fidx, mjtNum* grad, ipcCC* ccache, int* nacon, int amax,
                         const mjtNum* bpair, const int* aoff, ipcS3* s3list, int* ns3cnt) {
   if (*nacon >= amax) return;
-  if (s->type == 3) {   // flex VERTEX vs ARTICULATED geom (no sphere ri -> handle FIRST, before ci/k touch rmass[ri])
+  if (s->type == 3) {   // flex ELEMENT (3 barycentric verts) vs MOVABLE-body geom -- the only soft contact type
     // LIVE gap (gconGap form): x_v live (flex SoA) + cp live via FK of the frozen geom-local anchor (caller has
     // run mj_kinematics at the trial articulated config). n FROZEN at q_n -> full nonlinear FK, no tunneling.
     mjtNum cp[3]; mj_local2Global((mjData*)d, cp, NULL, s->plocal, NULL, m->geom_bodyid[s->gi], mjSAMEFRAME_NONE);
@@ -1024,11 +1023,10 @@ static void ipc_softTry(const ipcSoft* s, const mjModel* m, const mjData* d, con
 
 // SOFT flex-rigid penalty energy (line-search parity with ipc_softTry): 0.5*k*gap^2 over penetrating pairs.
 static mjtNum ipc_softEnergy(const ipcSoft* soft, int nsoft, const mjModel* m, const mjData* d,
-                             const mjtNum* x, int nfv, const mjtNum* rrad, const mjtNum* rad,
-                             const mjtNum* rmass, mjtNum ih2) {
+                             const mjtNum* x) {
   mjtNum E = 0;
   for (int si=0; si < nsoft; si++) { const ipcSoft* s = &soft[si];
-    if (s->type == 3) {   // flex VERTEX vs ARTICULATED geom: live-FK gap (caller FK'd at the trial config), no ri
+    if (s->type == 3) {   // flex ELEMENT vs MOVABLE-body geom: live-FK gap (caller FK'd at the trial config)
       mjtNum cp[3]; mj_local2Global((mjData*)d, cp, NULL, s->plocal, NULL, m->geom_bodyid[s->gi], mjSAMEFRAME_NONE);
       mjtNum q = s->w[0]*mju_dot3(s->n, &x[3*s->vp[0]]) + s->w[1]*mju_dot3(s->n, &x[3*s->vp[1]])
                + s->w[2]*mju_dot3(s->n, &x[3*s->vp[2]]);
@@ -1269,6 +1267,15 @@ static void ipc_jacobiApply(const ipcSparse* sp, mjtNum* z, const mjtNum* r) {
 // contact-stiffness floor: the AL's penalty stiffness mu is auto-set to 0.1*max(inertia diag) each step
 // (matched to the system Hessian scale, paper Eq.20); this is only the pre-mdiag init placeholder.
 #define IPC_KAPPA0   1000.0
+
+// type-3 (flex-element vs movable-geom) soft-contact stiffness multiplier over the one-step-resolve value
+// k0 = ih2/invm (the natural value is 1.0, but that's dominated by the very light cloth verts -> too soft to
+// hold a heavier body; ~20 is needed to hold the humanoid in the bag). The penalty is implicit (stable), BUT
+// the PCG preconditioner does NOT cover the contact stiffness on the articulated-tree dofs (only block-Jacobi
+// on flex + M^-1 on the tree), so cranking this too far (~500) puts a stiff, unpreconditioned lump on the tree
+// -> PCG stops converging -> the Newton grinds its full cap (looks like a hang). Raising it safely needs the
+// tree-contact term folded into the preconditioner (the parked conditioning work).
+#define IPC_SOFTK    20.0
 
 // A tracked GENERAL rigid penalty contact, ANCHORED at q_n, driven by MuJoCo's own collision result d->contact.
 // End A = geom[0]'s body, end B = geom[1]'s body; either may be static (welded to world). The contact point
@@ -1746,8 +1753,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
     int g = con->geom[0], fl = con->flex[1], el = con->elem[1];
     if (g < 0 || fl < 0 || el < 0) continue;                   // geom-vs-flex-ELEMENT entries only
     int gb = m->geom_bodyid[g];
-    if (m->body_dofnum[gb] == 0) continue;
-    int gt = m->dof_treeid[m->body_dofadr[gb]];
+    int gw = m->body_weldid[gb];                               // weld root: a welded geom (head/hand) has 0 OWN dofs but moves via its root's joints
+    if (m->body_dofnum[gw] == 0) continue;                     // root truly static (welded to world) -> stays on the AL path, no soft contact
+    int gt = m->dof_treeid[m->body_dofadr[gw]];                // tree id from the weld root (the geom's own body may be dofless); mj_jac(gb) below still walks the full chain
     if (aoff[gt] < 0) continue;                                 // geom must sit on an appended (movable) tree
     if (m->flex_dim[fl] != 2) continue;                         // triangle elements only
     int kf = flex2slot[fl]; if (kf < 0) continue;
@@ -1771,7 +1779,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     ipcSoft* s = &soft[nsoft];
     // dist0 = -rt so the LIVE gap = -rt + Sum_p w_p n.x_vp - n.cp_live equals con->dist at q_n (the element verts are
     // the vertex CENTERLINES; n.(centerline - geom_surface) = centerline_gap; con->dist = centerline_gap - rt).
-    s->type=3; s->gi=g; s->atree=gt; s->bn=gnd; s->dist0=-rt; s->k=ih2/invm;
+    s->type=3; s->gi=g; s->atree=gt; s->bn=gnd; s->dist0=-rt; s->k=IPC_SOFTK*ih2/invm;
     for (int j=0; j < 3; j++) { s->vp[j]=pp[j]; s->w[j]=w[j]; }
     mju_copy3(s->n, nn);
     mjtNum rel[3]; mju_sub3(rel, psurf, d->xpos+3*gb); mju_mulMatTVec3(s->plocal, d->xmat+9*gb, rel);   // psurf -> geom-body local
@@ -1905,7 +1913,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     }
     int ns3 = 0;                                                // active type-3 list, rebuilt each Newton iter
     for (int s=0; s < nsoft; s++)                               // SOFT flex-rigid penalty (penetration only); shares ccache/nacon
-      ipc_softTry(&soft[s], m, d, x, nfv, NULL, rad, NULL, ih2, nfree_flex, fidx, grad, ccache, &nacon, amax,
+      ipc_softTry(&soft[s], m, d, x, fidx, grad, ccache, &nacon, amax,
                   g_bsoft + (size_t)s*(NVTREE > 0 ? NVTREE : 1), aoff, a_s3, &ns3);
     if (nacon > prof_nacon) prof_nacon = nacon;
     for (int c=0; c < nacon; c++) {                          // contact GN -> IC0 sparse Hessian
@@ -1976,7 +1984,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // N7 line search. E0 baseline over the same candidate subset (candLS) as the trials.
     mjtNum E0 = ipc_energy(m, d, npt, ne, elems, nbe, bends, x, xtil, fidx, mass, h, r, rad, ghat,
                            gv, ge, candLS, nls, xold, xfree);
-    E0 += ipc_softEnergy(soft, nsoft, m, d, x, nfv, NULL, rad, NULL, ih2);   // soft flex-rigid (parity w/ ipc_softTry)
+    E0 += ipc_softEnergy(soft, nsoft, m, d, x);   // soft flex-rigid (parity w/ ipc_softTry)
     E0 += ipc_articResid(m, d, qn_a, qtil_a, qdelta, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr);
     if (na_artic) E0 += ipc_gconEnergy(d, gcon, ngc);   // rigid-rigid penalty (FK above is at q_n(+)qdelta)
     mjtNum alpha = 1.0;
@@ -1996,7 +2004,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       }
       mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat,
                               gv, ge, candLS, nls, xold, xfree);
-      Etr += ipc_softEnergy(soft, nsoft, m, d, xn, nfv, NULL, rad, NULL, ih2);   // soft flex-rigid at the trial (geom @ qdtmp)
+      Etr += ipc_softEnergy(soft, nsoft, m, d, xn);   // soft flex-rigid at the trial (geom @ qdtmp)
       Etr += ipc_articResid(m, d, qn_a, qtil_a, qdtmp, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr);
       if (na_artic) Etr += ipc_gconEnergy(d, gcon, ngc);   // rigid-rigid penalty at the trial config
       if (Etr <= E0 + 1e-12 || newton_converged) { lsok = 1; break; }
