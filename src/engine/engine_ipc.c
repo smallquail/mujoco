@@ -1479,7 +1479,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
       ipcBend* bn = &bends[nbe++];
       for (int i=0; i < 4; i++) { int gp = fxadr[k] + v[i]; bn->vg[i] = gp; bn->fv[i] = fidx[gp]; }
       for (int i=0; i < 16; i++) bn->Q[i] = Qe[i];
-      bn->b16 = Qe[16];   // curved-reference (Garg "Cubic Shells"): makes the curved rest the equilibrium
+      bn->b16 = 0.0;   // curved-reference (Garg "Cubic Shells") dropped for now -- assumes flat-panel rest; re-add by restoring Qe[16]
     }
   }
   int amax = npt*64 + 1024;                   // capacity of the active-contact list
@@ -1787,6 +1787,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   }
   int outer_cap = 1024;       // newton_max_iter
   mjtNum last_maxdx = 1e30;    // last inner Newton-direction magnitude, exposed to the outer early-out
+  mjtNum last_ls_alpha = 1.0;   // accepted line-search step of the last Newton iter; gates the outer termination
   int prof_outer=0, prof_inner=0, prof_cb=1, prof_nacon=0;   // MJ_IPC_PROF counters (cb: 1 initial build)
   for (int outer=0; outer < outer_cap && N_total > 0; outer++) {   // OUTER loop (single AL loop; paper Alg.1). N_total (not N): the appended articulated block must run even with no flex packing (humanoid: N==0, N_total==nv)
   prof_outer++;
@@ -1802,12 +1803,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
   for (int c=0; c < wn; c++)
     wcon[c].ld0 = ipc_conGap(&wcon[c], m, d, xfree, gv, ge, r, rad,
                              wcon[c].ln, wcon[c].liv, wcon[c].lcw, &wcon[c].lniv, ghat);
-  // RESTART the optimizer from the feasible base each outer iter. Our design solves a FREE x and advances
-  // a SEPARATE feasible shadow xfree; left to accumulate, x runs ahead of xfree whenever the CCD can't follow (ac->0),
-  // |x-xfree| grows, the re-query margin explodes the broad-phase and beta collapses -> the contact-set-explosion
-  // NaN. We COMMIT xfree, keeping a single CCD-advanced position, so tying x to the feasible base each iter costs
-  // nothing in committed motion and kills the divergence.
-  for (int i=0; i < 3*nstate; i++) x[i] = xfree[i];   // restart the optimizer from the feasible base each Newton iter
+  // x PERSISTS across outer iters (libuipc/paper warm-start) -- NOT reset to xfree. The old restart-from-xfree was a
+  // contact-set-explosion NaN firewall that ALSO prevented the primal Newton from ever converging (one cold step per
+  // outer iter); with the faithful active-set + the fixed broad-phase collar the NaN no longer fires, so persisting x
+  // lets the warm-started Newton actually solve the equation of motion, which the restart was blocking.
   (void)minc; (void)appr; (void)gam; (void)actc;
   // N2 update_slack (at x): materialize s[c] and the slack-baked d the assemble (ipc_try) / lambda use.
   ipc_updateSlack(wcon, wn, wheld, x, xfree, rad, ghat, mass, ih2);
@@ -2013,6 +2012,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     for (int i=0; i < 3*nstate; i++) x[i] = xn[i];   // always accept the final trial
     for (int j=0; j < N_artic; j++) qdelta[j] = qdtmp[j];   // commit the accepted articulated tangent
     lsok = 1;
+    last_ls_alpha = alpha;   // accepted global line-search step (the outer loop terminates only on a full step)
     if (getenv("MJ_IPC_PROF2"))   // per-inner-iter: gradient drop / active-set / line-search alpha
       fprintf(stderr, "    o=%d it=%d gnorm/g0=%.3e nacon=%d nls=%d alpha=%.4f lsok=%d nc=%d\n",
               outer, it, g0 > 0 ? gnorm/g0 : 1.0, nacon, nls, alpha, lsok, newton_converged);
@@ -2052,7 +2052,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
   if (ac > IPC_ALPHA_LB) for (int i=0; i < 3*npt; i++) xfree[i] = (1.0-ac)*xfree[i] + ac*x[i];
   beta = beta + (1.0 - beta)*ac;
   // terminate: beta feasible (>= 1 - IPC_TOI_THRESH) AND (newton_iter+1 >= min_iter OR newton_converged).
-  if (beta >= 1.0 - IPC_TOI_THRESH && (outer+1 >= IPC_FLEX_MIN_ITER || newton_converged_out)) break;
+  if (beta >= 1.0 - IPC_TOI_THRESH && (last_ls_alpha >= 1.0 - 1e-9 || newton_converged_out)) break;   // stop when the full Newton step is accepted (primal in its basin), dual stays soft
   (void)last_maxdx; (void)beta_eps;
   }   // OUTER loop close
   if (getenv("MJ_IPC_PROF")) {
