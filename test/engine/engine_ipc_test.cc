@@ -310,44 +310,44 @@ TEST_F(IpcTest, RigidNoContactMatchesEuler) {
   }
 }
 
-// CONTACT rung: the SIMPLE one-sided penalty 0.5*k*min(0,gap)^2 (k = mass/h^2) assembled per-tree into the Newton
-// (gap evaluated LIVE -> no tunnel). A sphere rests on the floor at the penalty's analytic penetration radius-mg/k;
-// spheres stack via the sphere-sphere DOF coupling; both settle with no blow-up (implicit Euler damps the normal
-// bounce). The undamped penalty is NOT MuJoCo's solref contact -- damping + the MuJoCo-equivalent form are next.
-TEST_F(IpcTest, RigidContactRestsAndStacks) {
-  // single sphere drops onto the floor -> rests at radius - mg/k, no tunnel, settles
-  {
-    mjModel* m = Load(R"(
-      <mujoco><option timestep="0.002" gravity="0 0 -9.81" integrator="ipc"/>
+// CONTACT rung: rigid contact now reproduces MuJoCo's solref/solimp spring-damper (explicit aref when the
+// timeconst >= 2h, the refsafe-safe regime), so a RIGID-ONLY scene through the IPC integrator must track the
+// EULER integrator of the same scene -- the fidelity property we are after. (A sub-2h timeconst switches to the
+// stable implicit branch and is deliberately NOT Euler-faithful, since MuJoCo would have clamped it via refsafe.)
+// The gap is LIVE through nonlinear FK -> no tunnel. Default solref timeconst here is 0.02 = 10h, well above 2h.
+TEST_F(IpcTest, RigidContactMatchesEuler) {
+  struct Scene { const char* name; const char* xml; int steps; };
+  const Scene scenes[] = {
+    {"sphere on floor", R"(
+      <mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
         <worldbody><geom type="plane" size="3 3 0.1"/>
           <body pos="0 0 0.4"><freejoint/><geom type="sphere" size="0.1" mass="1" condim="1"/></body>
-        </worldbody></mujoco>)");
-    mjData* d = mj_makeData(m);
-    for (int s = 0; s < 600; s++) mj_step(m, d);
-    mjtNum z = d->geom_xpos[3*m->body_geomadr[1] + 2];
-    mjtNum mgk = 9.81 * 0.002 * 0.002;                        // mg/k with k = mass/h^2
-    EXPECT_NEAR(z, 0.1 - mgk, 1e-4) << "sphere should rest at radius - mg/k";
-    EXPECT_GT(z, 0.05) << "sphere tunneled through the floor";
-    EXPECT_LT(std::abs(d->qvel[2]), 1e-3) << "sphere should settle";
-    EXPECT_FALSE(std::isnan(d->qvel[2]));
-    mj_deleteData(d); mj_deleteModel(m);
-  }
-  // two spheres stack -> bottom on floor, top one diameter above (sphere-sphere Hessian coupling)
-  {
-    mjModel* m = Load(R"(
-      <mujoco><option timestep="0.002" gravity="0 0 -9.81" integrator="ipc"/>
+        </worldbody></mujoco>)", 600},
+    {"two spheres stack", R"(
+      <mujoco><option timestep="0.002" gravity="0 0 -9.81"/>
         <worldbody><geom type="plane" size="3 3 0.1"/>
           <body pos="0 0 0.1"><freejoint/><geom type="sphere" size="0.1" mass="1" condim="1"/></body>
           <body pos="0 0 0.33"><freejoint/><geom type="sphere" size="0.1" mass="1" condim="1"/></body>
-        </worldbody></mujoco>)");
-    mjData* d = mj_makeData(m);
-    for (int s = 0; s < 800; s++) mj_step(m, d);
-    mjtNum zb = d->geom_xpos[3*m->body_geomadr[1] + 2];
-    mjtNum zt = d->geom_xpos[3*m->body_geomadr[2] + 2];
-    EXPECT_NEAR(zb, 0.0999, 3e-3) << "bottom sphere should rest on the floor";
-    EXPECT_NEAR(zt, 0.2999, 3e-3) << "top sphere should stack one diameter up";
-    EXPECT_FALSE(std::isnan(zt));
-    mj_deleteData(d); mj_deleteModel(m);
+        </worldbody></mujoco>)", 800},
+  };
+  for (const Scene& s : scenes) {
+    mjModel* mi = Load(s.xml); mi->opt.integrator = mjINT_IPC;
+    mjModel* me = Load(s.xml); me->opt.integrator = mjINT_EULER;
+    mjData* di = mj_makeData(mi);
+    mjData* de = mj_makeData(me);
+    for (int k = 0; k < s.steps; k++) { mj_step(mi, di); mj_step(me, de); }
+    mjtNum dq[64];
+    mj_differentiatePos(mi, dq, 1.0, de->qpos, di->qpos);     // manifold qpos diff (freejoint-quaternion safe)
+    mjtNum eq = 0, ev = 0;
+    for (int i = 0; i < mi->nv; i++) {
+      mjtNum a = std::fabs(dq[i]);                     if (a > eq) eq = a;
+      mjtNum b = std::fabs(di->qvel[i] - de->qvel[i]); if (b > ev) ev = b;
+    }
+    EXPECT_LT(eq, 1e-9) << s.name << ": IPC qpos should track Euler to round-off";
+    EXPECT_LT(ev, 1e-8) << s.name << ": IPC qvel should track Euler to round-off";
+    EXPECT_FALSE(std::isnan(di->qvel[2])) << s.name;
+    mj_deleteData(di); mj_deleteModel(mi);
+    mj_deleteData(de); mj_deleteModel(me);
   }
 }
 
