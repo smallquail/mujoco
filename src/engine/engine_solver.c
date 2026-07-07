@@ -887,7 +887,6 @@ typedef struct {
   int is_sparse;          // 1: sparse, 0: dense
   int is_elliptic;        // 1: elliptic, 0: pyramidal
   int island;             // current island index, -1 if monolithic
-  int flg_pcg;            // [IPC] Newton direction via matrix-free PCG (contact in the H*p operator), no factorization
 
   // sizes
   int nv;                 // number of dofs
@@ -1303,84 +1302,6 @@ static void PrimalUpdateConstraint(mjPrimalContext* ctx, int flg_HessianCone) {
 }
 
 
-// [IPC] matrix-free Hessian-vector product Hp = M*p + J'*D*J*p + Sum_t D_t*val_t*(val_t . p).
-// The injected contact penalty enters the OPERATOR here (rank-1 per contact), so PCG solves the true Newton
-// system without ever forming/factoring H. scratch: Jp,DJp (nefc), t (nv).
-static void PrimalHessVec(const mjPrimalContext* ctx, mjtNum* Hp, const mjtNum* p,
-                          mjtNum* Jp, mjtNum* DJp, mjtNum* t) {
-  int nv = ctx->nv, nefc = ctx->nefc;
-  mju_mulSymVecSparse(Hp, ctx->M, p, nv, ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind);   // Hp = M*p
-  if (nefc) {                                                                             // Hp += J'*D*J*p
-    if (ctx->is_sparse) {
-      mju_mulMatVecSparse(Jp, ctx->J, p, nefc, ctx->J_rownnz, ctx->J_rowadr, ctx->J_colind, ctx->J_rowsuper);
-    } else {
-      mju_mulMatVec(Jp, ctx->J, p, nefc, nv);
-    }
-    for (int i=0; i < nefc; i++) DJp[i] = ctx->D[i]*Jp[i];
-    if (ctx->is_sparse) {
-      mju_mulMatVecSparse(t, ctx->JT, DJp, nv, ctx->JT_rownnz, ctx->JT_rowadr, ctx->JT_colind, ctx->JT_rowsuper);
-    } else {
-      mju_mulMatTVec(t, ctx->J, DJp, nefc, nv);
-    }
-    mju_addTo(Hp, t, nv);
-  }
-  if (g_extraPrimal && ctx->island < 0) {                                                 // Hp += injected contact
-    const mjExtraPrimal* e = g_extraPrimal;
-    for (int r=0; r < e->nrow; r++) {
-      int adr = e->rowadr[r], nnz = e->rownnz[r];
-      mjtNum s = 0;
-      for (int k=0; k < nnz; k++) s += e->val[adr+k]*p[e->colind[adr+k]];
-      mjtNum Ds = e->D[r]*s;
-      for (int k=0; k < nnz; k++) Hp[e->colind[adr+k]] += Ds*e->val[adr+k];
-    }
-  }
-}
-
-// [IPC] solve H*x = b with M^-1-preconditioned linear PCG, H applied matrix-free (PrimalHessVec). Unlike MuJoCo's
-// nonlinear CG, linear PCG on a fixed SPD H converges monotonically (no stagnation) -> a genuinely converged Newton
-// direction. Returns iteration count.
-static int PrimalPCG(mjData* d, mjPrimalContext* ctx, mjtNum* x, const mjtNum* b) {
-  int nv = ctx->nv, nefc = ctx->nefc;
-  int maxit = 4000;
-  mj_markStack(d);
-  mjtNum* r   = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* z   = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* pp  = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* Hp  = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* t   = mjSTACKALLOC(d, nv, mjtNum);
-  mjtNum* Jp  = mjSTACKALLOC(d, nefc > 0 ? nefc : 1, mjtNum);
-  mjtNum* DJp = mjSTACKALLOC(d, nefc > 0 ? nefc : 1, mjtNum);
-
-  mju_zero(x, nv);
-  mju_copy(r, b, nv);                              // r = b - H*x0 = b (x0 = 0)
-  mjtNum bnorm = mju_norm(b, nv);
-  int iter = 0;
-  if (bnorm > mjMINVAL) {
-    mju_copy(z, r, nv);                            // z = M^-1 r
-    mj_solveLD(z, ctx->qLD, ctx->qLDiagInv, nv, 1, ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind, NULL);
-    mju_copy(pp, z, nv);
-    mjtNum rz = mju_dot(r, z, nv);
-    mjtNum tol = 1e-9 * bnorm;
-    for (; iter < maxit; iter++) {
-      PrimalHessVec(ctx, Hp, pp, Jp, DJp, t);
-      mjtNum pHp = mju_dot(pp, Hp, nv);
-      if (pHp <= mjMINVAL) break;                 // safeguard: H is SPD, should not trigger
-      mjtNum alpha = rz / pHp;
-      mju_addToScl(x, pp, alpha, nv);             // x += alpha*pp
-      mju_addToScl(r, Hp, -alpha, nv);            // r -= alpha*Hp
-      if (mju_norm(r, nv) < tol) { iter++; break; }
-      mju_copy(z, r, nv);
-      mj_solveLD(z, ctx->qLD, ctx->qLDiagInv, nv, 1, ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind, NULL);
-      mjtNum rz_new = mju_dot(r, z, nv);
-      mjtNum beta = rz_new / rz;
-      for (int i=0; i < nv; i++) pp[i] = z[i] + beta*pp[i];
-      rz = rz_new;
-    }
-  }
-  mj_freeStack(d);
-  return iter;
-}
-
 // update grad, Mgrad
 static void PrimalUpdateGradient(mjData* d, mjPrimalContext* ctx, int flg_Newton) {
   int nv = ctx->nv;
@@ -1390,20 +1311,9 @@ static void PrimalUpdateGradient(mjData* d, mjPrimalContext* ctx, int flg_Newton
     ctx->grad[i] = ctx->Ma[i] - ctx->qfrc_smooth[i] - ctx->qfrc_constraint[i];
   }
 
-  // [IPC] Newton direction via matrix-free PCG: solve (M + J'DJ + injected contact) * Mgrad = grad without forming
-  // or factoring H. Linear PCG converges monotonically to the true Newton direction (nonlinear CG stagnated at
-  // ~1e-5, handing the outer loop a half-converged direction -> backtracking). Recompute the constraint inertia D
-  // from the current efc_state for the operator.
-  if (ctx->flg_pcg) {
-    for (int i=0; i < ctx->nefc; i++) {
-      ctx->D[i] = ctx->efc_state[i] == mjCNSTRSTATE_QUADRATIC ? ctx->efc_D[i] : 0;
-    }
-    PrimalPCG(d, ctx, ctx->Mgrad, ctx->grad);
-  }
-
   // Newton: Mgrad = H \ grad. H = ctx->L = chol(M + J'DJ + injected extra-primal penalty), so the Newton
   // direction accounts for the injected flex-flex contact's curvature (added in FactorizeHessian).
-  else if (flg_Newton) {
+  if (flg_Newton) {
     if (ctx->is_sparse) {
       mju_cholSolveSparse(ctx->Mgrad, (ctx->ncone ? ctx->Lcone : ctx->L),
                           ctx->grad, nv, ctx->L_rownnz, ctx->L_rowadr, ctx->L_colind);
@@ -2342,6 +2252,10 @@ static void HessianIncremental(mjData* d, mjPrimalContext* ctx, const int* oldst
 
 // driver
 static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, int flg_Newton) {
+  // [IPC] injected extra-primal rows are carried by the CG path (cost/gradient/line-search quadratics); the
+  // Newton Hessian does not include them, so force CG whenever rows are registered (engine_ipc sets mjSOL_CG
+  // anyway -- this guards direct callers).
+  if (g_extraPrimal && island < 0) flg_Newton = 0;
   int iter = 0;
   mjtNum alpha, beta;
   mjPrimalContext ctx;
@@ -2356,9 +2270,6 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
   int nefc = ctx.nefc;
   int* oldstate = ctx.oldstate;
 
-  // [IPC] matrix-free PCG Newton direction when the injected contact penalty is active (monolithic, pyramidal):
-  // no Hessian is formed or factored (that went rank-deficient); the contact enters the H*p operator instead.
-  ctx.flg_pcg = flg_Newton && g_extraPrimal && (ctx.island < 0) && !ctx.is_elliptic;
 
   // compute Ma = M * qacc
   mju_mulSymVecSparse(ctx.Ma, ctx.M, ctx.qacc, nv,
@@ -2376,7 +2287,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
 
   // first update
   PrimalUpdateConstraint(&ctx, flg_Newton & (m->opt.cone == mjCONE_ELLIPTIC));
-  if (flg_Newton && !ctx.flg_pcg) {
+  if (flg_Newton) {
     // compute and factorize Hessian (includes the injected extra-primal penalty, via FactorizeHessian)
     MakeHessian(d, &ctx);
     FactorizeHessian(d, &ctx, /*flg_recompute=*/0);
@@ -2426,7 +2337,7 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
 
     // update
     PrimalUpdateConstraint(&ctx, flg_Newton & (m->opt.cone == mjCONE_ELLIPTIC));
-    if (flg_Newton && !ctx.flg_pcg) {
+    if (flg_Newton) {
       HessianIncremental(d, &ctx, oldstate);
     }
     PrimalUpdateGradient(d, &ctx, flg_Newton);

@@ -1537,7 +1537,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
         nrow++;
       }
       mjExtraPrimal ep = {nrow, epnnz, epadr, epcol, epval, epref, epD, epone};
-      int saved = m->opt.disableflags; int savedsol = m->opt.solver; int savednefc = d->nefc; int savediter = m->opt.iterations;
+      int saved = m->opt.disableflags; int savedsol = m->opt.solver; int savednefc = d->nefc;
       if (na_artic == 0 && nfv > 0) d->nefc = d->ne + d->nf + d->nl;   // pure-FLEX: drop native contacts (injection+CCD replace them);
       nefc_qp = d->nefc;   // [ARCH-2] the rows the QP actually minimizes -- the merit's efc cost scores exactly these
       int dflags = saved | mjDSBL_ISLAND;                      // pure-RIGID + MIXED keep native contacts (rigid + flex-humanoid, w/ friction)
@@ -1550,11 +1550,16 @@ void mj_IPC(const mjModel* m, mjData* d) {
       // (no factorization to fail) and ~30-70x faster than the direct factor.
       // Default: matrix-free PCG Newton direction (mjSOL_NEWTON -> flg_pcg in mj_solPrimal): the injected contact
       // enters the H*p operator, solved with linear PCG (no factorization, no stagnation). IPC_CG = old nonlinear CG.
-      ((mjModel*)m)->opt.solver = mjSOL_NEWTON;   // matrix-free PCG Newton direction (flg_pcg in mj_solPrimal)
+      // NONLINEAR CG inner solve (Polak-Ribiere, exact line search; the injected penalty's cost/gradient/
+      // line-search curvature are on the shared primal path). The outer AL converges at the same rate with a
+      // loosely solved subproblem, so a fully converged Newton direction per outer is wasted work; the
+      // iteration cap is the model's opt.iterations. Tightening the cap trades speed against occasional
+      // deep line-search backtracks.
+      ((mjModel*)m)->opt.solver = mjSOL_CG;
       mj_setExtraPrimal(&ep);
       mj_fwdConstraint(m, d);                                   // efc_b + warmstart + mj_solCG (Gauss + efc + injected penalty contacts)
       mj_setExtraPrimal(NULL);
-      d->nefc = savednefc; ((mjModel*)m)->opt.disableflags = saved; ((mjModel*)m)->opt.solver = savedsol; ((mjModel*)m)->opt.iterations = savediter;
+      d->nefc = savednefc; ((mjModel*)m)->opt.disableflags = saved; ((mjModel*)m)->opt.solver = savedsol;
       // Barrier-free AL contact energy is FINITE, so a CONVERGED inner step is big and MUST be line-searched:
       // converge+no-line-search explodes (step 145), converge+line-search is stable (morph ladder on
       // scene_ipc_balls_edge2, 2026-07-04). Treat MuJoCo's converged solution as the search DIRECTION dx
