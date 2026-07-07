@@ -21,6 +21,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <mujoco/mujoco.h>
+#include "src/engine/engine_solver.h"
 #include "test/fixture.h"
 
 namespace mujoco {
@@ -30,6 +31,80 @@ using ::std::max;
 using ::testing::NotNull;
 
 using SolverTest = MujocoTest;
+
+// M1: the extra-primal-term hook. A ball on 3 slide joints; a pin term 0.5*k*(qacc_x - a0)^2 injected into
+// the CG objective. With no other horizontal force the x-dof minimizer is a = k*a0/(m+k) (analytic), which
+// validates the cost + gradient + line-search hooks. Also checks the one-sided (contact-like) activation and
+// that clearing the term restores stock behavior.
+TEST_F(SolverTest, ExtraPrimalTerm) {
+  // gravity off + a satisfied joint equality on jy (residual 0 -> no force, but keeps nefc>0 so the solver runs).
+  // The only nontrivial term is our pin on jx (dof 0), decoupled -> a clean quadratic with minimizer k*a0/(m+k).
+  static const char xml[] = R"(
+  <mujoco>
+    <option gravity="0 0 0"/>
+    <worldbody>
+      <body pos="0 0 0.5">
+        <joint name="jx" type="slide" axis="1 0 0"/>
+        <joint name="jy" type="slide" axis="0 1 0"/>
+        <joint name="jz" type="slide" axis="0 0 1"/>
+        <geom type="sphere" size="0.1" mass="1"/>
+      </body>
+    </worldbody>
+    <equality>
+      <joint joint1="jy"/>
+    </equality>
+  </mujoco>)";
+  char error[1024];
+  mjModel* model = LoadModelFromString(xml, error, sizeof(error));
+  ASSERT_THAT(model, NotNull()) << error;
+  model->opt.solver = mjSOL_CG;
+  model->opt.tolerance = 1e-12;
+  model->opt.ls_tolerance = 1e-12;
+  model->opt.iterations = 500;
+  model->opt.disableflags |= mjDSBL_ISLAND;   // monolithic solve (island=-1); the hook targets that path
+  mjData* data = mj_makeData(model);
+  mj_forward(model, data);
+  ASSERT_GT(data->nefc, 0) << "solver must run for the hook to be exercised";
+
+  const mjtNum m = 1.0;   // slide-dof effective mass = body mass
+  const mjtNum k = 10.0, a0 = 1.0;
+  const mjtNum expect = k*a0/(m+k);   // 0.90909...
+
+  int rownnz[1] = {1}, rowadr[1] = {0}, colind[1] = {0};
+  mjtNum val[1] = {1.0}, ref[1] = {a0}, D[1] = {k};
+
+  // baseline: no extra term -> no horizontal acceleration
+  mj_setExtraPrimal(nullptr);
+  mj_forward(model, data);
+  EXPECT_NEAR(data->qacc[0], 0.0, 1e-9);
+
+  // two-sided pin on dof 0
+  int two[1] = {0};
+  mjExtraPrimal pin = {1, rownnz, rowadr, colind, val, ref, D, two};
+  mj_setExtraPrimal(&pin);
+  mj_forward(model, data);
+  mj_setExtraPrimal(nullptr);
+  EXPECT_NEAR(data->qacc[0], expect, 1e-6);
+
+  // one-sided pin, ACTIVE (residual a-a0 < 0 at the minimizer) -> same as two-sided
+  int one[1] = {1};
+  mjExtraPrimal on = {1, rownnz, rowadr, colind, val, ref, D, one};
+  mj_setExtraPrimal(&on);
+  mj_forward(model, data);
+  mj_setExtraPrimal(nullptr);
+  EXPECT_NEAR(data->qacc[0], expect, 1e-6);
+
+  // one-sided pin, INACTIVE (a0=-1 -> residual a+1 > 0) -> no shift
+  mjtNum refneg[1] = {-1.0};
+  mjExtraPrimal off = {1, rownnz, rowadr, colind, val, refneg, D, one};
+  mj_setExtraPrimal(&off);
+  mj_forward(model, data);
+  mj_setExtraPrimal(nullptr);
+  EXPECT_NEAR(data->qacc[0], 0.0, 1e-9);
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
+}
 
 static const char* const kModelPath = "engine/testdata/solver/model.xml";
 static const char* const kHumanoidPath = "engine/testdata/solver/humanoid.xml";

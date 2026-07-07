@@ -881,8 +881,10 @@ void mj_fwdConstraint(const mjModel* m, mjData* d) {
   // always clear qfrc_constraint
   mju_zero(d->qfrc_constraint, nv);
 
-  // no constraints: copy unconstrained acc, clear forces, return
-  if (!nefc) {
+  // no constraints AND no injected extra-primal rows: copy unconstrained acc, clear forces, return.
+  // (pure-flex IPC drops native contacts -> nefc==0, but the injected flex-flex contact still needs
+  // the primal solve; keep going when extra-primal rows are registered.)
+  if (!nefc && !mj_extraPrimalRows()) {
     mju_copy(d->qacc, d->qacc_smooth, nv);
     mju_zeroInt(d->solver_niter, mjNISLAND);
     TM_END(mjTIMER_CONSTRAINT);
