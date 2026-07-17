@@ -29,6 +29,7 @@
 #include "engine/engine_core_util.h"
 #include "engine/engine_derivative.h"
 #include "engine/engine_inverse.h"
+#include "engine/engine_ipc.h"
 #include "engine/engine_island.h"
 #include "engine/engine_macro.h"
 #include "engine/engine_memory.h"
@@ -918,9 +919,10 @@ void mj_fwdConstraint(const mjModel* m, mjData* d) {
   // always clear qfrc_constraint
   mju_zero(d->qfrc_constraint, nv);
 
-  // no constraints: copy unconstrained acc, clear forces, return
-  // (with the effective metric active, qacc_smooth is already the implicit answer)
-  if (!nefc) {
+  // no constraints AND no injected extra-primal rows: copy unconstrained acc, clear forces,
+  // return (with the effective metric active, qacc_smooth is already the implicit answer).
+  // Injected flex-flex contact (engine_ipc) still needs the primal solve when nefc==0.
+  if (!nefc && !mj_extraPrimalRows()) {
     mju_copy(d->qacc, d->qacc_smooth, nv);
     mju_zeroInt(d->solver_niter, mjNISLAND);
     TM_END(mjTIMER_CONSTRAINT);
@@ -1572,7 +1574,25 @@ void mj_step(const mjModel* m, mjData* d) {
   // common to all integrators
   mj_checkPos(m, d);
   mj_checkVel(m, d);
-  mj_forward(m, d);
+  // The FLEX IPC predictor must be pure free-flight x~ = x + h*v + h^2*a: the stiff FEM elastic is computed
+  // EXPLICITLY in qacc_smooth (disable SPRING+DAMPER -- both, so mj_passive early-returns, since
+  // mj_flexPassiveStretch ignores its own flags -- else x~ blows up for the light flex vertices and double-
+  // counts the elasticity), and the flex path does its OWN per-vertex contact (disable CONSTRAINT+CONTACT; native
+  // contacts would only mislead the viewer). The RIGID IPC path (mj_ipcTree) instead drives its penalty from the
+  // NATIVE contact set and needs the rigid passive forces; qacc_smooth is ALREADY the unconstrained accel, so it
+  // just runs the normal forward (collision populates d->contact; the native constraint solve runs but is ignored).
+  int ipcflex = 0;
+  if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
+    for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { ipcflex = 1; break; }
+  }
+  if (ipcflex) {
+    int saved = m->opt.disableflags;
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING | mjDSBL_DAMPER;
+    mj_forward(m, d);
+    ((mjModel*) m)->opt.disableflags = saved;
+  } else {
+    mj_forward(m, d);
+  }
   mj_checkAcc(m, d);
 
   // compare forward and inverse solutions if enabled
@@ -1593,6 +1613,10 @@ void mj_step(const mjModel* m, mjData* d) {
   case mjINT_IMPLICIT:
   case mjINT_IMPLICITFAST:
     mj_implicit(m, d);
+    break;
+
+  case mjINT_IPC:
+    mj_IPC(m, d);
     break;
 
   default:

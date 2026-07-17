@@ -3688,7 +3688,7 @@ void mjCModel::CopyObjects(mjModel* m) {
 
     if (!pfl->rigid && m->flex_edgeequality[i] == 0 &&
         !pfl->edgestiffness && !pfl->edgedamping && !pfl->damping &&
-        pfl->bending.empty()) {
+        pfl->bending.empty() && pfl->stiffness.empty()) {
       AddWarning("flex '" + pfl->name +
                      "' is not rigid and has no equality constraints or "
                      "passive forces",

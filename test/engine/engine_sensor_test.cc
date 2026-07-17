@@ -1826,8 +1826,6 @@ TEST_F(SensorTest, InsideSiteFlexBody) {
   )";
 
   char error[1024] = {0};
-  EXPECT_CALL(mock_warning_handler, Warn(testing::HasSubstr("is not rigid")))
-      .WillOnce(testing::Return());
   MjModelPtr m = LoadModelFromString(xml, error, sizeof(error));
   ASSERT_THAT(m.get(), NotNull()) << error;
   MjDataPtr d = MakeData(m);
@@ -1909,8 +1907,6 @@ TEST_F(SensorTest, FlexContactSensors) {
   )";
 
   char error[1024] = {0};
-  EXPECT_CALL(mock_warning_handler, Warn(testing::HasSubstr("is not rigid")))
-      .WillOnce(testing::Return());
   MjModelPtr m = LoadModelFromString(xml, error, sizeof(error));
   ASSERT_THAT(m.get(), NotNull()) << error;
   MjDataPtr d = MakeData(m);
