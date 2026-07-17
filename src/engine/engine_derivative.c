@@ -1377,14 +1377,25 @@ void mjd_flexBend_mul(const mjModel* m, mjData* d, mjtNum* res, const mjtNum* ve
         continue;
       }
 
-      // apply 4x4 bending stencil, coordinate-wise
+      // apply 4x4 bending stencil, coordinate-wise. A PINNED vertex (welded to a parent body,
+      // not a free 3-slide flex vertex) has no flex dofs: its row and column drop from the
+      // operator, mirroring mj_flexPassiveBend's isfree convention (its position still shapes
+      // the passive force; the pin carries the reaction). Without this guard, body_dofadr is -1
+      // for world-pinned vertices and the stencil reads/writes out of bounds.
       for (int i = 0; i < 4; i++) {
-        int dof_i = m->body_dofadr[bodyid[v[i]]];
+        int bi = bodyid[v[i]];
+        if (m->body_dofnum[bi] != 3) {
+          continue;
+        }
+        int dof_i = m->body_dofadr[bi];
         for (int x = 0; x < 3; x++) {
           mjtNum val = 0;
           for (int j = 0; j < 4; j++) {
-            int dof_j = m->body_dofadr[bodyid[v[j]]];
-            val += b[17*e + 4*i + j] * vec[dof_j + x];
+            int bj = bodyid[v[j]];
+            if (m->body_dofnum[bj] != 3) {
+              continue;
+            }
+            val += b[17*e + 4*i + j] * vec[m->body_dofadr[bj] + x];
           }
           res[dof_i + x] += scale * val;
         }

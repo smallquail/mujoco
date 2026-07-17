@@ -2143,5 +2143,33 @@ TEST_F(DerivativeTest, EffSolveExact) {
   EXPECT_LT(solve_residual(model.get(), data.get()), 1e-4);
 }
 
+// pinned vertices have no flex dofs: the metric operators must drop their rows and columns
+// (regression: mjd_flexBend_mul indexed body_dofadr of the pin's parent, -1 for world pins)
+TEST_F(DerivativeTest, EffOperatorsPinnedCloth) {
+  static const char* const kXml = R"(
+  <mujoco>
+    <option solver="CG" integrator="implicitfast"/>
+    <worldbody>
+      <flexcomp name="cloth" type="grid" count="6 6 1" spacing="0.05 0.05 0.05"
+                radius=".005" dim="2" mass="0.5" pos="0 0 1" dof="full">
+        <contact selfcollide="none" contype="0" conaffinity="0"/>
+        <elasticity young="1e3" poisson="0.2" damping="0.1" elastic2d="bend" thickness="0.01"/>
+        <pin id="0 5"/>
+      </flexcomp>
+    </worldbody>
+  </mujoco>
+  )";
+  char error[1024];
+  MjModelPtr model = LoadModelFromString(kXml, error, sizeof(error));
+  ASSERT_THAT(model.get(), NotNull()) << error;
+  MjDataPtr data = MakeData(model);
+  for (int i = 0; i < 100; i++) {
+    mj_step(model.get(), data.get());
+  }
+  for (int i = 0; i < model->nv; i++) {
+    EXPECT_TRUE(mju_isBad(data->qacc[i]) == 0) << "qacc[" << i << "]";
+  }
+}
+
 }  // namespace
 }  // namespace mujoco
