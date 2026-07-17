@@ -77,6 +77,26 @@ MJAPI void mjd_flexStretch_mul(const mjModel* m, mjData* d, mjtNum* res, const m
 // dof-level CSR; phase 1 (colind==NULL) fills rownnz/rowadr and returns total nnz, phase 2
 // fills colind/val. Interp flexes are assembled iff Krot (mjd_flexInterp_cacheKrot cache) is
 // non-NULL and the centered fast path applies (check mjd_flexInterpAssemblable first).
+// geometric nested-dissection block ordering (see engine_derivative.c); used by the per-step
+// effective-metric factor, the constant factor in mj_setConst, and the model compiler's
+// symbolic sizing (which must reproduce the identical order)
+typedef struct {
+  const mjtNum* pos;     // block positions                              (3 x nblk)
+  const int* B_rownnz;   // dof-level stiffness pattern, for block adjacency
+  const int* B_rowadr;
+  const int* B_colind;
+  const int* dofid;      // block -> first dof address (3 dofs per block)
+  const int* dof2c;      // dof -> compact index (pre-permutation)
+  int* work;             // block id work array                          (nblk x 1)
+  int* stamp;            // current-range stamp per block                (nblk x 1)
+  int* side;             // bisection side per block (valid when stamped)(nblk x 1)
+  int stampctr;          // running range id
+  int* scratch;          // side-1 gather scratch                        (nblk x 1)
+  int* perm;             // output: block emission order                 (nblk x 1)
+  int nperm;             // emitted count
+} mjEffND;
+MJAPI void mjd_effNDOrder(mjEffND* nd, int lo, int hi);
+
 MJAPI int mjd_flexStiff_assemble(const mjModel* m, mjData* d, int* rownnz, int* rowadr,
                                  int* colind, mjtNum* val, mjtNum s1, mjtNum s2,
                                  int flg_bend, int flg_stretch, const mjtNum* Krot);

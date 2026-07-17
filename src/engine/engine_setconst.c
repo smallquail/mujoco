@@ -1338,9 +1338,11 @@ static void setSpring(mjModel* m, mjData* d) {
 // the dofs of unpinned vertices of standard dim-2 flexes with bending. The matrix is constant
 // (flat-rest bending stiffness, point masses), so the factor is computed here once and reused
 // by the implicit-flex constraint solve every step. Bending couples only same-coordinate dofs,
-// so the pattern is three interleaved copies of the vertex flap adjacency. Row order (flex
-// order, vertex order, coordinate fastest) and the resulting fill count must match the
-// compiler's symbolic sizing (checked below).
+// so the pattern is three interleaved copies of the vertex flap adjacency. Rows are ordered by
+// geometric nested dissection on the REST positions (mjd_effNDOrder: natural order fill explodes
+// on irregular meshes -- a bag mesh measured 195 nnz/row natural vs grid-like fill under ND),
+// coordinate fastest within a vertex block. The compiler's symbolic sizing reproduces the
+// identical order from identical inputs (checked below).
 static void setEfm0Factor(mjModel* m, mjData* d) {
   int nbd = m->nefm0dof;
   if (!nbd) {
@@ -1357,15 +1359,28 @@ static void setEfm0Factor(mjModel* m, mjData* d) {
     vslot[i] = -1;
   }
   int nfree = 0;
+  int nvmax = nbd/3;
+  mjtNum* vpos = mjSTACKALLOC(d, 3*nvmax, mjtNum);   // rest position per covered vertex (slot order)
+  int* vdof = mjSTACKALLOC(d, nvmax, int);           // first dof address per covered vertex
+  int* frange = mjSTACKALLOC(d, m->nflex + 1, int);  // covered-slot range per qualifying flex
+  int nqf = 0;
   for (int f=0; f < m->nflex; f++) {
     if (m->flex_interp[f] || m->flex_rigid[f] || m->flex_dim[f] != 2 ||
         m->flex_bendingadr[f] < 0) {
       continue;
     }
+    frange[nqf++] = nfree;
     for (int lv=0; lv < m->flex_vertnum[f]; lv++) {
       int gv = m->flex_vertadr[f] + lv;
-      if (m->body_dofnum[m->flex_vertbodyid[gv]] == 3) {
+      int vb = m->flex_vertbodyid[gv];
+      if (m->body_dofnum[vb] == 3) {
         vslot[gv] = nfree;
+        vdof[nfree] = m->body_dofadr[vb];
+        // ordering coordinates: must match the compiler's sizing bit-for-bit. Centered flexes
+        // store (0,0,0) in flex_vert, so use the vertex body position; both are verbatim copies
+        // of the same spec fields on both sides.
+        const mjtNum* p = m->flex_centered[f] ? m->body_pos + 3*vb : m->flex_vert + 3*gv;
+        vpos[3*nfree+0] = p[0]; vpos[3*nfree+1] = p[1]; vpos[3*nfree+2] = p[2];
         nfree++;
       }
     }
@@ -1374,16 +1389,6 @@ static void setEfm0Factor(mjModel* m, mjData* d) {
     mj_freeStack(d);
     mjERROR("constant metric factor dof count mismatch: compiler sized %d, engine found %d",
             nbd, 3*nfree);
-  }
-
-  // fill row -> dof address (row 3*slot + k, coordinate fastest)
-  for (int gv=0; gv < m->nflexvert; gv++) {
-    if (vslot[gv] >= 0) {
-      int da = m->body_dofadr[m->flex_vertbodyid[gv]];
-      for (int k=0; k < 3; k++) {
-        m->efm0_dofid[3*vslot[gv] + k] = da + k;
-      }
-    }
   }
 
   // assemble the bending-only stiffness K = (h^2 + h*damping)*K_bend over all dofs with the
@@ -1399,7 +1404,54 @@ static void setEfm0Factor(mjModel* m, mjData* d) {
   mjtNum* K_val = mjSTACKALLOC(d, nK > 0 ? nK : 1, mjtNum);
   mjd_flexStiff_assemble(m, d, K_rownnz, K_rowadr, K_colind, K_val, h*h, h, 1, 0, NULL);
 
-  // inverse map: dof address -> compact factor row (monotone: slots follow dof order)
+  // nested-dissection order on the rest positions (natural-order fill explodes on irregular
+  // meshes). Adjacency comes from the assembled K pattern via natural-slot dof maps.
+  int* dofid_nat = mjSTACKALLOC(d, nbd, int);
+  int* dof2c_nat = mjSTACKALLOC(d, nv, int);
+  for (int i=0; i < nv; i++) {
+    dof2c_nat[i] = -1;
+  }
+  for (int b=0; b < nfree; b++) {
+    for (int k=0; k < 3; k++) {
+      dofid_nat[3*b + k] = vdof[b] + k;
+      dof2c_nat[vdof[b] + k] = 3*b + k;
+    }
+  }
+  mjEffND nd;
+  nd.pos = vpos;
+  nd.B_rownnz = K_rownnz;
+  nd.B_rowadr = K_rowadr;
+  nd.B_colind = K_colind;
+  nd.dofid = dofid_nat;
+  nd.dof2c = dof2c_nat;
+  nd.work = mjSTACKALLOC(d, nfree, int);
+  nd.stamp = mjSTACKALLOC(d, nfree, int);
+  nd.side = mjSTACKALLOC(d, nfree, int);
+  nd.scratch = mjSTACKALLOC(d, nfree, int);
+  nd.perm = mjSTACKALLOC(d, nfree, int);
+  nd.stampctr = 0;
+  nd.nperm = 0;
+  for (int b=0; b < nfree; b++) {
+    nd.work[b] = b;
+    nd.stamp[b] = 0;
+  }
+  // per-flex ND, flex-major emission: the compiler sizes each flex independently, and with no
+  // cross-flex bending coupling the fill of the block-diagonal system is the sum of the per-flex
+  // fills -- but only if the within-flex relative order matches the compiler's, so the recursion
+  // must run per flex range, not globally
+  frange[nqf] = nfree;
+  for (int q=0; q < nqf; q++) {
+    mjd_effNDOrder(&nd, frange[q], frange[q+1]);
+  }
+
+  // fill row -> dof address in emission order (block perm[i] -> rows 3*i+k, coordinate fastest)
+  for (int i=0; i < nfree; i++) {
+    for (int k=0; k < 3; k++) {
+      m->efm0_dofid[3*i + k] = vdof[nd.perm[i]] + k;
+    }
+  }
+
+  // inverse map: dof address -> compact factor row (permuted)
   int* dofrow = mjSTACKALLOC(d, nv, int);
   for (int i=0; i < nv; i++) {
     dofrow[i] = -1;
@@ -1437,7 +1489,7 @@ static void setEfm0Factor(mjModel* m, mjData* d) {
     Hl_rowadr[r] = ladr;
     Hu_rowadr[r] = uadr;
     mjtNum diag = 0;
-    // B columns are dof-ascending, so filtered lower/upper columns stay ascending
+    int l0 = ladr, u0 = uadr;
     for (int c=0; c < K_rownnz[dof]; c++) {
       int adr = K_rowadr[dof] + c;
       int rc = dofrow[K_colind[adr]];
@@ -1450,6 +1502,21 @@ static void setEfm0Factor(mjModel* m, mjData* d) {
       } else {
         diag = K_val[adr];
       }
+    }
+    // the ND permutation breaks the dof-ascending order: insertion-sort both row segments
+    for (int i=l0+1; i < ladr; i++) {
+      int ci = Hl_colind[i]; mjtNum vi = Hl_val[i]; int j = i - 1;
+      while (j >= l0 && Hl_colind[j] > ci) {
+        Hl_colind[j+1] = Hl_colind[j]; Hl_val[j+1] = Hl_val[j]; j--;
+      }
+      Hl_colind[j+1] = ci; Hl_val[j+1] = vi;
+    }
+    for (int i=u0+1; i < uadr; i++) {
+      int ci = Hu_colind[i]; int j = i - 1;
+      while (j >= u0 && Hu_colind[j] > ci) {
+        Hu_colind[j+1] = Hu_colind[j]; j--;
+      }
+      Hu_colind[j+1] = ci;
     }
     // diagonal last: point mass + armature + bending diagonal
     Hl_colind[ladr] = r;

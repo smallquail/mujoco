@@ -46,6 +46,7 @@
 #include <mujoco/mujoco.h>
 #include "cc/array_safety.h"
 #include "engine/engine_core_util.h"
+#include "engine/engine_derivative.h"
 #include "engine/engine_forward.h"
 #include "engine/engine_io.h"
 #include "engine/engine_name.h"
@@ -2287,14 +2288,64 @@ void mjCModel::SetSizes() {
         }
       }
 
-      // dof-level upper-triangle pattern: row 3*s+k has columns {3*t+k : t > s, t in adj(s)}
+      // nested-dissection order on the rest positions, reproducing setEfm0Factor exactly:
+      // same coordinates (centered flexes store (0,0,0) in vert_, use the vertex body position;
+      // both sides read verbatim copies of the same spec fields), same adjacency, same initial
+      // (natural) order. The block adjacency is presented to mjd_effNDOrder through identity
+      // dof maps (block index == "dof" index).
+      std::vector<mjtNum> vpos(3*nfree);
+      for (int v=0; v < nvrt; v++) {
+        if (slot[v] >= 0) {
+          const double* p = fl->centered ? bodies_[fl->vertbodyid[v]]->pos : &fl->vert_[3*v];
+          for (int k=0; k < 3; k++) {
+            vpos[3*slot[v]+k] = p[k];
+          }
+        }
+      }
+      std::vector<int> bnnz(nfree), badr(nfree), bcol;
+      for (int s=0; s < nfree; s++) {
+        badr[s] = (int)bcol.size();
+        for (int t : adj[s]) {
+          bcol.push_back(t);
+        }
+        bnnz[s] = (int)adj[s].size();
+      }
+      std::vector<int> dofid(3*nfree, 0), dof2c(nfree);
+      std::vector<int> work(nfree), stamp(nfree, 0), side(nfree), scratch(nfree), perm(nfree);
+      for (int b=0; b < nfree; b++) {
+        dofid[3*b] = b;
+        dof2c[b] = 3*b;
+        work[b] = b;
+      }
+      mjEffND nd;
+      nd.pos = vpos.data();
+      nd.B_rownnz = bnnz.data();
+      nd.B_rowadr = badr.data();
+      nd.B_colind = bcol.data();
+      nd.dofid = dofid.data();
+      nd.dof2c = dof2c.data();
+      nd.work = work.data();
+      nd.stamp = stamp.data();
+      nd.side = side.data();
+      nd.stampctr = 0;
+      nd.scratch = scratch.data();
+      nd.perm = perm.data();
+      nd.nperm = 0;
+      mjd_effNDOrder(&nd, 0, nfree);
+      std::vector<int> newrow(nfree);
+      for (int i=0; i < nfree; i++) {
+        newrow[perm[i]] = i;
+      }
+
+      // dof-level upper-triangle pattern in the PERMUTED index space
       int n = 3*nfree;
       std::vector<std::vector<int>> upper(n);
       for (int s=0; s < nfree; s++) {
         for (int t : adj[s]) {
-          if (t > s) {
+          int ns = newrow[s], nt = newrow[t];
+          if (nt > ns) {
             for (int k=0; k < 3; k++) {
-              upper[3*s+k].push_back(3*t+k);
+              upper[3*ns+k].push_back(3*nt+k);
             }
           }
         }

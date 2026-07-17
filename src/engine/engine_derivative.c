@@ -2967,25 +2967,12 @@ void mjd_effSolve(const mjModel* m, mjData* d, mjtNum* x, const mjtNum* b) {
 }
 
 
-// geometric nested-dissection ordering for the per-step factor: recursive coordinate bisection
-// with adjacency-detected separators, emitted ancestors-first (the reverse-Cholesky convention)
-typedef struct {
-  const mjtNum* pos;     // block positions                              (3 x nblk)
-  const int* B_rownnz;   // dof-level B pattern, for block adjacency
-  const int* B_rowadr;
-  const int* B_colind;
-  const int* dofid;      // block -> first dof address (3 dofs per block)
-  const int* dof2c;      // dof -> compact index (pre-permutation)
-  int* work;             // block id work array                          (nblk x 1)
-  int* stamp;            // current-range stamp per block                (nblk x 1)
-  int* side;             // bisection side per block (valid when stamped)(nblk x 1)
-  int stampctr;          // running range id
-  int* scratch;          // side-1 gather scratch                        (nblk x 1)
-  int* perm;             // output: block emission order                 (nblk x 1)
-  int nperm;             // emitted count
-} mjEffND;
-
-static void effNDOrder(mjEffND* nd, int lo, int hi) {
+// geometric nested-dissection ordering (mjd_effNDOrder): recursive coordinate bisection with
+// adjacency-detected separators, emitted ancestors-first (the reverse-Cholesky convention).
+// Shared by the per-step factor, the constant factor (mj_setConst) and the model compiler's
+// symbolic sizing (identical inputs -> identical order; the compiler synthesizes block-level
+// adjacency with identity dof maps). Struct and declaration live in engine_derivative.h.
+void mjd_effNDOrder(mjEffND* nd, int lo, int hi) {
   int nblk = hi - lo;
   if (nblk <= 16) {
     for (int i=lo; i < hi; i++) {
@@ -3061,8 +3048,8 @@ static void effNDOrder(mjEffND* nd, int lo, int hi) {
   for (int i=0; i < nb; i++) {
     nd->work[lo + na + i] = nd->scratch[i];
   }
-  effNDOrder(nd, lo, lo + na);
-  effNDOrder(nd, lo + na, lo + na + nb);
+  mjd_effNDOrder(nd, lo, lo + na);
+  mjd_effNDOrder(nd, lo + na, lo + na + nb);
 }
 
 
@@ -3122,7 +3109,7 @@ static void effFactor(const mjModel* m, mjData* d) {
     nd.scratch = nd_scr;
     nd.perm = nd_perm;
     nd.nperm = 0;
-    effNDOrder(&nd, 0, nblk);
+    mjd_effNDOrder(&nd, 0, nblk);
   }
 
   // apply the permutation to the compact indexing; the permuted dofid persists on the arena
