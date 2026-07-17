@@ -33,6 +33,7 @@
 #include "engine/engine_support.h"      // mj_mulM, mj_integratePos, mj_differentiatePos (per-tree mass + manifold)
 #include "engine/engine_core_smooth.h"  // mj_solveM, mj_kinematics, mj_comPos (per-tree M^-1, FK at trial q)
 #include "engine/engine_core_util.h"    // mj_local2Global (anchor body-local -> world for the live gap)
+#include "engine/engine_derivative.h"   // [P1c] mjd_effMulAdd (metric elastic term of the merit)
 #include "engine/engine_util_solve.h"   // mju_cholFactor, mju_cholSolve (dense Newton solve)
 #include "engine/engine_util_blas.h"    // mju_dot3, mju_mulMatVec3
 #include "engine/engine_util_spatial.h" // mju_cross (flex bending)
@@ -533,41 +534,10 @@ static mjtNum ipc_ccd(const mjModel* m, const mjData* d, const mjtNum* x, const 
 }
 
 
-// EDGE-EQUALITY soft constraint: a flex edge (v0,v1 = combined-space free-point indices) whose inextensibility
-// c = |x_v0 - x_v1| - L0 is driven to MuJoCo's mjEQ_FLEX reference by a TWO-SIDED soft penalty 1/2 k (c - ctarget)^2.
-// Replaces the stiff stretch energy on flexes with edge equality; the QP handles the rows natively (efc).
-typedef struct { int v0, v1; mjtNum uh[3], efcD, aref, rconst; } ipcEdge;   // MuJoCo efc row VERBATIM (matches the QP)
-
-
-// One membrane element (2D triangle): the 3 flex vertices (global vg, free-dof fv, -1 if pinned),
-// the FEM stiffness metric M (symmetric 3x3 over the element's 3 edges, read from flex_stiffness),
-// and the rest squared edge lengths Lr2. We consume MuJoCo's P1 FEM membrane energy (engine_passive,
-// Kharevych et al.): E = 1/4 e^T M e with e[edge] = L^2 - L0^2 (frame-invariant). The force is the
-// gradient (matches mj_flexPassiveStretch exactly) and the Hessian is its Gauss-Newton part.
-typedef struct { int vg[3], fv[3]; mjtNum M[6]; mjtNum Lr2[3];
-                 mjtNum kD;        // Rayleigh damping coefficient = flex_damping/h (constant)
-                 mjtNum ep[3];     // elongations e_a at the previous step (xold), refreshed each step
-               } ipcElem;
-// One bending "flap" (an interior edge + the two opposite triangle apexes): the 4 flex vertices (global vg,
-// free-dof fv, -1 if pinned) and the constant 4x4 quadratic-bending operator Q (MuJoCo's precomputed
-// flex_bending; Wardetzky/Garg "Discrete Quadratic Curvature"/"Cubic Shells"). Flat-rest assumption -> the
-// curved-reference term b[17e+16] is dropped. Energy 1/2 x^T (Q (x) I3) x, force/Hessian = Q (x) I3 -- constant,
-// PSD by construction (rank-1 Q = cos*stiffness*c c^T; concave-rest edges with trace(Q)<0 are skipped at setup).
-typedef struct { int vg[4], fv[4]; mjtNum Q[16]; mjtNum b16; } ipcBend;
-static const int ipc_eedge[3][2] = {{1, 2}, {2, 0}, {0, 1}};   // local edges (== engine_passive's)
-static inline mjtNum ipc_Mab(const mjtNum* M6, int a, int b) {
-  static const int id[3][3] = {{0,1,2},{1,3,4},{2,4,5}};   // 3x3 symmetric from 6 upper-tri entries
-  return M6[id[a][b]];
-}
-// edge vectors d[a] = x[v_a0]-x[v_a1] and elongations e[a] = |d[a]|^2 - Lr2[a] for an element at x
-static void ipc_elemEval(const ipcElem* el, const mjtNum* x, mjtNum d[3][3], mjtNum e[3]) {
-  for (int a=0; a < 3; a++) {
-    int p = el->vg[ipc_eedge[a][0]], q = el->vg[ipc_eedge[a][1]];
-    mjtNum L2 = 0;
-    for (int k=0; k < 3; k++) { d[a][k] = x[3*p+k]-x[3*q+k]; L2 += d[a][k]*d[a][k]; }
-    e[a] = L2 - el->Lr2[a];
-  }
-}
+// [P1c] The FEM machinery (ipcElem membrane elements, ipcBend flaps, ipcEdge soft rows) is gone:
+// stretch is carried by the native edge-equality efc rows in the inner QP, and stretch+bending are
+// implicit in the QP's effective metric Mtilde = M + K (mjd_effMulAdd/mjd_effSolve, gated by
+// mj_flexCG accepting mjINT_IPC). The merit's matching elastic term is ipc_metricElastic below.
 
 
 // re-test ONE held contact at the optimizer x and admit it to the assembled set (acon -> the injected QP rows).
@@ -751,39 +721,41 @@ typedef struct {
 // per-iteration active contact list acon (cached so the line search doesn't re-enumerate all pairs)
 // FEM membrane stretch energy: sum over elements of 1/4 e^T M e, e[edge] = L^2 - L0^2 (the invariant
 // metric measure; matches MuJoCo's engine_passive). Shared by ipc_energyBase and ipc_energy.
-static mjtNum ipc_stretchEnergy(int nelem, const ipcElem* elems, const mjtNum* x) {
-  mjtNum E = 0;
-  for (int t=0; t < nelem; t++) {
-    mjtNum d[3][3], e[3]; ipc_elemEval(&elems[t], x, d, e);
-    const mjtNum* M = elems[t].M; mjtNum kD = elems[t].kD;
-    mjtNum de[3]; for (int a=0; a < 3; a++) de[a] = e[a] - elems[t].ep[a];   // elongation change (damping)
-    for (int a=0; a < 3; a++) for (int b=0; b < 3; b++)
-      E += 0.25*ipc_Mab(M,a,b)*(e[a]*e[b] + kD*de[a]*de[b]);   // elastic + dissipative incremental potl
+// [P1c] implicit-metric elastic energy: 0.5*ih2 * w^T K_eff w, with w the dof-mapped (x - xtil)
+// (world -> local slide frames via R^T) and K_eff = (h^2 + h*damping)*K applied by mjd_effMulAdd.
+// This is the flex block of the QP's Mtilde-Gauss objective beyond the point-mass part (which
+// ipc_energy scores): together they equal h^2 * 0.5*(qacc - qacc_smooth)^T Mtilde (qacc -
+// qacc_smooth) on the flex dofs, because w = h^2*(qacc - qacc_smooth) under the row substitution
+// and xtil is built from the same metric-implicit qacc_smooth the QP references. The merit must
+// score exactly the QP objective (the A != merit bug class), so this term is NOT optional while
+// the metric is active. Inactive metric (e.g. elliptic cone): contributes 0 and elasticity is
+// explicit in qacc_smooth -- outside the supported gate, kept from crashing but not tuned.
+static mjtNum ipc_metricElastic(const mjModel* m, mjData* d, const mjtNum* x, const mjtNum* xtil,
+                                int npt, const int* fidx, const int* dofadr, const int* pbody,
+                                mjtNum h) {
+  if (!d->efm_active) {
+    return 0;
   }
+  int nv = m->nv;
+  mjtNum* w  = (mjtNum*) mju_malloc(nv*sizeof(mjtNum));
+  mjtNum* Kw = (mjtNum*) mju_malloc(nv*sizeof(mjtNum));
+  mju_zero(w, nv);
+  mju_zero(Kw, nv);
+  for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
+    const mjtNum* R = d->xmat + 9*pbody[v];
+    mjtNum dpw[3], dpl[3];
+    for (int c=0; c < 3; c++) dpw[c] = x[3*v+c] - xtil[3*v+c];
+    mju_mulMatTVec3(dpl, R, dpw);
+    for (int c=0; c < 3; c++) w[dofadr[v]+c] = dpl[c];
+  }
+  mjd_effMulAdd(m, d, Kw, w);
+  mjtNum E = 0.5*mju_dot(w, Kw, nv)/(h*h);
+  mju_free(w);
+  mju_free(Kw);
   return E;
 }
 
-
-// quadratic bending energy: sum over flaps of 1/2 x^T (Q (x) I3) x (Q the constant per-edge bending operator).
-static mjtNum ipc_bendEnergy(int nbe, const ipcBend* bends, const mjtNum* x) {
-  mjtNum E = 0;
-  for (int t=0; t < nbe; t++) {
-    const ipcBend* bn = &bends[t]; const mjtNum* Q = bn->Q;
-    for (int i=0; i < 4; i++) for (int j=0; j < 4; j++) { mjtNum q = Q[4*i+j]; if (q == 0) continue;
-      for (int k=0; k < 3; k++) E += 0.5*q*x[3*bn->vg[i]+k]*x[3*bn->vg[j]+k]; }
-    if (bn->b16 != 0) {   // curved-reference: E += b16 * det[ed0,ed1,ed2], ed_a = x[v_{a+1}] - x[v0] (gradient = b16*frc)
-      const mjtNum* x0 = x + 3*bn->vg[0]; mjtNum ed[3][3];
-      for (int a=0; a < 3; a++) { const mjtNum* xa = x + 3*bn->vg[a+1];
-        for (int k=0; k < 3; k++) ed[a][k] = xa[k] - x0[k]; }
-      mjtNum cr[3]; mju_cross(cr, ed[1], ed[2]);   // ed1 x ed2
-      E += bn->b16 * (ed[0][0]*cr[0] + ed[0][1]*cr[1] + ed[0][2]*cr[2]);
-    }
-  }
-  return E;
-}
-
-static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, const ipcElem* elems,
-                         int nbe, const ipcBend* bends,
+static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv,
                          const mjtNum* x, const mjtNum* xtil, const int* fidx, const mjtNum* mass,
                          mjtNum h, mjtNum r, const mjtNum* rad, mjtNum ghat,
                          const mjtNum* gv, const mjtNum* ge, const ipcCon* acon, int nacon,
@@ -793,8 +765,6 @@ static mjtNum ipc_energy(const mjModel* m, const mjData* d, int nfv, int nelem, 
     mjtNum mh = mass[v]*ih2;
     for (int c=0; c < 3; c++) { mjtNum t = x[3*v+c] - xtil[3*v+c]; E += 0.5*mh*t*t; }
   }
-  E += ipc_stretchEnergy(nelem, elems, x);
-  E += ipc_bendEnergy(nbe, bends, x);
   for (int c=0; c < nacon; c++) {
     // AL penalty energy E = 0.5*scale*d^2 over the slack-baked d: exact parity with
     // ipc_try's gradient. d = c_raw - s - lam/mu, scale = pow(IPC_DECAY, cnt-exp)*mu_pair. Keep mj's dashpot energy.
@@ -1025,14 +995,13 @@ static int ipc_candidates(const mjModel* m, const mjData* d, const mjtNum* x, co
 }
 
 // IPC-style variational integrator (integrator="ipc"): owns the full step, minimizing the per-step incremental
-// potential (inertia + flex edge-stretch + bending energy) with penetration-free contact by a barrier-free
-// AUGMENTED-LAGRANGIAN method (paper arXiv 2512.12151) -- the contact multiplier carries the force at a
-// fixed low stiffness (no log barrier, no kappa adaptation, no TOI-lock); the inner optimizer is solved freely and
-// the committed output is a conservative-CCD blend from the last intersection-free state. Covers flex self-contact
-// (vertex-triangle + edge-edge) and flex-vs-geom. Flex-only: falls back to Euler if no 2D flex.
-// contact-stiffness floor: the AL's penalty stiffness mu is auto-set to 0.1*max(inertia diag) each step
-// (matched to the system Hessian scale, paper Eq.20); this is only the pre-mdiag init placeholder.
-#define IPC_KAPPA0   1000.0
+// potential with penetration-free contact by a barrier-free AUGMENTED-LAGRANGIAN method (paper
+// arXiv 2512.12151) -- the contact multiplier carries the force at a fixed low stiffness (no log
+// barrier, no kappa adaptation, no TOI-lock); the inner optimizer is MuJoCo's CG in the effective
+// metric Mtilde = M + K (stretch via native edge-equality efc rows, stretch+bending implicit in the
+// metric) with the AL contact injected as extra-primal rows; the committed output is a
+// conservative-CCD blend from the last intersection-free state. Covers flex self-contact
+// (vertex-triangle + edge-edge) and flex-vs-geom.
 
 // Soft-contact (k, gtarget) come from MuJoCo's per-contact efc reference via ipc_softCoef: gtarget = pos + h*vel +
 // h^2*aref (efc_aref/efc_vel), k = imp/(1-imp)*ih2/invm (efc impedance + our EXACT contact-space mass). This
@@ -1078,8 +1047,8 @@ static mjtNum ipc_articResid(const mjModel* m, mjData* d, const mjtNum* qn, cons
 }
 
 void mj_IPC(const mjModel* m, mjData* d) {
+
   mjtNum h = m->opt.timestep;
-  mjtNum kappa = IPC_KAPPA0;   // placeholder; set to the auto mu = 0.1*max(inertia diag) once mdiag is known
   // all dim-2 flexes participate in the IPC solve (was: only the first). Their vertices are concatenated
   // into the free-point array in flex order; fxadr[k] is the free-point offset of dim-2 flex flist[k].
   int nfd = 0;
@@ -1098,11 +1067,16 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mj_makeConstraint(m, d);         // build efc (efc_J/pos/R via mj_makeImpedance) for the snapshot contacts -- ONCE per step
   mj_referenceConstraint(m, d);    // build efc_aref/efc_vel/efc_KBIP -- REUSE MuJoCo's exact reference, no re-derivation
   ((mjModel*) m)->opt.disableflags = saved_df;
+  // [P1c] mj_makeConstraint rolled the arena back past the effective-metric block built by the
+  // predictor's mj_fwdPosition (efm has efc-like arena lifetime): rebuild it on top of the
+  // snapshot efc. Same qpos, so the rebuilt metric is identical; the predictor's qacc_smooth
+  // (a buffer field) is untouched and remains the shared Mtilde-Gauss center.
+  mjd_effBuild(m, d, mj_flexCG(m), /*flg_factor=*/1);
   int* flist = (int*) mju_malloc(nfd*sizeof(int));   // the dim-2 flex ids
   int* fxadr = (int*) mju_malloc(nfd*sizeof(int));   // free-point offset of each dim-2 flex
-  int nfv = 0, ne = 0;                               // total dim-2 flex verts / elements (all flexes)
+  int nfv = 0;                                       // total dim-2 flex verts (all flexes)
   for (int i=0, k=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) {
-    flist[k] = i; fxadr[k] = nfv; nfv += m->flex_vertnum[i]; ne += m->flex_elemnum[i]; k++;
+    flist[k] = i; fxadr[k] = nfv; nfv += m->flex_vertnum[i]; k++;
   }
   int f = (nfd > 0) ? flist[0] : -1;   // flex 0 sets the global barrier scale (ghat) if any flex exists
   mjtNum r = (f >= 0) ? m->flex_radius[f] : 0, ghat = r;   // contact activates within ghat of the surface gap
@@ -1170,78 +1144,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // diverged from mj_mulM in the flex+balls scene -- unexplained; the full mj_mulM/mj_solveM is correct.)
   (void) NVTREE;                                             // consumed in 4c (mixed-contact side store)
   int nstate = nfv;                                          // state-vector length (flex points)
-  // FEM membrane elements (all dim-2 flexes): consume MuJoCo's precomputed flex_stiffness metric (from the
-  // model's <elasticity young=.../> tag) per element + the rest squared edge lengths. No hand-rolled springs.
-  // Element vertex indices are mapped from per-flex local (el_k) to the combined free-point space (fxadr[k]+).
-  ipcElem* elems = (ipcElem*) mju_malloc((ne > 0 ? ne : 1)*sizeof(ipcElem));
-  for (int k=0, et=0; k < nfd; k++) {
-    int fi = flist[k], sa_k = m->flex_stiffnessadr[fi], ea_k = m->flex_edgeadr[fi], ne_k = m->flex_elemnum[fi];
-    const int* el_k = m->flex_elem + m->flex_elemdataadr[fi];
-    const int* eme_k = m->flex_elemedge + m->flex_elemedgeadr[fi];
-    mjtNum kD_k = (h > 0) ? m->flex_damping[fi]/h : 0;          // stiffness-prop. Rayleigh damping
-    for (int t=0; t < ne_k; t++, et++) {   // stretch + edge coexist: use elastic2d="bend" (or low young) to avoid stiff-stretch double-count
-      for (int i=0; i < 3; i++) { int gp = fxadr[k] + el_k[3*t+i]; elems[et].vg[i] = gp; elems[et].fv[i] = fidx[gp]; }
-      for (int j=0; j < 6; j++) elems[et].M[j] = (sa_k >= 0) ? m->flex_stiffness[sa_k + 21*t + j] : 0;
-      for (int a=0; a < 3; a++) {
-        mjtNum L0 = m->flexedge_length0[ea_k + eme_k[3*t+a]]; elems[et].Lr2[a] = L0*L0; elems[et].ep[a] = 0;
-      }
-      elems[et].kD = kD_k;
-    }
-  }
-  // EDGE-EQUALITY soft constraints: for flexes whose stretch we just gated off, build one soft penalty per
-  // non-rigid edge from its mjEQ_FLEX efc row (same reference as contacts, via ipc_softCoef). The efc rows of an
-  // mjEQ_FLEX equality are consecutive, one per non-rigid edge in edge order -> walk edges + rows in lockstep.
-  int nedgeMax = 0;
-  for (int k=0; k < nfd; k++) if (m->flex_edgeequality[flist[k]]) nedgeMax += m->flex_edgenum[flist[k]];
-  ipcEdge* edges = (ipcEdge*) mju_malloc((nedgeMax > 0 ? nedgeMax : 1)*sizeof(ipcEdge));
-  int nedge = 0;
-  for (int k=0; k < nfd; k++) {
-    int fl = flist[k]; if (!m->flex_edgeequality[fl]) continue;
-    int eqid = -1; for (int q=0; q < m->neq; q++) if (m->eq_type[q]==mjEQ_FLEX && m->eq_obj1id[q]==fl) { eqid=q; break; }
-    if (eqid < 0) continue;
-    int row = -1; for (int i=0; i < d->nefc; i++) if (d->efc_type[i]==mjCNSTR_EQUALITY && d->efc_id[i]==eqid) { row=i; break; }
-    if (row < 0) continue;
-    int ebase = m->flex_edgeadr[fl], en = m->flex_edgenum[fl];
-    for (int e=0; e < en; e++) {
-      if (m->flexedge_rigid[ebase+e]) continue;                 // rigid edges get NO efc row -> skip in lockstep
-      int v0 = fxadr[k] + m->flex_edge[2*(ebase+e)], v1 = fxadr[k] + m->flex_edge[2*(ebase+e)+1];
-      mjtNum invm = 0;                                          // contact-space inverse mass = 1/m_v0 + 1/m_v1
-      if (fidx[v0] >= 0 && mass[v0] > mjMINVAL) invm += 1.0/mass[v0];
-      if (fidx[v1] >= 0 && mass[v1] > mjMINVAL) invm += 1.0/mass[v1];
-      if (invm >= mjMINVAL) {
-        ipcEdge* ed = &edges[nedge++];
-        ed->v0 = v0; ed->v1 = v1;
-        ed->efcD = d->efc_D[row]; ed->aref = d->efc_aref[row];   // VERBATIM: MuJoCo's efc stiffness + reference (uh/rconst after xtil)
-      }
-      row++;                                                    // advance the efc row for every non-rigid edge
-    }
-  }
-  // bending flaps: read MuJoCo's precomputed quadratic operator Q from flex_bending (b[17e+4i+j]); flat-rest
-  // assumption -> drop the curved-reference b[17e+16]. Stencil v[4]={edge0,edge1,flap0,flap1}; skip boundary
-  // (v[3]==-1) and concave-rest (trace(Q)<0, rank-1 negative -> keeps each block PSD without a clamp).
-  int nbeMax = 0;
-  for (int k=0; k < nfd; k++) { int fi = flist[k];
-    if (m->flex_dim[fi] == 2 && m->flex_bendingadr[fi] >= 0) nbeMax += m->flex_edgenum[fi]; }
-  ipcBend* bends = (ipcBend*) mju_malloc((nbeMax > 0 ? nbeMax : 1)*sizeof(ipcBend));
-  int nbe = 0;
-  for (int k=0; k < nfd; k++) {
-    int fi = flist[k], badr = m->flex_bendingadr[fi];
-    if (m->flex_dim[fi] != 2 || badr < 0) continue;
-    int eadr = m->flex_edgeadr[fi], enum_k = m->flex_edgenum[fi];
-    const mjtNum* b = m->flex_bending + badr;
-    for (int e=0; e < enum_k; e++) {
-      const int* edge = m->flex_edge + 2*(eadr + e);
-      const int* flap = m->flex_edgeflap + 2*(eadr + e);
-      int v[4] = { edge[0], edge[1], flap[0], flap[1] };
-      if (v[3] == -1) continue;                                  // boundary edge: only one adjacent triangle
-      const mjtNum* Qe = b + 17*e;
-      if (Qe[0] + Qe[5] + Qe[10] + Qe[15] < 0) continue;         // trace(Q)<0: concave rest -> skip (PSD safe)
-      ipcBend* bn = &bends[nbe++];
-      for (int i=0; i < 4; i++) { int gp = fxadr[k] + v[i]; bn->vg[i] = gp; bn->fv[i] = fidx[gp]; }
-      for (int i=0; i < 16; i++) bn->Q[i] = Qe[i];
-      bn->b16 = 0.0;   // curved-reference (Garg "Cubic Shells") dropped for now -- assumes flat-panel rest; re-add by restoring Qe[16]
-    }
-  }
+  // [P1c] No FEM element / edge-penalty / bending-flap arrays: stretch rides the native
+  // edge-equality efc rows, and stretch+bending are implicit in the inner QP's effective metric
+  // (built once per step by mjd_effBuild in the predictor's mj_fwdPosition and persisted).
   int amax = npt*64 + 1024;                   // capacity of the active-contact list
   ipcCon* acon = (ipcCon*) mju_malloc(amax*sizeof(ipcCon));
   int candmax = npt*192 + 8192;               // capacity of the per-step candidate list (sized for the
@@ -1300,7 +1205,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mjtNum* xold = (mjtNum*) mju_malloc(3*nstate*sizeof(mjtNum));
   mjtNum* xn   = (mjtNum*) mju_malloc(3*nstate*sizeof(mjtNum));
   mjtNum* dx   = (mjtNum*) mju_malloc(Na*sizeof(mjtNum));
-  mjtNum* mdiag= (mjtNum*) mju_malloc(Na*sizeof(mjtNum));   // inertia diagonal (for the kappa auto-scale)
 
   // flex/sphere inertial prediction: q~ = q + h*v + h^2*qacc_smooth (point masses have no Coriolis).
   mjtNum* qacc_pred = (mjtNum*) mju_malloc((m->nv > 0 ? m->nv : 1)*sizeof(mjtNum));
@@ -1347,43 +1251,14 @@ void mj_IPC(const mjModel* m, mjData* d) {
       for (int c=0; c < 3; c++) xtil[3*v+c] = xold[3*v+c];   // pinned: fixed
     }
   }
-  { mjtNum ih2e = 1.0/(h*h);   // VERBATIM edge per-step: frozen efc_J dir uh @ q_n + rconst folding efc_b and the xtil offset
-    for (int e=0; e < nedge; e++) {
-      ipcEdge* ed = &edges[e]; int v0 = ed->v0, v1 = ed->v1;
-      mjtNum dv[3]; for (int c=0;c<3;c++) dv[c] = xold[3*v0+c] - xold[3*v1+c];
-      mjtNum L = mju_sqrt(dv[0]*dv[0]+dv[1]*dv[1]+dv[2]*dv[2]);
-      if (L < mjMINVAL) { for (int c=0;c<3;c++) ed->uh[c]=0; ed->rconst=0; continue; }
-      for (int c=0;c<3;c++) ed->uh[c] = dv[c]/L;
-      mjtNum aw0[3]={0}, aw1[3]={0};
-      if (fidx[v0] >= 0) mju_mulMatVec3(aw0, d->xmat+9*pbody[v0], qacc_pred+dofadr[v0]);
-      if (fidx[v1] >= 0) mju_mulMatVec3(aw1, d->xmat+9*pbody[v1], qacc_pred+dofadr[v1]);
-      mjtNum efc_b = -ed->aref, ptil = 0;
-      for (int c=0;c<3;c++) { efc_b += ed->uh[c]*(aw0[c]-aw1[c]); ptil += ed->uh[c]*(xtil[3*v0+c]-xtil[3*v1+c]); }
-      ed->rconst = efc_b - ptil*ih2e;
-    }
-  }
   for (int i=0; i < 3*nstate; i++) x[i] = xold[i];   // start from last collision-free state (feasibility)
 
   mjtNum ih2 = 1.0/(h*h);
-  for (int i=0; i < N; i++) mdiag[i] = 0;                          // inertia diagonal (fixed per step)
-  for (int v=0; v < npt; v++) if (fidx[v] >= 0) {
-    int fi = fidx[v]; for (int c=0; c < 3; c++) mdiag[3*fi+c] = mass[v]*ih2;
-  }
-  // AL contact stiffness: kappa carries a FIXED, auto-set mu = 0.1 * max(inertia diag),
-  // matched to the system's Hessian scale (paper Eq.20). No per-step adaptation -> no kappa
-  // oscillation; non-penetration is the CCD's job (the AL force is finite). Computed over the FLEX-ONLY
-  // mdiag (before the rigid block is written) so the flex AL is bit-identical to the unified-array version.
-  {
-    mjtNum mmax = 0;
-    for (int i=0; i < N; i++) if (mdiag[i] > mmax) mmax = mdiag[i];
-    kappa = 0.1*mmax;   // penalty stiffness mu = 0.1 * max(inertia diag), matched to the Hessian scale (paper Eq.20)
-  }
   {   // AL: per-free-point flex/sphere contact-multiplier warm-start store (persisted across steps).
     if (g_palN != npt) { mju_free(g_pal); g_palN = npt;
       g_pal = (mjtNum*) mju_malloc((size_t)(npt > 0 ? npt : 1)*sizeof(mjtNum));
       for (int i=0; i < npt; i++) g_pal[i] = 0; }            // zero ONLY on resize -> warm-start persists
   }
-  (void)kappa;
   // build the candidate-contact list once per step: detection threshold inflated by the predictor
   // displacement so any pair that could close during the step is captured (verified by gap checks)
   mjtNum maxdisp = 0;
@@ -1412,11 +1287,6 @@ void mj_IPC(const mjModel* m, mjData* d) {
   // margin covers the step displacement), so it is a far better feasible initial guess than xold and Newton
   // converges in ~1 iteration instead of ~2 -- halving the cost of contact-free steps.
   if (ncand == 0) for (int i=0; i < 3*nstate; i++) x[i] = xtil[i];
-  // sparse Hessian pattern (mesh + candidate-contact couplings) for the IC(0) preconditioner, once/step
-  // Rayleigh damping uses the previous-step elongations e_prev = e(xold); xold is fixed over the Newton
-  // loop, so cache e_prev once per step. Only needed when damping is on.
-  if (nfd > 0 && m->flex_damping[f] > 0)
-    for (int t=0; t < ne; t++) { mjtNum dtmp[3][3]; ipc_elemEval(&elems[t], xold, dtmp, elems[t].ep); }
   // mark active inter-flex/sphere candidates (gap already within their per-contact ghat). gap here == iter-0 gap
   // (x is unchanged until the Newton loop); geom contacts (types 2/3/4) add no coupling so they're skipped.
   for (int c=0; c < ncand; c++) {
@@ -1491,7 +1361,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // N7 monotone-energy line search (below) -- a converged step is big and needs the line search to stay stable.
     {
       int mixed = (na_artic > 0 && nfv > 0);
-      int cap = 2*nacon + nedge + 1;   // contact stiffness + dashpot rows (+ optional edge-penalty rows, MORPH_EDGEPEN2)
+      int cap = 2*nacon + 1;   // contact stiffness + dashpot rows
       int* epnnz = (int*) mju_malloc(cap*sizeof(int));
       int* epadr = (int*) mju_malloc(cap*sizeof(int));
       int* epcol = (int*) mju_malloc(cap*12*sizeof(int));
@@ -1622,8 +1492,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
     // the per-outer relinearized nonlinearity the line search exists for). The line search itself is required:
     // the paper line-searches the nonlinear subproblem energy; accepting the linearized full step overshoots
     // into penetration and the N8 CCD advance collapses (beta grinds at the outer cap).
-    mjtNum E0 = ipc_energy(m, d, npt, ne, elems, nbe, bends, x, xtil, fidx, mass, h, r, rad, ghat,
+    mjtNum E0 = ipc_energy(m, d, npt, x, xtil, fidx, mass, h, r, rad, ghat,
                            gv, ge, candLS, nls, xold, xfree)
+              + ipc_metricElastic(m, d, x, xtil, npt, fidx, dofadr, pbody, h)
               + ipc_articResid(m, d, qn_a, qtil_a, qdelta, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr)
               + ipc_efcCost(m, d, x, xold, npt, fidx, dofadr, pbody, qdelta, na_artic, atid, aoff, N, h, nefc_qp);
     mjtNum alpha = 1.0;
@@ -1640,8 +1511,9 @@ void mj_IPC(const mjModel* m, mjData* d) {
           for (int i=0; i < nd; i++) a_gdq[da+i] = qdtmp[o+i-N]; }
         mju_copy(d->qpos, qn_a, m->nq); mj_integratePos(m, d->qpos, a_gdq, 1); mj_kinematics(m, d);
       }
-      mjtNum Etr = ipc_energy(m, d, npt, ne, elems, nbe, bends, xn, xtil, fidx, mass, h, r, rad, ghat,
+      mjtNum Etr = ipc_energy(m, d, npt, xn, xtil, fidx, mass, h, r, rad, ghat,
                               gv, ge, candLS, nls, xold, xfree)
+                 + ipc_metricElastic(m, d, xn, xtil, npt, fidx, dofadr, pbody, h)
                  + ipc_articResid(m, d, qn_a, qtil_a, qdtmp, na_artic, atid, aoff, N, ih2, a_gdq, qcur_a, a_gr, a_gMr)
                  + ipc_efcCost(m, d, xn, xold, npt, fidx, dofadr, pbody, qdtmp, na_artic, atid, aoff, N, h, nefc_qp);
       if (Etr <= E0 + 1e-12 || newton_converged) break;
@@ -1724,7 +1596,7 @@ void mj_IPC(const mjModel* m, mjData* d) {
     if (nfd == 0) { mj_kinematics(m, d); mj_comPos(m, d); }
   }
   d->time += h;
-  mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass); mju_free(elems); mju_free(bends);
+  mju_free(dofadr); mju_free(qpadr); mju_free(fidx); mju_free(mass);
   mju_free(rad); mju_free(pbody);
 
   mju_free(flist); mju_free(fxadr); mju_free(pt2vg); mju_free(pt2flex);
@@ -1734,11 +1606,10 @@ void mj_IPC(const mjModel* m, mjData* d) {
   mju_free(gv); mju_free(ge);
   mju_free(x); mju_free(xfree); mju_free(xtil); mju_free(xold); mju_free(xn);
   mju_free(aoff); mju_free(atid);
-  mju_free(edges);
 
   mju_free(qn_a); mju_free(qtil_a); mju_free(qcur_a); mju_free(qdelta); mju_free(qdtmp);
   mju_free(a_gdq); mju_free(a_gr); mju_free(a_gMr);
-  mju_free(dx); mju_free(mdiag); mju_free(qacc_pred);
+  mju_free(dx); mju_free(qacc_pred);
   (void)stalled;   // CCD-freeze detector; the diagnostic kill was env-gated and is removed
 }
 

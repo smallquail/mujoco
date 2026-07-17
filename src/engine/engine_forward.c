@@ -1369,9 +1369,13 @@ static mjtBool flex_has_implicit_stiffness(const mjModel* m) {
 // constraint islanding). solver="Newton" keeps its exact-factorization semantics untouched.
 // Models outside the gate integrate flex elasticity explicitly.
 int mj_flexCG(const mjModel* m) {
-  return m->opt.solver == mjSOL_CG &&
-         (m->opt.integrator == mjINT_IMPLICIT || m->opt.integrator == mjINT_IMPLICITFAST) &&
-         m->opt.cone != mjCONE_ELLIPTIC && !mjENABLED(mjENBL_SLEEP) &&
+  // the IPC integrator (engine_ipc) forces the CG inner solve itself, so it is gated regardless
+  // of the model's solver option
+  int solver_gated = (m->opt.solver == mjSOL_CG &&
+                      (m->opt.integrator == mjINT_IMPLICIT ||
+                       m->opt.integrator == mjINT_IMPLICITFAST)) ||
+                     m->opt.integrator == mjINT_IPC;
+  return solver_gated && m->opt.cone != mjCONE_ELLIPTIC && !mjENABLED(mjENBL_SLEEP) &&
          flex_has_implicit_stiffness(m);
 }
 
@@ -1574,20 +1578,21 @@ void mj_step(const mjModel* m, mjData* d) {
   // common to all integrators
   mj_checkPos(m, d);
   mj_checkVel(m, d);
-  // The FLEX IPC predictor must be pure free-flight x~ = x + h*v + h^2*a: the stiff FEM elastic is computed
-  // EXPLICITLY in qacc_smooth (disable SPRING+DAMPER -- both, so mj_passive early-returns, since
-  // mj_flexPassiveStretch ignores its own flags -- else x~ blows up for the light flex vertices and double-
-  // counts the elasticity), and the flex path does its OWN per-vertex contact (disable CONSTRAINT+CONTACT; native
-  // contacts would only mislead the viewer). The RIGID IPC path (mj_ipcTree) instead drives its penalty from the
-  // NATIVE contact set and needs the rigid passive forces; qacc_smooth is ALREADY the unconstrained accel, so it
-  // just runs the normal forward (collision populates d->contact; the native constraint solve runs but is ignored).
+  // The FLEX IPC predictor runs without constraints or contacts (the flex path does its own
+  // per-vertex contact; native rows are rebuilt inside mj_IPC), but KEEPS the passive spring and
+  // damper forces: with the effective metric gated on (mj_flexCG accepts mjINT_IPC), the smooth
+  // acceleration is the IMPLICIT elastic response qacc_smooth = Mtilde^-1 (qfrc_smooth + c) -- the
+  // stable linearization center the inner QP and the merit share. (The fork-era SPRING+DAMPER
+  // disabling belonged to the explicit-elasticity architecture, where the passive accel would blow
+  // up the predictor for light flex vertices.) The RIGID IPC path drives its penalty from the
+  // NATIVE contact set, so it runs the normal forward.
   int ipcflex = 0;
   if ((mjtIntegrator) m->opt.integrator == mjINT_IPC) {
     for (int i=0; i < m->nflex; i++) if (m->flex_dim[i] == 2) { ipcflex = 1; break; }
   }
   if (ipcflex) {
     int saved = m->opt.disableflags;
-    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT | mjDSBL_SPRING | mjDSBL_DAMPER;
+    ((mjModel*) m)->opt.disableflags = saved | mjDSBL_CONSTRAINT | mjDSBL_CONTACT;
     mj_forward(m, d);
     ((mjModel*) m)->opt.disableflags = saved;
   } else {
