@@ -1073,6 +1073,9 @@ typedef struct {
   // active, ctx.qfrc_smooth is pre-shifted by +c and Ma/Mv carry the B term, so the stock
   // objective/gradient/linesearch formulas below operate in the Mtilde metric unchanged
   int flg_flex;           // effective metric active for this solve
+  mjtNum* cgB;            // CG preconditioner: per-vertex 3x3 blocks of M + J'*D*J (factored)
+  int* cgBadr;            // CG preconditioner: dof address of each block
+  int cg_nblk;            // CG preconditioner: number of blocks (0 = use the mass matrix)
   const mjModel* fm;      // model, for the metric calls
   mjData* fd;             // data, for the metric calls
 
@@ -1220,7 +1223,7 @@ static void PrimalAllocate(const mjModel* m, mjData* d, mjPrimalContext* ctx, in
       if (is_elliptic) nNum += nv*nv;  // Lcone (dense)
     }
   } else {
-    nNum += 4*nv;                      // CG arrays
+    nNum += 4*nv + nefc;               // CG arrays, + D for the block preconditioner
   }
 
   // add island matrix sizes
@@ -1298,6 +1301,9 @@ static void PrimalAllocate(const mjModel* m, mjData* d, mjPrimalContext* ctx, in
   ctx->quad   = numblock;  numblock += 3*nefc;
   if (is_sparse) {
     ctx->JT   = numblock;  numblock += nJ;
+  }
+  if (!flg_Newton) {
+    ctx->D = numblock;  numblock += nefc;
   }
   if (flg_Newton) {
     ctx->D       = numblock;  numblock += nefc;
@@ -1413,6 +1419,109 @@ static void PrimalUpdateGrad(mjPrimalContext* ctx) {
 
 
 // update Mgrad;  Newton: Mgrad = H \ grad,  CG: Mgrad = M \ grad
+// Per-flex-vertex 3x3 blocks of the constraint Hessian M + J'*D*J, prefactored. Nonlinear CG's
+// default preconditioner is the mass matrix alone, which knows nothing about the constraint rows a
+// loaded flex is dominated by; these blocks do, at O(n) cost. Built once per solve -- the active
+// set barely moves within a step, and staleness affects preconditioner quality, not correctness.
+static void CGBlockBuild(mjPrimalContext* ctx, mjData* d) {
+  int nv = ctx->nv, nefc = ctx->nefc;
+  // [AB3] static buffers + D scratch so the CG path can use the blocks too
+  for (int i=0; i < nefc; i++) {
+    ctx->D[i] = ctx->efc_state[i] == mjCNSTRSTATE_QUADRATIC ? ctx->efc_D[i] : 0;
+  }
+  // cheap block preconditioner: per-flex-vertex 3x3 blocks of H = Mtilde + J'*D*J, prefactored
+  // once per direction; the apply is one qLD sweep with the flex triples overwritten by the
+  // block solves. This keeps the inner iteration at matvec cost (an exact metric solve here
+  // would price every inner iteration like a full nonlinear-CG iteration).
+  const mjModel* fm = ctx->fm;
+  int nfvert = 0;
+  for (int f=0; f < fm->nflex; f++) {
+    nfvert += fm->flex_vertnum[f];
+  }
+  (void) nfvert;
+  mjtNum* B   = mjSTACKALLOC(d, 9*(nfvert > 0 ? nfvert : 1), mjtNum);
+  int* Badr   = mjSTACKALLOC(d, nfvert > 0 ? nfvert : 1, int);
+  int* dofblk = mjSTACKALLOC(d, nv, int);
+  for (int k=0; k < nv; k++) {
+    dofblk[k] = -1;
+  }
+  int nblk = 0;
+  for (int f=0; f < fm->nflex; f++) {
+    for (int v=0; v < fm->flex_vertnum[f]; v++) {
+      int b = fm->flex_vertbodyid[fm->flex_vertadr[f] + v];
+      if (b < 0 || fm->body_dofnum[b] != 3) {
+        continue;  // pinned or non-simple vertex: the qLD sweep covers it
+      }
+      int da = fm->body_dofadr[b];
+      Badr[nblk] = da;
+      dofblk[da] = dofblk[da+1] = dofblk[da+2] = nblk;
+      mjtNum* Bk = B + 9*nblk;
+      mju_zero(Bk, 9);
+      for (int r2=0; r2 < 3; r2++) {  // Mtilde 3x3 sub-block: M rows + K rows, cols in the triple
+        int row = da + r2;
+        for (int a=ctx->M_rowadr[row]; a < ctx->M_rowadr[row] + ctx->M_rownnz[row]; a++) {
+          int c = ctx->M_colind[a];
+          if (c >= da && c < da+3) {
+            Bk[3*r2 + (c-da)] += ctx->M[a];
+          }
+        }
+        if (ctx->flg_flex) {
+          for (int a=d->efm_K_rowadr[row]; a < d->efm_K_rowadr[row] + d->efm_K_rownnz[row]; a++) {
+            int c = d->efm_K_colind[a];
+            if (c >= da && c < da+3) {
+              Bk[3*r2 + (c-da)] += d->efm_K_val[a];
+            }
+          }
+        }
+      }
+      nblk++;
+    }
+  }
+  if (ctx->is_sparse) {  // J'*D*J diagonal blocks: one pass over the rows
+    for (int i=0; i < nefc; i++) {
+      if (!ctx->D[i]) {
+        continue;
+      }
+      int adr = ctx->J_rowadr[i], nnz = ctx->J_rownnz[i];
+      for (int a1=0; a1 < nnz; a1++) {
+        int blk = dofblk[ctx->J_colind[adr+a1]];
+        if (blk < 0) {
+          continue;
+        }
+        int c1 = ctx->J_colind[adr+a1] - Badr[blk];
+        for (int a2=0; a2 < nnz; a2++) {
+          int c2v = ctx->J_colind[adr+a2];
+          if (c2v >= Badr[blk] && c2v < Badr[blk]+3) {
+            B[9*blk + 3*c1 + (c2v-Badr[blk])] += ctx->D[i]*ctx->J[adr+a1]*ctx->J[adr+a2];
+          }
+        }
+      }
+    }
+  }
+  for (int k=0; k < nblk; k++) {
+    mju_cholFactor(B + 9*k, 3, mjMINVAL);
+  }
+  ctx->cgB = B;
+  ctx->cgBadr = Badr;
+  ctx->cg_nblk = nblk;
+}
+
+
+
+// apply: one qLD sweep, then the flex-vertex triples are overwritten by the block solves
+static void CGBlockApply(mjPrimalContext* ctx, const mjtNum* B, const int* Badr, int nblk,
+                             mjtNum* z, const mjtNum* r) {
+  int nv = ctx->nv;
+  mju_copy(z, r, nv);
+  mj_solveLD(z, ctx->qLD, ctx->qLDiagInv, nv, 1,
+             ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind, NULL);
+  for (int k=0; k < nblk; k++) {
+    mju_cholSolve(z + Badr[k], B + 9*k, r + Badr[k], 3);
+  }
+}
+
+
+
 static void PrimalUpdateMgrad(mjPrimalContext* ctx, int flg_Newton) {
   int nv = ctx->nv;
 
@@ -1431,8 +1540,10 @@ static void PrimalUpdateMgrad(mjPrimalContext* ctx, int flg_Newton) {
     mjd_effPrec(ctx->fm, ctx->fd, ctx->Mgrad, ctx->grad);
   }
 
-  // CG: Mgrad = M \ grad
-  else {
+  // CG: Mgrad = (M + J'*D*J block-diagonal) \ grad, or M \ grad without blocks
+  else if (ctx->cg_nblk) {
+    CGBlockApply(ctx, ctx->cgB, ctx->cgBadr, ctx->cg_nblk, ctx->Mgrad, ctx->grad);
+  } else {
     mju_copy(ctx->Mgrad, ctx->grad, nv);
     mj_solveLD(ctx->Mgrad, ctx->qLD, ctx->qLDiagInv, nv, 1,
                ctx->M_rownnz, ctx->M_rowadr, ctx->M_colind, NULL);
@@ -2392,6 +2503,14 @@ static void mj_solPrimal(const mjModel* m, mjData* d, int island, int maxiter, i
   ctx.scale = scale;
 
   // Mgrad = M \ grad: the CG preconditioned gradient, also the convergence certificate
+  // only when the blocks are the preconditioner actually used: with the implicit effective metric
+  // active, PrimalUpdateMgrad solves against Mtilde instead and building them would be wasted work
+  if (!flg_Newton && !ctx.flg_flex && ctx.island < 0 &&
+      m->opt.cone != mjCONE_ELLIPTIC && m->nflex > 0) {
+    ctx.fm = m;
+    ctx.fd = d;
+    CGBlockBuild(&ctx, d);
+  }
   PrimalUpdateMgrad(&ctx, /*flg_Newton=*/0);
 
   // convergence certificate: the cost is strongly convex in the M-norm, bounding the
